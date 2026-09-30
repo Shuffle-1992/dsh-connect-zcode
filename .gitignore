@@ -1,0 +1,25 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 运行期数据（含额度台账，可能被你本机路径覆盖到仓库内时兜底）
+*.log
+zcode-runs.jsonl
+zcode-dispatch.switch.json
+
+# 凭据与本地配置 —— 绝不入库
+.credentials*
+*.key
+.env
+.env.*
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 临时产物
+*.tmp
+.tmp/

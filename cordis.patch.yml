@@ -1,0 +1,13 @@
+# dsh-connect-zcode bundle patch：把插件插入 profile。
+# 安装（需用户批准）：profile package.json 加
+#   "@local/dsh-connect-zcode": "link:<本插件目录的绝对路径>"
+# 并加入 dsh.profile.bundles。
+# 机器专有路径（switchPath / ledgerPath / credentialPath）刻意不写在这里——
+# 默认值见 lib/*.js（可用 env 或 profile config 覆盖），不进本文件。
+- insert:
+    - id: zcode-connect
+      name: '@local/dsh-connect-zcode'
+      config:
+        planKey: 'builtin:bigmodel-coding-plan'
+        contextWindow: 200000
+        maxConcurrent: 2
