@@ -240,6 +240,16 @@ async function assertRejects(promise, pattern, label) {
     rows.length === 3 && rows.every((r) => Number.isInteger(r.contextWindow) && r.contextWindow > 0 && Number.isInteger(r.maxTokens) && r.maxTokens > 0 && r.id && r.name) &&
       rows.filter((r) => r.official === true).length === 2
   );
+  /* 静态表必须带展示名（= 网关 display_name 实测值）：state.lastCatalog 初始化为静态表，
+   * 而动态发现是懒加载 —— 若静态表只有裸 id，面板在首次发现前会显示 `glm-5.3` 而非 `GLM-5.3`。 */
+  check(
+    '目录: 静态行 name 为展示名（非裸 id），与网关 display_name 一致',
+    rows.every((r) => typeof r.name === 'string' && r.name !== r.id) &&
+      rows.find((r) => r.id === 'glm-5.3')?.name === 'GLM-5.3' &&
+      rows.find((r) => r.id === 'glm-5.3-flash')?.name === 'GLM-5.3-Flash' &&
+      rows.find((r) => r.id === 'glm-5.3-flashx')?.name === 'GLM-5.3-FlashX',
+    rows.map((r) => `${r.id}=${r.name}`).join(', ')
+  );
 
   const catalog = modelMeta.buildCatalog(
     [
