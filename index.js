@@ -24,7 +24,7 @@
  *   contextBudgets/modelOverrides 为面板写入的每模型能力配置（volatile），
  *   官方数据锁定的行（推理档/输入模态）不消费覆盖（applyXxx 跳过 official 行）。
  */
-import { DEFAULT_PLAN_KEY, readPlanCredential } from './lib/credential.js';
+import { DEFAULT_PLAN_KEY, readPlanCredential, resolvePlanCredential } from './lib/credential.js';
 import { DEFAULT_SWITCH_PATH, assertSwitchEnabled, readDispatchSwitch } from './lib/switch.js';
 import { DEFAULT_LEDGER_PATH, appendProviderRun } from './lib/ledger.js';
 import { resolveHostLlmModules, resolveSchemastery } from './lib/host-modules.js';
@@ -328,9 +328,23 @@ function registerStatusRoute(webCtx, deps) {
  */
 function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
   const credentialPath = cfg.credentialPath === '' ? undefined : cfg.credentialPath;
-  const gate = () => {
+  /**
+   * 每次实际调用前的凭据闸门（PROTOCOL §7.1 冻结语义 + 方案 B 回退）。
+   * 用 resolvePlanCredential：config.json 的 key 若验活失败，自动回退到 ZCode 加密凭据库里的
+   * 有效候选（2026-10-01 真机事故：OAuth 重登后 ZCode 只更新凭据库、不回写 config.json）。
+   * 验活用 GET /v1/models（零推理成本）；失败一律回退为 config.json 原值，不引入新失败面。
+   */
+  const gate = async () => {
     assertSwitchEnabled(cfg.switchPath);
-    return readPlanCredential(credentialPath, cfg.planKey);
+    return resolvePlanCredential(credentialPath, cfg.planKey, {
+      onDiagnostic: (msg) => {
+        try {
+          console.warn(`[dsh-connect-zcode] ${msg}`);
+        } catch {
+          /* 日志失败不影响凭据解析 */
+        }
+      },
+    });
   };
   // 注册期只读凭据（拿 baseURL 落模型条目），不查开关——开关关闭时插件照样注册，
   // 冻结语义在 resolveApiKey/发现回调的调用路径上生效（PROTOCOL §7.1 验收路径即如此测试）。
@@ -369,8 +383,11 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
         apiKey: {
           name: 'ZCode Coding Plan key',
           async resolve() {
-            const credential = gate();
-            return { auth: { apiKey: credential.apiKey }, source: '~/.zcode/v2/config.json' };
+            const credential = await gate();
+            return {
+              auth: { apiKey: credential.apiKey },
+              source: credential.source === 'store' ? '~/.zcode/v2/credentials.json（回退）' : '~/.zcode/v2/config.json',
+            };
           },
         },
       },
@@ -395,7 +412,7 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
   const adapter = new mods.PiAiAdapter({
     profiles: () => profiles,
     auth: INERT_AUTH,
-    resolveApiKey: async () => gate().apiKey, // 适配器每请求 await（T20 实证）：开关+凭据的真正调用门
+    resolveApiKey: async () => (await gate()).apiKey, // 适配器每请求 await（T20 实证）：开关+凭据的真正调用门
   });
 
   const offs = [];
@@ -406,7 +423,12 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
       // PROTOCOL §7.1：冻结期连目录发现也不发请求（GET /v1/models 同样不走）。
       if (!readDispatchSwitch(cfg.switchPath).enabled) return discoveredFor(state.lastCatalog);
       try {
-        const rows = await discoverModels(readPlanCredential(credentialPath, cfg.planKey), {
+        // 方案 B：与调用门同一凭据解析（config.json 验活失败则回退凭据库），
+        // 否则会出现"推理可用但目录发现用旧 key 401"的不一致。
+        const credential = await resolvePlanCredential(credentialPath, cfg.planKey, {
+          ...(cancellation === undefined ? {} : { signal: cancellation }),
+        });
+        const rows = await discoverModels(credential, {
           officialMeta: readMeta(),
           baseContextWindow: cfg.contextWindow,
           ...(cancellation === undefined ? {} : { signal: cancellation }),

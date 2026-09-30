@@ -10,9 +10,10 @@
  * 面板行控件（锁定 disabled、1M 显隐、官方徽标）。
  */
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir, userInfo } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import * as crypto from 'node:crypto';
 
 const PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const results = [];
@@ -28,6 +29,7 @@ async function waitFor(cond, ms = 4000) {
 
 // ─── 模块导入（被测物） ───────────────────────────────────────────────────────
 const credential = await import('../lib/credential.js');
+const credStore = await import('../lib/credential-store.js');
 const sw = await import('../lib/switch.js');
 const ledger = await import('../lib/ledger.js');
 const discovery = await import('../lib/discovery.js');
@@ -130,6 +132,123 @@ async function assertRejects(promise, pattern, label) {
     }
   })();
   check('凭据: enabled:false → CredentialError', errDisabled?.name === 'CredentialError' && /未启用/.test(errDisabled.message));
+}
+
+// ─── 1b. 凭据库回退（方案 B，2026-10-01 真机事故修复） ────────────────────────
+{
+  /* 事故：ZCode OAuth 重登后只把新 key 写进 credentials.json（加密），**不回写 config.json**，
+   * 而 config.json 留着失效旧 key ⇒ CLI 与插件一起 401。
+   * 修法：resolvePlanCredential 在 config.json 的 key **验活失败**时，回退到凭据库候选。
+   * 关键不变量：**必须验活才切换**（不验活可能选到同样失效的 key，比不切更糟）。 */
+
+  // 构造一把合法形态的假 key（32 hex + "." + 16 alnum；必须真 hex，否则被形态校验滤掉）
+  const mkKey = (h) => `${h.repeat(32).slice(0, 32)}.${'B'.repeat(16)}`;
+  const storedKey = `${'a'.repeat(32)}.${'S'.repeat(16)}`; // 32 个 'a' 是合法 hex
+  const enc = (() => {
+    const { createCipheriv, createHash } = crypto;
+    const secret = `zcode-credential-fallback:${process.platform}:${homedir()}:${userInfo().username}`;
+    const key = createHash('sha256').update(secret).digest();
+    const iv = Buffer.alloc(12, 7);
+    const c = createCipheriv('aes-256-gcm', key, iv);
+    const data = Buffer.concat([c.update(storedKey, 'utf8'), c.final()]);
+    return `enc:v1:${iv.toString('base64url')}.${c.getAuthTag().toString('base64url')}.${data.toString('base64url')}`;
+  })();
+
+  check('凭据库: 解密 enc:v1（AES-256-GCM + sha256(secret)，与 zcode.cjs 同式）', (() => {
+    const store = tmpFile('credstore.json', JSON.stringify({ 'account-provider:coding-plan:account:acct-x:api-key': enc }));
+    const list = credStore.readStoredApiKeys(store);
+    return list.length === 1 && list[0].id === 'acct-x' && list[0].apiKey === storedKey;
+  })());
+  check('凭据库: 非 enc 值/坏 JSON/缺文件 → 空数组（绝不抛）', (() => {
+    const bad1 = tmpFile('credstore-bad1.json', JSON.stringify({ 'account-provider:coding-plan:account:a:api-key': 'plain-not-enc' }));
+    const bad2 = tmpFile('credstore-bad2.json', 'not-json{{');
+    return credStore.readStoredApiKeys(bad1).length === 0 && credStore.readStoredApiKeys(bad2).length === 0 && credStore.readStoredApiKeys(join(tmp, 'nope.json')).length === 0;
+  })());
+  check('凭据库: 只收 coding-plan 前缀 + 只收 api-key 形态', (() => {
+    const store = tmpFile('credstore-filter.json', JSON.stringify({
+      'account-provider:coding-plan:account:ok:api-key': enc,
+      'account-provider:coding-plan:account:ok:other': enc,
+      'oauth:bigmodel:access_token': enc,
+      'account-provider:other:account:x:api-key': enc,
+    }));
+    const list = credStore.readStoredApiKeys(store);
+    return list.length === 1 && list[0].id === 'ok';
+  })());
+  check('凭据库: keyFingerprint 不含完整 key', (() => {
+    const k = mkKey('a');
+    const fp = credStore.keyFingerprint(k);
+    return !fp.includes(k) && fp.includes('***');
+  })());
+
+  /* 真实网关契约（2026-10-01 实测，**本组断言的核心**）：
+   * 失效 key 也返回 HTTP 200，body = {"code":1000,"msg":"身份验证失败。","success":false}。
+   * 有效 key 返回 HTTP 200 + {"data":[...非空...]}。
+   * 故 validateApiKey 必须验体，不能只看 res.ok —— 假 fetch 也必须按此契约构造。 */
+  const okModelsRes = () => ({ ok: true, json: async () => ({ data: [{ id: 'glm-5.3' }] }) });
+  const authFailRes = () => ({ ok: true, json: async () => ({ code: 1000, msg: '身份验证失败。', success: false }) });
+  const http401Res = () => ({ ok: false, status: 401, json: async () => ({ error: { type: '1000' } }) });
+
+  check('验活: HTTP 200 + data 非空 → 有效', await credential.validateApiKey('x'.repeat(49), 'https://e.test', { fetchFn: async () => okModelsRes() }));
+  check('验活: HTTP 200 但 body code:1000（认证失败）→ 无效（**防 200 假绿**）', (await credential.validateApiKey('x'.repeat(49), 'https://e.test', { fetchFn: async () => authFailRes() })) === false);
+  check('验活: HTTP 401 → 无效', (await credential.validateApiKey('x'.repeat(49), 'https://e.test', { fetchFn: async () => http401Res() })) === false);
+  check('验活: data 为空数组 → 无效', (await credential.validateApiKey('x'.repeat(49), 'https://e.test', { fetchFn: async () => ({ ok: true, json: async () => ({ data: [] }) }) })) === false);
+  check('验活: 网络异常 → 无效（绝不抛）', (await credential.validateApiKey('x'.repeat(49), 'https://e.test', { fetchFn: async () => { throw new Error('boom'); } })) === false);
+
+  // resolvePlanCredential 的验活回退（注入假 fetch，零网络）
+  check('回退: config 验活通过 → source=config（不读凭据库）', await (async () => {
+    const cfgPath = tmpFile('rb-cfg-ok.json', fixtureConfig());
+    const calls = [];
+    const r = await credential.resolvePlanCredential(cfgPath, undefined, {
+      fetchFn: async (url) => { calls.push(url); return okModelsRes(); },
+    });
+    return r.source === 'config' && calls.length === 1;
+  })());
+  check('回退: config 验活失败 + 凭据库候选有效 → source=store', await (async () => {
+    const cfgPath = tmpFile('rb-cfg-bad.json', fixtureConfig());
+    const store = tmpFile('rb-store.json', JSON.stringify({ 'account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:123:api-key': enc }));
+    let n = 0;
+    const r = await credential.resolvePlanCredential(cfgPath, undefined, {
+      storePath: store,
+      // 第 1 次(config) → 200 但认证失败；第 2 次(store) → 200 + data
+      fetchFn: async () => { n += 1; return n === 1 ? authFailRes() : okModelsRes(); },
+    });
+    return r.source === 'store' && r.apiKey === storedKey && n === 2;
+  })());
+  check('回退: 凭据库 account id 解析（键为 7 段 ...:account:<planId>:account:<id>:api-key）', (() => {
+    const store = tmpFile('rb-id.json', JSON.stringify({ 'account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:12345678901234567:api-key': enc }));
+    const list = credStore.readStoredApiKeys(store);
+    return list.length === 1 && list[0].id === 'bigmodel-individual-coding-plan';
+  })());
+  check('回退: config 与凭据库都失败 → 沿用 config 原值（不抛、不引入新失败面）', await (async () => {
+    const cfgPath = tmpFile('rb-cfg-bad2.json', fixtureConfig());
+    const store = tmpFile('rb-store-bad.json', JSON.stringify({ 'account-provider:coding-plan:account:p:account:1:api-key': enc }));
+    const r = await credential.resolvePlanCredential(cfgPath, undefined, {
+      storePath: store,
+      fetchFn: async () => http401Res(),
+    });
+    return r.source === 'config' && r.apiKey === fakeKey;
+  })());
+  check('回退: 凭据库为空 → 沿用 config 原值', await (async () => {
+    const cfgPath = tmpFile('rb-cfg-bad3.json', fixtureConfig());
+    const r = await credential.resolvePlanCredential(cfgPath, undefined, {
+      storePath: join(tmp, 'no-store.json'),
+      fetchFn: async () => http401Res(),
+    });
+    return r.source === 'config';
+  })());
+  check('回退: 诊断回调不泄漏 key 原文', await (async () => {
+    const cfgPath = tmpFile('rb-cfg-bad4.json', fixtureConfig());
+    const store = tmpFile('rb-store-ok2.json', JSON.stringify({ 'account-provider:coding-plan:account:p2:account:2:api-key': enc }));
+    const msgs = [];
+    let n = 0;
+    await credential.resolvePlanCredential(cfgPath, undefined, {
+      storePath: store,
+      onDiagnostic: (m) => msgs.push(m),
+      fetchFn: async () => { n += 1; return n === 1 ? authFailRes() : okModelsRes(); },
+    });
+    const joined = msgs.join(' ');
+    return msgs.length > 0 && !joined.includes(fakeKey) && !joined.includes(storedKey);
+  })());
 }
 
 // ─── 2. 开关（§3.2，三种态） ─────────────────────────────────────────────────
