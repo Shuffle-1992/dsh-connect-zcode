@@ -1,16 +1,28 @@
 {
   "name": "@local/dsh-connect-zcode",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
   },
-  "exports": { ".": "./index.js", "./package.json": "./package.json" },
-  "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" }
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
   },
-  "meta": { "title": "ZCode Coding Plan", "description": "把 ZCode Coding Plan 注册为 DSH 的 LLM provider（凭据零落盘）" },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-settings-plugins"
+      ]
+    }
+  },
+  "meta": { "title": "ZCode Coding Plan", "description": "把 ZCode Coding Plan 注册为 DSH 的 LLM provider（凭据零落盘，含模型显隐/能力面板）" },
   "peerDependencies": {
     "@deepseek-ai/dsh-llm": ">=0.1.7-rc.1 <0.3.0-0",
     "@deepseek-ai/dsh-llm-pi-ai": ">=0.1.7-rc.1 <0.3.0-0",

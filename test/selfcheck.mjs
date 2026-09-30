@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 /**
- * selfcheck.mjs —— dsh-connect-zcode 自检（T20 §3.5）。
+ * selfcheck.mjs —— dsh-connect-zcode 自检（T20 §3.5 + T21 §3.5 + T22 §1.5）。
  *
  * 纪律：不产生任何网络请求（fetch 全程投毒）；不读真实 ~/.zcode/v2/config.json 内容
- * （凭据用 tmp fixture）；tmp 用后即删；零明文（假 key 现场构造，不落字面量）。
+ * （凭据与官方元数据用 tmp fixture）；tmp 用后即删；零明文（假 key 现场构造，不落字面量）。
  * 退出码：0=全绿；1=存在 FAIL。
+ * T22 新增组：5.3 系显式集合过滤 / 官方元数据归一与合并（锁定）/ 用户开关与上下文预算 /
+ * trae 形状完整性（每行正整数 contextWindow + reasoningEfforts 枚举映射）/ host 管线 /
+ * 面板行控件（锁定 disabled、1M 显隐、官方徽标）。
  */
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -28,6 +31,8 @@ const credential = await import('../lib/credential.js');
 const sw = await import('../lib/switch.js');
 const ledger = await import('../lib/ledger.js');
 const discovery = await import('../lib/discovery.js');
+const modelMeta = await import('../lib/model-meta.js');
+const webStatus = await import('../lib/web-status.js');
 const { Semaphore, instrumentApi } = await import('../lib/api-instrument.js');
 
 const tmp = mkdtempSync(join(tmpdir(), 'dsh-connect-zcode-selfcheck-'));
@@ -42,11 +47,27 @@ function tmpFile(name, content) {
 
 /** 假 zhipu 形态 key（32 hex + "." + 16 alnum）——现场构造，任何文件里不出现字面量。 */
 const fakeKey = `${'a'.repeat(32)}.${'b'.repeat(16)}`;
-const fixtureConfig = (over = {}) =>
+/* 官方 models 段（T22）：形状照真实 ZCode config.json 的 provider[planKey].models 段
+ * （key 大小写与网关 id 不同 → 匹配须大小写不敏感；只有这 2 个模型有官方数据，
+ * FlashX 无 → 用作「无官方数据」对照）。不含任何凭据字段。 */
+const fixtureModels = () => ({
+  'GLM-5.3': {
+    reasoning: { enabled: true, variants: ['low', 'max', 'high'], defaultVariant: 'max' },
+    limit: { context: 1000000, output: 128000 },
+    modalities: { input: ['text'], output: ['text'] },
+  },
+  'GLM-5.3-Flash': {
+    reasoning: { enabled: true, variants: ['low', 'max', 'high'], defaultVariant: 'max' },
+    limit: { context: 1000000, output: 128000 },
+    modalities: { input: ['text', 'image', 'video'], output: ['text'] },
+  },
+});
+const fixtureConfig = (over = {}, withModels = true) =>
   JSON.stringify({
     provider: {
       'builtin:bigmodel-coding-plan': {
         enabled: true,
+        ...(withModels ? { models: fixtureModels() } : {}),
         options: { apiKey: fakeKey, baseURL: 'https://example.test/api/anthropic', ...over },
       },
     },
@@ -152,26 +173,190 @@ async function assertRejects(promise, pattern, label) {
   check('台账: sanitizeErrorSummary 脱敏 zhipu 形态', ledger.sanitizeErrorSummary(`x ${fakeKey} y`) === 'x <REDACTED> y');
 }
 
-// ─── 4. 静态目录与发现回退（§3.4） ───────────────────────────────────────────
+// ─── 4. 官方元数据层 + 5.3 系过滤 + 静态目录（T22 §1.5-1/2/3/5） ─────────────
 {
-  check('目录: 静态表 11 项且含 glm-5.3', discovery.STATIC_MODEL_IDS.length === 11 && discovery.STATIC_MODEL_IDS.includes('glm-5.3'), discovery.STATIC_MODEL_IDS.join(','));
-  const rows = discovery.staticDiscoveredModels(200000);
-  check(
-    '目录: 每行 contextWindow/maxTokens 为正整数',
-    rows.every((r) => Number.isInteger(r.contextWindow) && r.contextWindow > 0 && Number.isInteger(r.maxTokens) && r.maxTokens > 0 && r.id && r.name)
+  // ZCode config models 段 fixture（T22 §0.2 原样形态；key 大写与网关 id 不同）。
+  const metaConfig = tmpFile(
+    'zcode-meta.json',
+    JSON.stringify({
+      provider: {
+        'builtin:bigmodel-coding-plan': {
+          enabled: true,
+          options: { apiKey: fakeKey, baseURL: 'https://example.test/api/anthropic' },
+          models: {
+            'GLM-5.3': {
+              reasoning: { enabled: true, variants: ['low', 'max', 'high'], defaultVariant: 'max' },
+              limit: { context: 1000000, output: 128000 },
+              modalities: { input: ['text'], output: ['text'] },
+            },
+            'GLM-5.3-Flash': {
+              reasoning: { enabled: true, variants: ['low', 'max', 'high'], defaultVariant: 'max' },
+              limit: { context: 1000000, output: 128000 },
+              modalities: { input: ['text', 'image', 'video'], output: ['text'] },
+            },
+          },
+        },
+      },
+    })
   );
-  check('发现: extractModelIds 兼容三种形态', JSON.stringify(discovery.extractModelIds({ data: [{ id: 'a' }, { id: 'b' }] })) === '["a","b"]' && JSON.stringify(discovery.extractModelIds({ models: ['c'] })) === '["c"]' && JSON.stringify(discovery.extractModelIds(['d'])) === '["d"]');
-  const rows2 = await discovery.discoverModels({ apiKey: fakeKey, baseURL: 'https://example.test/api/anthropic' }, 200000, { fetchFn: async () => ({ ok: false }) });
-  check('发现: HTTP 非 200 回退静态表', rows2.length === 11 && rows2[0].contextWindow === 200000);
-  const rows3 = await discovery.discoverModels({ apiKey: fakeKey, baseURL: 'https://example.test/api/anthropic' }, 200000, { fetchFn: async () => { throw new Error('NETWORK FORBIDDEN'); } });
-  check('发现: 网络异常回退静态表', rows3.length === 11);
-  const rows4 = await discovery.discoverModels({ apiKey: fakeKey, baseURL: 'https://example.test/api/anthropic' }, 200000, {
+  const officialMeta = modelMeta.readOfficialMeta(metaConfig);
+  check(
+    '官方: readOfficialMeta 归一（key 小写 + context/output/variants/defaultVariant/input）',
+    officialMeta['glm-5.3']?.context === 1000000 && officialMeta['glm-5.3']?.output === 128000 &&
+      JSON.stringify(officialMeta['glm-5.3']?.reasoningVariants) === '["low","max","high"]' && officialMeta['glm-5.3']?.defaultVariant === 'max' &&
+      JSON.stringify(officialMeta['glm-5.3-flash']?.input) === '["text","image","video"]',
+    JSON.stringify(officialMeta)
+  );
+  check('官方: 零明文——返回值不含 key 也不含 options 段（只读 models）', !JSON.stringify(officialMeta).includes(fakeKey) && !JSON.stringify(officialMeta).includes('"options"'));
+  check(
+    '官方: 缺文件/坏 JSON/缺 models 段 → {}（绝不抛）',
+    JSON.stringify(modelMeta.readOfficialMeta(join(tmp, 'nope.json'))) === '{}' &&
+      JSON.stringify(modelMeta.readOfficialMeta(tmpFile('meta-bad.json', 'not-json{{'))) === '{}' &&
+      JSON.stringify(modelMeta.readOfficialMeta(tmpFile('meta-nomodels.json', fixtureConfig({}, false)))) === '{}'
+  );
+  const noCtx = tmpFile(
+    'meta-noctx.json',
+    JSON.stringify({ provider: { 'builtin:bigmodel-coding-plan': { enabled: true, options: { apiKey: fakeKey, baseURL: 'https://x.test' }, models: { 'glm-x': { reasoning: { variants: ['low'] } } } } } })
+  );
+  check('官方: 缺正整数 context 的条目不收编（宁按无官方数据处理，不虚构数字）', JSON.stringify(modelMeta.readOfficialMeta(noCtx)) === '{}');
+
+  check(
+    '过滤: 5.3 系显式集合判定（大小写不敏感；不含 glm-5.2 / glm-5.3-pro / 非字符串）',
+    modelMeta.isGlm53Family('GLM-5.3-FLASHX') === true && modelMeta.isGlm53Family('glm-5.2') === false &&
+      modelMeta.isGlm53Family('glm-5.3-pro') === false && modelMeta.isGlm53Family(42) === false && modelMeta.isGlm53Family(undefined) === false
+  );
+  const gateway11 = ['glm-5.3', 'glm-5.3-flash', 'glm-5.3-flashx', 'glm-5.2', 'glm-5.1', 'glm-5', 'glm-5-turbo', 'glm-4.7', 'glm-4.6', 'glm-4.5', 'glm-4.5-air'].map((id) => ({ id }));
+  check(
+    '过滤: 网关 11 → 5.3 系 3（显式集合；大小写不敏感放行 GLM-5.3-FlashX）',
+    modelMeta.filterGlm53Family(gateway11).length === 3 &&
+      modelMeta.filterGlm53Family([{ id: 'GLM-5.3-FlashX' }, { id: 'glm-5.2' }]).map((r) => r.id).join(',') === 'GLM-5.3-FlashX'
+  );
+  check('过滤: 非数组输入 → 空数组（防御）', modelMeta.filterGlm53Family(null).length === 0 && modelMeta.filterGlm53Family('glm-5.3').length === 0);
+
+  check('目录: 静态表裁剪为 5.3 系 3 项（与 model-meta GLM53_FAMILY 同序）', discovery.STATIC_MODEL_IDS.length === 3 && JSON.stringify(discovery.STATIC_MODEL_IDS) === JSON.stringify(modelMeta.GLM53_FAMILY), discovery.STATIC_MODEL_IDS.join(','));
+  const rows = discovery.staticCatalog(officialMeta, 200000);
+  check(
+    '目录: 静态事实行每行正整数 contextWindow/maxTokens + 官方徽标 2 枚',
+    rows.length === 3 && rows.every((r) => Number.isInteger(r.contextWindow) && r.contextWindow > 0 && Number.isInteger(r.maxTokens) && r.maxTokens > 0 && r.id && r.name) &&
+      rows.filter((r) => r.official === true).length === 2
+  );
+
+  const catalog = modelMeta.buildCatalog(
+    [
+      { id: 'glm-5.3' },
+      { id: 'glm-5.3-flash', display_name: 'GLM-5.3-Flash' },
+      { id: 'glm-5.3-flashx', display_name: 'GLM-5.3-FlashX' },
+      { id: 'glm-5.2' },
+    ],
+    officialMeta,
+    200000
+  );
+  const row53 = catalog.find((r) => r.id === 'glm-5.3');
+  const rowFlash = catalog.find((r) => r.id === 'glm-5.3-flash');
+  const rowFlashX = catalog.find((r) => r.id === 'glm-5.3-flashx');
+  check(
+    '合并: 官方命中 → official + 默认 200K + 官方 Max 档 1M + 推理档锁定（low/max/high）',
+    row53?.official === true && row53?.contextWindow === 200000 && row53?.maxContextWindow === 1000000 &&
+      JSON.stringify(row53?.reasoningEfforts) === '{"low":"light","max":"high","high":"high"}',
+    JSON.stringify(row53)
+  );
+  check('合并: name ← 网关 display_name（缺失回退 id）', row53?.name === 'glm-5.3' && rowFlash?.name === 'GLM-5.3-Flash');
+  check('合并: Flash 官方 input 含 image/video（锁定，原样保留官方声明）', JSON.stringify(rowFlash?.input) === '["text","image","video"]');
+  check(
+    '合并: FlashX 无官方 → 默认 200K/无 1M 档/无推理档/input 纯文本（T22 §1.5-3）',
+    rowFlashX?.official === false && rowFlashX?.contextWindow === 200000 && rowFlashX?.maxContextWindow === undefined &&
+      rowFlashX?.reasoningEfforts === undefined && JSON.stringify(rowFlashX?.input) === '["text"]',
+    JSON.stringify(rowFlashX)
+  );
+  /* 5.3 系过滤的**真实契约**：过滤发生在目录层（discoverModels 的 filterGlm53Family /
+   * 静态表 STATIC_MODEL_IDS = GLM53_FAMILY），buildCatalog 是纯合并（假定已过滤输入）。
+   * 故此处断言过滤函数本身 + 经 discoverModels 的端到端行为，而非要求 buildCatalog 过滤。 */
+  check(
+    '过滤: filterGlm53Family 剔除非 5.3 系（glm-5.2 不出现），恰 3 行',
+    (() => {
+      const filtered = modelMeta.filterGlm53Family([
+        { id: 'glm-5.3' },
+        { id: 'GLM-5.3-Flash' }, // 大小写不敏感
+        { id: 'glm-5.3-flashx' },
+        { id: 'glm-5.2' },
+        { id: 'glm-5.1' },
+      ]);
+      return filtered.length === 3 && filtered.some((r) => r.id === 'glm-5.2') === false;
+    })()
+  );
+  check(
+    '过滤: discoverModels 端到端只回 5.3 系（网关给 11 个含 glm-5.2/glm-5.1）',
+    await (async () => {
+      const gwBody = {
+        data: [
+          ...modelMeta.GLM53_FAMILY.map((id) => ({ id, display_name: id })),
+          { id: 'glm-5.2' },
+          { id: 'glm-5.1' },
+          { id: 'glm-4.5' },
+        ],
+      };
+      const rows = await discovery.discoverModels(
+        { baseURL: 'https://example.test/api/anthropic', apiKey: fakeKey },
+        {
+          officialMeta: modelMeta.readOfficialMeta(tmpFile('meta-gw.json', fixtureConfig())),
+          fetchFn: async () => ({ ok: true, json: async () => gwBody }),
+        }
+      );
+      return rows.length === 3 && rows.some((r) => r.id === 'glm-5.2') === false && rows.every((r) => Number.isInteger(r.contextWindow));
+    })()
+  );
+  check('红线: buildCatalog 每行必有正整数 contextWindow（INVALID_MODEL_CONTEXT）', catalog.every((r) => Number.isInteger(r.contextWindow) && r.contextWindow > 0));
+
+  check('开关: 非官方行图片可开（override.image=true → 含 image）', JSON.stringify(modelMeta.applyImageSelection(catalog, { 'glm-5.3-flashx': { image: true } }).find((r) => r.id === 'glm-5.3-flashx')?.input) === '["text","image"]');
+  check(
+    '开关: 官方行忽略图片覆盖（GLM-5.3 强塞 image 不生效；Flash 官方模态剥不掉）',
+    JSON.stringify(modelMeta.applyImageSelection(catalog, { 'glm-5.3': { image: true } }).find((r) => r.id === 'glm-5.3')?.input) === '["text"]' &&
+      JSON.stringify(modelMeta.applyImageSelection(catalog, { 'glm-5.3-flash': {} }).find((r) => r.id === 'glm-5.3-flash')?.input) === '["text","image","video"]'
+  );
+  const onReasoning = modelMeta.applyReasoningSelection(catalog, { 'glm-5.3-flashx': { reasoning: true } });
+  check(
+    '开关: 非官方行推理开 → 单档 wire 枚举 high；官方行推理档不受覆盖影响',
+    JSON.stringify(onReasoning.find((r) => r.id === 'glm-5.3-flashx')?.reasoningEfforts) === '{"high":"high"}' &&
+      JSON.stringify(onReasoning.find((r) => r.id === 'glm-5.3')?.reasoningEfforts) === '{"low":"light","max":"high","high":"high"}'
+  );
+  check('开关: 推理默认关（无 override → 非官方行无 reasoningEfforts）', modelMeta.applyReasoningSelection(catalog, {}).find((r) => r.id === 'glm-5.3-flashx')?.reasoningEfforts === undefined);
+
+  const budgeted = modelMeta.applyContextBudgets(
+    modelMeta.applyReasoningSelection(modelMeta.applyImageSelection(catalog, {}), {}),
+    { 'glm-5.3': 1000000, 'glm-5.3-flashx': 1000000, 'glm-5.3-flash': 999999 }
+  );
+  check('预算: 官方 Max 档勾选 1M 生效（GLM-5.3 → 1000000，T22 §1.5-4）', budgeted.find((r) => r.id === 'glm-5.3')?.contextWindow === 1000000);
+  check('预算: 非官方 Max 档写入被忽略（FlashX 无档；Flash 非 Max 值 → 保持 200K）', budgeted.find((r) => r.id === 'glm-5.3-flashx')?.contextWindow === 200000 && budgeted.find((r) => r.id === 'glm-5.3-flash')?.contextWindow === 200000);
+  check('红线: 预算管线末端每行仍正整数 contextWindow', budgeted.every((r) => Number.isInteger(r.contextWindow) && r.contextWindow > 0));
+
+  check(
+    '发现: extractModels 提取 display_name（三种形态兼容；缺失回退 id）',
+    JSON.stringify(discovery.extractModels({ data: [{ id: 'a', display_name: 'A' }, { id: 'b' }] })) === '[{"id":"a","name":"A"},{"id":"b","name":"b"}]' &&
+      JSON.stringify(discovery.extractModels(['c'])) === '[{"id":"c","name":"c"}]' &&
+      JSON.stringify(discovery.extractModelIds({ models: ['d'] })) === '["d"]'
+  );
+  const cred = { apiKey: fakeKey, baseURL: 'https://example.test/api/anthropic' };
+  const rows2 = await discovery.discoverModels(cred, { officialMeta, baseContextWindow: 200000, fetchFn: async () => ({ ok: false }) });
+  check('发现: HTTP 非 200 回退静态表（3 行 5.3 系）', rows2.length === 3 && rows2[0].contextWindow === 200000, `rows=${rows2.length}`);
+  const rows3 = await discovery.discoverModels(cred, { officialMeta, fetchFn: async () => { throw new Error('NETWORK FORBIDDEN'); } });
+  check('发现: 网络异常回退静态表', rows3.length === 3);
+  const rows4 = await discovery.discoverModels(cred, {
+    officialMeta,
     fetchFn: async (url, init) => {
       if (!init.headers['x-api-key'] || !init.headers['anthropic-version']) throw new Error('missing headers');
-      return { ok: true, json: async () => ({ data: [{ id: 'glm-9.9' }] }) };
+      return {
+        ok: true,
+        json: async () => ({ data: [{ id: 'glm-5.2' }, { id: 'GLM-5.3-Flash', display_name: 'GLM-5.3-Flash' }, { id: 'glm-5.3-flashx' }, { id: 'glm-5.3-pro' }] }),
+      };
     },
   });
-  check('发现: 200 时用端点目录', rows4.length === 1 && rows4[0].id === 'glm-9.9' && rows4[0].contextWindow === 200000, JSON.stringify(rows4[0]));
+  check(
+    '发现: 200 时 5.3 系过滤（大小写不敏感合并官方）+ display_name',
+    rows4.length === 2 && rows4[0].id === 'GLM-5.3-Flash' && rows4[0].name === 'GLM-5.3-Flash' && rows4[0].official === true && rows4[0].maxContextWindow === 1000000 && rows4[1].id === 'glm-5.3-flashx',
+    JSON.stringify(rows4)
+  );
+  const rows5 = await discovery.discoverModels(cred, { officialMeta, fetchFn: async () => ({ ok: true, json: async () => ({ data: [{ id: 'glm-9.9' }] }) }) });
+  check('发现: 目录无 5.3 系（过滤后为空）→ 回退静态表', rows5.length === 3);
 }
 
 // ─── 5. 并发预算与流拦截记账（§3.4 N=2） ─────────────────────────────────────
@@ -228,10 +413,25 @@ async function assertRejects(promise, pattern, label) {
 {
   const pkg = JSON.parse(readFileSync(join(PLUGIN_ROOT, 'package.json'), 'utf8'));
   check('manifest: 名字正确', pkg.name === '@local/dsh-connect-zcode');
-  check('manifest: 无 dsh.client（防 DSH 拒启）', pkg.dsh?.client === undefined && Object.keys(pkg.dsh ?? {}).join(',') === 'bundle');
+  /* T21 防拒启核心断言：dsh.client 与 exports["./client"] 必须同时存在，且入口文件真实存在。
+   * 声明了 dsh.client 却缺 lib/client.js（或加载失败）= DSH 拒绝启动（ClientPackageCompositionError，
+   * 启动后几秒自行退出）——这对断言是本插件的生命线，任何一侧缺失即 FAIL。 */
+  const clientRel = pkg.dsh?.client !== undefined ? pkg.exports?.['./client'] : undefined;
+  const clientFile = typeof clientRel === 'string' ? join(PLUGIN_ROOT, clientRel) : undefined;
+  check('manifest: dsh.client 与 exports["./client"] 成对存在（防拒启）', pkg.dsh?.client !== undefined && typeof clientRel === 'string', `dsh.client=${JSON.stringify(pkg.dsh?.client ?? null)}`);
+  check('manifest: client 入口文件真实存在', !!clientFile && existsSync(clientFile), clientFile ?? '(未声明)');
+  check('manifest: client 声明形状（platform web + 非空 inject 列表）', pkg.dsh?.client?.platform === 'web' && Array.isArray(pkg.dsh?.client?.inject) && pkg.dsh.client.inject.length > 0, JSON.stringify(pkg.dsh?.client?.inject ?? null));
   check('manifest: peerDependencies 声明宿主栈', !!pkg.peerDependencies?.['@earendil-works/pi-ai'] && !!pkg.peerDependencies?.['@deepseek-ai/dsh-llm-pi-ai']);
   const patch = readFileSync(join(PLUGIN_ROOT, 'cordis.patch.yml'), 'utf8');
   check('patch: 含 zcode-connect 与 @local/dsh-connect-zcode', patch.includes('id: zcode-connect') && patch.includes("'@local/dsh-connect-zcode'"));
+  /* volatile 标记 tripwire：0.1.7 设置写入门禁要求条目含 volatile 字段，缺了它面板每次写入都被
+   * 静默拒绝（trae lib/index.js :4086-4094 实证注释）。schemastery 在开发目录解析不到、无法运行时
+   * 断言主路径，故以源码级 tripwire 兜底（防该标记被无意删除）。T22：三个面板写入字段全部要有。 */
+  const indexSource = readFileSync(join(PLUGIN_ROOT, 'index.js'), 'utf8');
+  check('纪律: enabledModelIds 带 volatile 标记（写入门禁硬前提）', indexSource.includes('enabledModelIds: asVolatile('));
+  check('纪律: contextBudgets 带 volatile 标记（T22 写入门禁）', indexSource.includes('contextBudgets: asVolatile('));
+  check('纪律: modelOverrides 带 volatile 标记（T22 写入门禁）', indexSource.includes('modelOverrides: asVolatile('));
+  check('纪律: 1M 档语义 tripwire（applyContextBudgets 只认官方 Max 档）', indexSource.includes('applyContextBudgets') && indexSource.includes('readOfficialMeta'));
 
   const jsFiles = [];
   (function walk(dir) {
@@ -251,6 +451,62 @@ async function assertRejects(promise, pattern, label) {
     '纪律: README 存在且含安装告示（需使用者确认，非自动安装）',
     readmeText.length > 0 && /(用户批准|自行确认|安装.{0,12}(改动|修改)|需.{0,6}确认)/.test(readmeText),
   );
+  check('纪律: README 含设置面板与 enabledModelIds 语义（空 = 全部显示）', readmeText.includes('设置面板') && readmeText.includes('enabledModelIds') && /空\s*=\s*全部显示/.test(readmeText));
+  check(
+    '纪律: README 含 T22 语义（5.3 系过滤 / max→high 映射 / 官方锁定判定来源 / 1M 实测差异）',
+    /5\.3\s*系/.test(readmeText) && readmeText.includes('max→high') && readmeText.includes('ZCode config') && readmeText.includes('200k')
+  );
+}
+
+// ─── 6.5 过滤语义 + 面板状态文档（T21/T22，纯静态零网络） ────────────────────
+{
+  const all = discovery.STATIC_MODEL_IDS.map((id) => ({ id }));
+  check('过滤: 空集/未配置 = 全量显示（T21 §3.1 关键语义）', discovery.filterByEnabledModels(all, []).length === 3 && discovery.filterByEnabledModels(all, undefined).length === 3);
+  const one = discovery.filterByEnabledModels(all, ['glm-5.3']);
+  check('过滤: 单选只留 1 项', one.length === 1 && one[0].id === 'glm-5.3', JSON.stringify(one));
+  const mixed = discovery.filterByEnabledModels(all, ['no-such-model', 'glm-5.3-flash']);
+  check('过滤: 未知 id 静默忽略', mixed.length === 1 && mixed[0].id === 'glm-5.3-flash', JSON.stringify(mixed));
+  check('过滤: 非数组输入 = 不过滤（防御）', discovery.filterByEnabledModels(all, 'glm-5.3').length === 3 && discovery.filterByEnabledModels(all, null).length === 3);
+
+  check('回环: Origin 判定（空放行/localhost·127.0.0.1 放行/外域与垃圾拒）', webStatus.originIsLoopback(undefined) === true && webStatus.originIsLoopback('') === true && webStatus.originIsLoopback('http://localhost:5173') === true && webStatus.originIsLoopback('http://127.0.0.1') === true && webStatus.originIsLoopback('http://[::1]:8080') === true && webStatus.originIsLoopback('https://evil.example') === false && webStatus.originIsLoopback('not a url') === false);
+  check('回环: Host 判定（含端口剥离）', webStatus.hostIsLoopback('localhost:5173') === true && webStatus.hostIsLoopback('127.0.0.1:3210') === true && webStatus.hostIsLoopback('[::1]:8080') === true && webStatus.hostIsLoopback('evil.example') === false && webStatus.hostIsLoopback(undefined) === false && webStatus.hostIsLoopback('') === false);
+
+  const doc = webStatus.buildStatusDocument({
+    registered: () => true,
+    readSwitch: () => ({ enabled: false }),
+    endpointHost: () => 'open.bigmodel.cn',
+    catalog: () => [
+      { id: 'glm-5.3', name: 'GLM-5.3', official: true, maxContextWindow: 1000000, input: ['text'], reasoningEfforts: { low: 'light', max: 'high', high: 'high' } },
+      { id: 'glm-5.3-flashx', name: 'GLM-5.3-FlashX', official: false, input: ['text'] },
+    ],
+    enabledModelIds: () => ['glm-5.3'],
+    lastLedger: () => ({ ts: '2026-10-01T00:00:00.000Z', model: 'glm-5.3', exit: 0, input: 1, output: 2, elapsedMs: 3 }),
+  });
+  check(
+    '状态: 文档字段齐且零凭据（端点只出 host，无 key 无 path）',
+    doc.providerRegistered === true && doc.frozen === true && doc.endpointHost === 'open.bigmodel.cn' && doc.modelsTotal === 2 &&
+      doc.enabledModelIds.join(',') === 'glm-5.3' && doc.enabledCount === 1 &&
+      !JSON.stringify(doc).includes('apiKey') && !JSON.stringify(doc).includes('api/anthropic'),
+    JSON.stringify(doc)
+  );
+  const m53 = doc.models.find((m) => m.id === 'glm-5.3');
+  const mFlashX = doc.models.find((m) => m.id === 'glm-5.3-flashx');
+  check(
+    '状态: T22 能力事实（官方徽标/1M 显隐/图片支持/推理档键序）',
+    m53?.official === true && m53?.has1m === true && m53?.imageSupported === false && JSON.stringify(m53?.reasoningVariants) === '["low","max","high"]' &&
+      mFlashX?.official === false && mFlashX?.has1m === false && mFlashX?.imageSupported === false && mFlashX?.reasoningVariants === undefined,
+    JSON.stringify(doc.models)
+  );
+  const docAll = webStatus.buildStatusDocument({ registered: () => false, readSwitch: () => ({ enabled: true }), endpointHost: () => null, catalog: () => all, enabledModelIds: () => [] });
+  check('状态: 空勾选 = enabledCount 等于总数；开关未冻结', docAll.enabledCount === 3 && docAll.modelsTotal === 3 && docAll.frozen === false && docAll.providerRegistered === false && docAll.endpointHost === null);
+
+  const statusLedgerPath = tmpFile(
+    'status-ledger.jsonl',
+    ['{"channel":"dispatch","model":"decoy"}', `{"ts":"2026-10-01T00:00:00.000Z","channel":"provider","model":"glm-5.3","exit":"error: boom ${fakeKey}","input":1,"output":2,"elapsedMs":5}`, ''].join('\n')
+  );
+  const row = webStatus.readLastLedgerRow(statusLedgerPath);
+  check('状态: 台账摘要取最后 provider 行（跳过 dispatch/空行）且出站脱敏', row?.model === 'glm-5.3' && typeof row.exit === 'string' && row.exit.includes('<REDACTED>') && !row.exit.includes(fakeKey) && row.input === 1 && row.output === 2 && row.elapsedMs === 5, JSON.stringify(row));
+  check('状态: 台账缺失/损坏 → null（尽力而为，不炸路由）', webStatus.readLastLedgerRow(join(tmp, 'no-such-ledger.jsonl')) === null && webStatus.readLastLedgerRow(tmpFile('status-ledger-bad.jsonl', 'not json{{')) === null);
 }
 
 // ─── 7. 全链路注册（stub 宿主栈 + 假 ctx） ───────────────────────────────────
@@ -358,10 +614,42 @@ async function assertRejects(promise, pattern, label) {
   } finally {
     globalThis.fetch = realFetch;
   }
-  check('发现: 冻结期零网络直接回静态表', Array.isArray(discoveryRows) && discoveryRows.length === 11 && discoveryRows[0].contextWindow === 200000, `rows=${discoveryRows?.length}`);
+  check('发现: 冻结期零网络直接回静态表', Array.isArray(discoveryRows) && discoveryRows.length === 3 && discoveryRows[0].contextWindow === 200000, `rows=${discoveryRows?.length}`);
+
+  /* T22 host 管线：带预算/开关/勾选的第二次注册——校验 provider.models 的 trae 形状输出。
+   * 凭据 fixture 无 models 段 → officialMeta = {} → 三行全按「无官方数据」处理，
+   * 预算全部无效（无官方 Max 档）→ 这正是「无官方数据时 1M 不生效」的 host 侧实证。 */
+  const ctx1b = fakeCtx();
+  index.apply(ctx1b, {
+    switchPath,
+    credentialPath: credPath,
+    ledgerPath,
+    contextBudgets: { 'glm-5.3': 1000000, 'glm-5.3-flashx': 1000000 },
+    modelOverrides: { 'glm-5.3-flashx': { reasoning: true, image: true }, 'glm-5.3': { image: true } },
+    enabledModelIds: [],
+  });
+  const registered1b = await waitFor(() => registrations.adapters.length === 2 && registrations.discoveries.length === 2);
+  const piModels = registered1b ? registrations.adapters[1]?.adapter?.options?.profiles().get('zcode')?.piProvider?.getModels() : null;
+  const m53 = piModels?.find((m) => m.id === 'glm-5.3');
+  const mFlash = piModels?.find((m) => m.id === 'glm-5.3-flash');
+  const mFlashX = piModels?.find((m) => m.id === 'glm-5.3-flashx');
+  check('T22 管线: 三行 5.3 系模型注册', Array.isArray(piModels) && piModels.length === 3, `models=${piModels?.length}`);
+  /* GLM-5.3 有官方数据（fixture models 段）：官方锁定优先——用户 override 强塞 image
+   * 必须被忽略（官方 modalities 声明 text-only），且 1M 预算合法生效（官方 Max 档）。
+   * 注意：这与「无官方数据」的 FlashX 形成对照（见下一条断言）。 */
+  check(
+    'T22 管线: 官方数据锁定优先——GLM-5.3 override 强塞 image 被忽略、1M 预算合法生效',
+    JSON.stringify(m53?.input) === '["text"]' &&
+      m53?.contextWindow === 1000000 &&
+      m53?.reasoning === true &&
+      m53?.compat?.supportsReasoningEffort === true,
+    JSON.stringify(m53)
+  );
+  check('T22 管线: FlashX 用户开关开（推理 + 图片）+ 预算无效 + thinkingLevelMap 仅 high 档', mFlashX?.reasoning === true && mFlashX?.compat?.supportsReasoningEffort === true && JSON.stringify(mFlashX?.input) === '["text","image"]' && mFlashX?.contextWindow === 200000 && JSON.stringify(mFlashX?.thinkingLevelMap) === '{"off":null,"minimal":null,"low":null,"medium":null,"high":"high","xhigh":null,"max":null}', JSON.stringify(mFlashX));
+  check('T22 管线: 每行正整数 contextWindow + api/provider/baseUrl（红线 + trae 形状）', (piModels ?? []).every((m) => Number.isInteger(m?.contextWindow) && m.contextWindow > 0 && m.api === 'anthropic-messages' && m.provider === 'zcode' && typeof m.baseUrl === 'string' && m.baseUrl !== ''));
 
   for (const off of effects.splice(0)) off?.();
-  check('卸载: 三部曲对称移除', registrations.adapters.length === 0 && registrations.discoveries.length === 0 && registrations.directories.length === 0);
+  check('卸载: 三部曲对称移除（两次注册一并卸载）', registrations.adapters.length === 0 && registrations.discoveries.length === 0 && registrations.directories.length === 0);
 
   writeFileSync(switchPath, JSON.stringify({ enabled: true }), 'utf8');
   const ctx2 = fakeCtx();
@@ -375,6 +663,136 @@ async function assertRejects(promise, pattern, label) {
   index.apply(ctx3, { switchPath, credentialPath: credPath, ledgerPath });
   const noModules = await waitFor(() => errors.some((e) => e.includes('宿主 LLM 栈不可用')));
   check('失败面: 宿主栈不可解析 → 可操作错误且不注册', noModules === true, errors.find((e) => e.includes('宿主 LLM 栈不可用'))?.slice(0, 80));
+}
+
+// ─── 7.5 client 半行为（stub 宿主 + stub react；T21 §3.5 + T22 §1.5-6） ──────
+{
+  const clientFile = join(PLUGIN_ROOT, 'lib', 'client.js');
+  const clientSource = readFileSync(clientFile, 'utf8');
+  let parsed = null;
+  try {
+    new Function(clientSource); // 仅解析不执行
+    parsed = true;
+  } catch (err) {
+    parsed = err;
+  }
+  check('client: 语法合法（new Function 解析）', parsed === true, parsed instanceof Error ? parsed.message : '');
+  check('client: 信封自足（零静态 import；require 仅限宿主提供的 react）', !/\bimport\s/.test(clientSource) && !/require\("(?!react")/.test(clientSource));
+
+  const hadWindow = typeof globalThis.window !== 'undefined';
+  const realWindow = globalThis.window;
+  let loaded = null;
+  globalThis.window = { __ModuleLoader__: { load: (def) => { loaded = def; } } };
+  /** 元素树工具（stub createElement 产物 {type, props, children}）。 */
+  const findAllEls = (root, pred) => {
+    const out = [];
+    const walkFn = (node) => {
+      if (!node || typeof node !== 'object') return;
+      if (pred(node)) out.push(node);
+      for (const child of node.children ?? []) walkFn(child);
+    };
+    walkFn(root);
+    return out;
+  };
+  const byDataRole = (root, role) => findAllEls(root, (n) => n.type === 'input' && n.props?.['data-role'] === role);
+  try {
+    new Function(clientSource)(); // 执行信封 → load 被捕获（factory 不在此刻求值）
+    check('client: ModuleLoader 信封执行即交付 factory（id=包名）', !!loaded && typeof loaded.factory === 'function' && loaded.id === '@local/dsh-connect-zcode', `id=${loaded?.id ?? 'null'}`);
+    const reactStub = {
+      createElement: (type, props, ...children) => ({ type, props, children: children.flat(Infinity) }),
+      useState: (init) => [typeof init === 'function' ? init() : init, () => {}],
+      useEffect: () => {},
+    };
+    const clientExports = loaded.factory((spec) => (spec === 'react' ? reactStub : {}));
+    check('client: 导出 apply/inject/name 且 inject 只声明 slots（最小失败面）', typeof clientExports?.apply === 'function' && Array.isArray(clientExports?.inject) && clientExports.inject.length === 1 && clientExports.inject[0] === 'slots' && typeof clientExports?.name === 'string');
+
+    const slotInjects = [];
+    const slotRegisters = [];
+    const stubCtx = () => ({
+      get: () => undefined, // configForms 缺席 → 软探测降级（只读），绝不抛
+      slots: {
+        inject: (slotName, registrar) => slotInjects.push({ slotName, registrar }),
+        register: (desc, component) => slotRegisters.push({ desc, component }),
+      },
+    });
+    let applyThrew = null;
+    try {
+      clientExports.apply(stubCtx());
+    } catch (err) {
+      applyThrew = err;
+    }
+    check('client: apply 在服务缺失 stub ctx 下不抛且注册 bundle.config 卡（§0.3）', applyThrew === null && slotInjects.length === 1 && slotInjects[0].slotName === 'plugins.bundle.config', applyThrew?.message);
+    slotInjects[0]?.registrar?.();
+    const card = slotRegisters[0];
+    check('client: 卡 key = bundle 包名 + priority 30（slot 契约）', card?.desc?.key === '@local/dsh-connect-zcode' && card?.desc?.priority === 30 && card?.desc?.name === 'plugins.bundle.config', JSON.stringify(card?.desc ?? null));
+    check('client: 卡组件为函数（React 函数组件，无构建链）', typeof card?.component === 'function');
+
+    const scope = { getSnapshot: () => ({ status: 'unavailable', value: void 0, writable: false }), subscribe: () => () => {}, set: async () => false };
+    let summaryEl = null;
+    let pageEl = null;
+    try {
+      summaryEl = card.component({ settingsScope: scope, statusRef: { current: null }, view: 'summary' });
+    } catch (err) {
+      summaryEl = err;
+    }
+    try {
+      pageEl = card.component({ settingsScope: scope, statusRef: { current: null }, view: 'page' });
+    } catch (err) {
+      pageEl = err;
+    }
+    check(
+      'client: summary/page 双视图渲染不抛且产出元素',
+      !(summaryEl instanceof Error) && !(pageEl instanceof Error) && !!summaryEl && !!pageEl,
+      `${summaryEl?.message ?? ''} ${pageEl?.message ?? ''}`
+    );
+    check('client: page 视图在状态路由缺席时回退静态表（3 个显隐勾选行，T22 裁剪）', byDataRole(pageEl, 'enable').length === 3, `enable=${byDataRole(pageEl, 'enable').length}`);
+    check('client: 勾选语义文案在场（全部不勾 = 全部显示）', JSON.stringify(pageEl).includes('全部不勾 = 全部显示'));
+
+    /* T22 §1.5-6：带权威事实目录 + 可写配置的面板行控件断言。
+     * 配置：GLM-5.3 已勾 1M；FlashX 推理开；目录：GLM-5.3/Flash 官方（Flash 含图）。 */
+    const factsScope = {
+      getSnapshot: () => ({
+        status: 'ready',
+        writable: true,
+        value: { enabledModelIds: [], contextBudgets: { 'glm-5.3': 1000000 }, modelOverrides: { 'glm-5.3-flashx': { reasoning: true } } },
+      }),
+      subscribe: () => () => {},
+      set: async () => true,
+    };
+    const statusDoc = {
+      frozen: false,
+      modelsTotal: 3,
+      models: [
+        { id: 'glm-5.3', name: 'GLM-5.3', official: true, has1m: true, imageSupported: false, reasoningVariants: ['low', 'max', 'high'] },
+        { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', official: true, has1m: true, imageSupported: true, reasoningVariants: ['low', 'max', 'high'] },
+        { id: 'glm-5.3-flashx', name: 'GLM-5.3-FlashX', official: false, has1m: false, imageSupported: false, reasoningVariants: [] },
+      ],
+    };
+    let factsPage = null;
+    try {
+      factsPage = card.component({ settingsScope: factsScope, statusRef: { current: statusDoc }, view: 'page' });
+    } catch (err) {
+      factsPage = err;
+    }
+    check('client: 事实目录 + 可写配置 page 渲染不抛', !(factsPage instanceof Error) && !!factsPage, factsPage?.message);
+    const rows = findAllEls(factsPage, (n) => typeof n.props?.className === 'string' && n.props.className.split(' ').includes('dzc-model'));
+    const rowById = (id) => rows.find((r) => r.props?.key === id);
+    const rowBox = (id, role) => byDataRole(rowById(id), role)[0];
+    check('client: 行布局 3 行（一行一模型）', rows.length === 3, `rows=${rows.length}`);
+    check('client: 官方徽标 2 枚（·官方）', findAllEls(factsPage, (n) => n.props?.className === 'dzc-badge').length === 2);
+    check('client: 1M 单选只在官方 Max 档模型出现（2 枚；FlashX 无 1M）', byDataRole(factsPage, 'ctx-1m').length === 2 && byDataRole(factsPage, 'ctx-base').length === 3 && byDataRole(rowById('glm-5.3-flashx'), 'ctx-1m').length === 0);
+    check('client: 已配预算模型 1M 选中、未配模型 200K 选中', rowBox('glm-5.3', 'ctx-1m')?.props.checked === true && rowBox('glm-5.3-flash', 'ctx-1m')?.props.checked === false && rowBox('glm-5.3-flashx', 'ctx-base')?.props.checked === true);
+    check('client: 官方行图片锁定（GLM-5.3 关+disabled / Flash 开+disabled）', rowBox('glm-5.3', 'image')?.props.disabled === true && rowBox('glm-5.3', 'image')?.props.checked === false && rowBox('glm-5.3-flash', 'image')?.props.disabled === true && rowBox('glm-5.3-flash', 'image')?.props.checked === true);
+    check('client: FlashX 图片/推理开关可用（推理开反映配置）', rowBox('glm-5.3-flashx', 'image')?.props.disabled === false && rowBox('glm-5.3-flashx', 'image')?.props.checked === false && rowBox('glm-5.3-flashx', 'reasoning')?.props.checked === true && rowBox('glm-5.3-flashx', 'reasoning')?.props.disabled === false);
+    check('client: 官方行无推理开关（只展示锁定档位）', byDataRole(rowById('glm-5.3'), 'reasoning').length === 0 && byDataRole(rowById('glm-5.3-flash'), 'reasoning').length === 0);
+    check('client: 官方推理档锁定文案在场（low / max / high）', JSON.stringify(factsPage).includes('推理档: low / max / high（官方，锁定）'));
+    check('client: FlashX 无官方数据提示在场', JSON.stringify(factsPage).includes('未提供官方数据'));
+    check('client: 概览含上下文预算行（1 个模型已切 1M）', JSON.stringify(factsPage).includes('上下文预算') && JSON.stringify(factsPage).includes('1 个模型已切 1M'));
+    check('client: 1M 实测差异提示在场（CLI 实测 200k）', JSON.stringify(factsPage).includes('CLI 实测有效窗口 200k'));
+  } finally {
+    if (hadWindow) globalThis.window = realWindow;
+    else delete globalThis.window;
+  }
 }
 
 // ─── 8. 零明文终扫（§3.5-4） ─────────────────────────────────────────────────
