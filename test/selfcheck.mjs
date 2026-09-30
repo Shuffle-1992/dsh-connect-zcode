@@ -714,7 +714,36 @@ async function assertRejects(promise, pattern, label) {
       useEffect: () => {},
     };
     const clientExports = loaded.factory((spec) => (spec === 'react' ? reactStub : {}));
-    check('client: 导出 apply/inject/name 且 inject 只声明 slots（最小失败面）', typeof clientExports?.apply === 'function' && Array.isArray(clientExports?.inject) && clientExports.inject.length === 1 && clientExports.inject[0] === 'slots' && typeof clientExports?.name === 'string');
+    /* inject 断言（2026-10-01 真机实证后修正）：
+     * 原断言要求「只声明 slots」——那是 T21 过度优化的产物，且**直接导致了面板永久只读**
+     * （configForms 由 ui-settings 的 client 半提供，而它需要组合里先有 remote 服务）。
+     * 正确契约：必须声明 slots + locale + remote（两个已证可用的参照取并集），
+     * 且 manifest 的 dsh.client.inject 必须含提供 remote 的 @deepseek-ai/dsh-api-remotes。
+     * 见 lib/client.js 的 inject 注释与 pitfalls §10.7。 */
+    check(
+      'client: 导出 apply/inject/name 且 inject 含 slots+locale+remote（面板可写前提）',
+      typeof clientExports?.apply === 'function' &&
+        Array.isArray(clientExports?.inject) &&
+        ['slots', 'locale', 'remote'].every((s) => clientExports.inject.includes(s)) &&
+        typeof clientExports?.name === 'string',
+      JSON.stringify(clientExports?.inject)
+    );
+    check(
+      'client: manifest dsh.client.inject 含 api-remotes（提供 remote，configForms 前置）',
+      (() => {
+        const pkg = JSON.parse(readFileSync(join(PLUGIN_ROOT, 'package.json'), 'utf8'));
+        const list = pkg?.dsh?.client?.inject ?? [];
+        return list.includes('@deepseek-ai/dsh-api-remotes') && list.includes('@deepseek-ai/dsh-client-ui-settings');
+      })(),
+      JSON.stringify(JSON.parse(readFileSync(join(PLUGIN_ROOT, 'package.json'), 'utf8'))?.dsh?.client?.inject)
+    );
+    check(
+      'client: manifest 有顶层 description/displayName（插件列表显示描述行）',
+      (() => {
+        const pkg = JSON.parse(readFileSync(join(PLUGIN_ROOT, 'package.json'), 'utf8'));
+        return typeof pkg.description === 'string' && pkg.description.length > 0 && typeof pkg.displayName === 'string' && pkg.displayName.length > 0;
+      })()
+    );
 
     const slotInjects = [];
     const slotRegisters = [];
@@ -795,7 +824,7 @@ async function assertRejects(promise, pattern, label) {
     check('client: 官方行图片锁定（GLM-5.3 关+disabled / Flash 开+disabled）', rowBox('glm-5.3', 'image')?.props.disabled === true && rowBox('glm-5.3', 'image')?.props.checked === false && rowBox('glm-5.3-flash', 'image')?.props.disabled === true && rowBox('glm-5.3-flash', 'image')?.props.checked === true);
     check('client: FlashX 图片/推理开关可用（推理开反映配置）', rowBox('glm-5.3-flashx', 'image')?.props.disabled === false && rowBox('glm-5.3-flashx', 'image')?.props.checked === false && rowBox('glm-5.3-flashx', 'reasoning')?.props.checked === true && rowBox('glm-5.3-flashx', 'reasoning')?.props.disabled === false);
     check('client: 官方行无推理开关（只展示锁定档位）', byDataRole(rowById('glm-5.3'), 'reasoning').length === 0 && byDataRole(rowById('glm-5.3-flash'), 'reasoning').length === 0);
-    check('client: 官方推理档锁定文案在场（low / max / high）', JSON.stringify(factsPage).includes('推理档: low / max / high（官方，锁定）'));
+    check('client: 官方推理档锁定文案在场（low / max / high）', JSON.stringify(factsPage).includes('推理档：low / max / high（官方，锁定）'));
     check('client: FlashX 无官方数据提示在场', JSON.stringify(factsPage).includes('未提供官方数据'));
     check('client: 概览含上下文预算行（1 个模型已切 1M）', JSON.stringify(factsPage).includes('上下文预算') && JSON.stringify(factsPage).includes('1 个模型已切 1M'));
     check('client: 1M 实测差异提示在场（CLI 实测 200k）', JSON.stringify(factsPage).includes('CLI 实测有效窗口 200k'));

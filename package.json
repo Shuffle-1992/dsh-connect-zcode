@@ -1,6 +1,8 @@
 {
   "name": "@local/dsh-connect-zcode",
-  "version": "0.3.0",
+  "displayName": "DSH Connect ZCode",
+  "description": "把 ZCode（Z.ai / 智谱 BigModel Coding Plan）接入 DeepSeek Harness：复用本机已登录的套餐凭据，提供模型显隐、200K/1M 上下文预算与推理档/图片能力面板。",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "engines": {
@@ -16,18 +18,25 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-renderer",
         "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-settings-plugins"
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-settings-plugins",
+        "@deepseek-ai/dsh-client-ui-primitives",
+        "@deepseek-ai/dsh-client-locale"
       ]
     }
   },
   "meta": { "title": "ZCode Coding Plan", "description": "把 ZCode Coding Plan 注册为 DSH 的 LLM provider（凭据零落盘，含模型显隐/能力面板）" },
   "peerDependencies": {
+    "@deepseek-ai/dsh-client-ui-primitives": ">=0.1.7-rc.1 <0.3.0-0",
     "@deepseek-ai/dsh-llm": ">=0.1.7-rc.1 <0.3.0-0",
     "@deepseek-ai/dsh-llm-pi-ai": ">=0.1.7-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-settings": ">=0.1.7-rc.1 <0.3.0-0",
     "@deepseek-ai/schemastery": ">=3.18.4 <4.0.0",
-    "@earendil-works/pi-ai": ">=0.85.1"
+    "@earendil-works/pi-ai": ">=0.85.1",
+    "react": "^18.2.0"
   },
   "files": ["index.js", "lib", "cordis.patch.yml", "README.md", "test"]
 }
