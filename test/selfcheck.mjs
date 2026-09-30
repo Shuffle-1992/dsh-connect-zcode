@@ -804,6 +804,11 @@ async function assertRejects(promise, pattern, label) {
   const adapter = registrations.adapters[0]?.adapter;
   const opts = adapter?.options;
   check('适配器: profiles 单例 + INERT_AUTH + resolveApiKey', typeof opts?.profiles === 'function' && opts?.profiles() instanceof Map && typeof opts?.resolveApiKey === 'function' && typeof opts?.auth?.credentials?.read === 'function');
+  /* 默认推理档（2026-10-01）：默认 'none' → profile 不带 reasoning 字段（零回归）。
+   * profile.reasoning → dsh-llm-pi-ai :1820 catalog defaultEffort + :1852 实际请求兜底档；
+   * 但 provider 级静态档对"不支持该档的模型"会在 :1848 无条件校验、:1705 throw ——
+   * 因此默认必须不设（FlashX 等非推理模型无档位控件，无法自救）。 */
+  check('注册: 默认不设 profile.reasoning（none，零回归）', opts?.profiles()?.get('zcode')?.reasoning === undefined, `reasoning=${opts?.profiles()?.get('zcode')?.reasoning}`);
   const resolvedKey = await opts.resolveApiKey('zcode', opts.profiles().get('zcode'));
   check('调用门: 开关开+凭据有效 → 返回 key', resolvedKey === fakeKey);
   writeFileSync(switchPath, JSON.stringify({ enabled: false }), 'utf8');
@@ -854,6 +859,31 @@ async function assertRejects(promise, pattern, label) {
   );
   check('T22 管线: FlashX 用户开关开（推理 + 图片）+ 预算无效 + thinkingLevelMap 仅 high 档', mFlashX?.reasoning === true && mFlashX?.compat?.supportsReasoningEffort === true && JSON.stringify(mFlashX?.input) === '["text","image"]' && mFlashX?.contextWindow === 200000 && JSON.stringify(mFlashX?.thinkingLevelMap) === '{"off":null,"minimal":null,"low":null,"medium":null,"high":"high","xhigh":null,"max":null}', JSON.stringify(mFlashX));
   check('T22 管线: 每行正整数 contextWindow + api/provider/baseUrl（红线 + trae 形状）', (piModels ?? []).every((m) => Number.isInteger(m?.contextWindow) && m.contextWindow > 0 && m.api === 'anthropic-messages' && m.provider === 'zcode' && typeof m.baseUrl === 'string' && m.baseUrl !== ''));
+
+  /* 默认推理档显式配置场景：defaultReasoningEffort='max' → profile.reasoning='max' 生效；
+   * 同时守卫必须 warn 出"不支持该档"的模型（fixture 下 glm-5.3-flash / flashx 无推理元数据 → 受害者）。 */
+  {
+    const warnings = [];
+    const origWarn = console.warn;
+    console.warn = (msg) => warnings.push(String(msg));
+    try {
+      /* 激活是异步的（waitFor 才见注册），桩必须活到 waitFor 之后 —— 守卫在插件激活期运行。 */
+      const ctx1c = fakeCtx();
+      index.apply(ctx1c, { switchPath, credentialPath: credPath, ledgerPath, defaultReasoningEffort: 'max' });
+      const registered1c = await waitFor(() => registrations.adapters.length === 3);
+      const prof1c = registered1c ? registrations.adapters[2]?.adapter?.options?.profiles().get('zcode') : null;
+      const warnText = warnings.join(' ');
+      check(
+        '推理档: 显式 max → profile.reasoning=max + 守卫 warn 列出不支持模型',
+        prof1c?.reasoning === 'max' &&
+          warnText.includes("defaultReasoningEffort='max'") &&
+          warnText.includes('glm-5.3-flash'),
+        `reasoning=${prof1c?.reasoning} warn=${warnText.slice(0, 120)}`
+      );
+    } finally {
+      console.warn = origWarn;
+    }
+  }
 
   for (const off of effects.splice(0)) off?.();
   check('卸载: 三部曲对称移除（两次注册一并卸载）', registrations.adapters.length === 0 && registrations.discoveries.length === 0 && registrations.directories.length === 0);

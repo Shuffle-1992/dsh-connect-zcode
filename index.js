@@ -126,6 +126,8 @@ function normalizeConfig(config) {
     ledgerPath: nonEmptyStr(v.ledgerPath, DEFAULT_LEDGER_PATH),
     // 回退开关：仅显式 false 时关闭（缺省/非布尔 = 开启，保持既有行为）。
     credentialFallback: v.credentialFallback !== false,
+    // 默认推理档：'none' = 不设（零回归）；非法值一律回 'none'。
+    defaultReasoningEffort: ['low', 'high', 'max'].includes(v.defaultReasoningEffort) ? v.defaultReasoningEffort : 'none',
     // 降级路径也要保真这些字段（活读，剥 volatile 引用），否则 validate 会把面板写入剥掉。
     enabledModelIds: enabledModelIdsOf(v),
     contextBudgets: contextBudgetsOf(v),
@@ -178,6 +180,12 @@ async function loadConfig() {
         .boolean()
         .default(true)
         .description('凭据库回退：config.json 的 Key 验活失败时，自动回退到 ZCode 加密凭据库（credentials.json）；置 false 则只用 config.json（便于排查 / 不愿读加密存储时使用）'),
+      defaultReasoningEffort: z
+        .enum(['none', 'low', 'high', 'max'])
+        .default('none')
+        .description('默认推理档（profile.reasoning）：设为 low/high/max 后，模型切换后选择器初始显示该档、未手动选档时按该档发送。' +
+          '⚠️ 只在"本 provider 全部启用模型都支持该档"时才能开：不支持该档的模型（如未开推理开关的 FlashX）会直接请求失败' +
+          '（dsh-llm-pi-ai :1848 无条件校验、:1705 throw，且无档位控件可救）。none = 不设（现状，最安全）。手动选档始终优先。'),
       // 面板写入目标字段，必须 volatile（见 asVolatile 注释）；空 = 全部显示。
       enabledModelIds: asVolatile(
         z.array(z.string()).default([]).description('模型显隐勾选（设置面板写入）；空 = 全部显示')
@@ -382,6 +390,25 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
   const api = instrumentApi(mods.anthropicMessagesApi(), { semaphore, record });
   let models = buildModelEntries(boot.baseURL, state.lastCatalog, readUserCfg());
 
+  /* 默认推理档守卫（启动期静态检查）：配置了 defaultReasoningEffort 但静态目录里有模型
+   * 不支持该档（非推理模型 / 该档 thinkingLevelMap 为空）→ 明确列出受影响模型。
+   * 不阻断注册（用户显式配置 = 知情选择），但让"FlashX 突然全挂"可一眼定位。 */
+  if (cfg.defaultReasoningEffort !== 'none') {
+    const effort = cfg.defaultReasoningEffort;
+    const victims = models.filter((m) => {
+      if (!m.reasoning) return true; // 非推理模型：getSupportedThinkingLevels 只回 ['off']
+      const mapped = m.thinkingLevelMap?.[effort];
+      return mapped === null || mapped === undefined;
+    });
+    if (victims.length > 0) {
+      console.warn(
+        `[dsh-connect-zcode] ⚠️ defaultReasoningEffort='${effort}' 但以下模型不支持该档，` +
+          `这些模型将请求失败（dsh-llm-pi-ai :1848 无条件校验）——请改用 none、在面板为这些模型开启推理开关、或换档位：` +
+          victims.map((m) => m.id).join(', ')
+      );
+    }
+  }
+
   const provider = {
     ...mods.createProvider({
       id: PROVIDER_ID,
@@ -418,6 +445,15 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
     displayName: DISPLAY_NAME,
     streamIdleTimeoutMs: STREAM_IDLE_TIMEOUT_MS,
     ...(mods.resolveRetryPolicy ? { retryPolicy: mods.resolveRetryPolicy(undefined, 'dsh-connect-zcode retryPolicy') } : {}),
+    /* 默认推理档（dsh-llm-pi-ai :1820/:1852）：
+     * - catalog 的 defaultEffort = profile.reasoning（模型支持时）→ 选择器切换模型后显示此档而非 "default"；
+     * - 实际请求 effort = 用户手动选择 ?? profile.reasoning → 未手动选档时按此档发送。
+     * ⚠️ provider 级静态档在"混合推理/非推理模型"的 provider 上不安全：不支持该档的模型
+     *   在 :1848 被无条件校验、:1705 throw，且选择器对无推理元数据的模型不给档位控件（无法自救）。
+     *   因此默认 'none'（不设，零回归）；显式配置 = 用户知情接受该代价（description 已警示）。
+     * deepseek 系"记住档位"的机制就是它配了 profile.reasoning —— 并非按模型记忆，
+     * DSH 选择器只有单一 current，本就不存 per-model 选择（2026-10-01 反编译实证）。 */
+    ...(cfg.defaultReasoningEffort === 'none' ? {} : { reasoning: cfg.defaultReasoningEffort }),
     configuredMaxTokens: new Map(),
     modelErrors: new Map(),
     defaultContextWindow: cfg.contextWindow,
