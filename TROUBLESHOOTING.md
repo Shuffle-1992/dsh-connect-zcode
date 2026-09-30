@@ -22,6 +22,7 @@
   - [2.4 宿主包必须走 asar 候选链；asar 内部不能用 `existsSync` 探测](#24-宿主包必须走-asar-候选链asar-内部不能用-existssync-探测)
   - [2.5 深色主题出现白块：token 名写错 + 浅色回退值](#25-深色主题出现白块token-名写错--浅色回退值)
   - [2.6 插件列表不显示描述：字段写错位置](#26-插件列表不显示描述字段写错位置)
+  - [2.7 声明了图片能力却没给 resolveAttachments](#27-声明了图片能力却没给-resolveattachments--带图会话整体失败)
 - [三、通用工程](#三通用工程)
   - [3.1 用 `fetch` 后调 `process.exit()` 会崩（Windows）](#31-用-fetch-后调-processexit-会崩windows)
   - [3.2 "换个位置就红"的测试是资产](#32-换个位置就红的测试是资产)
@@ -362,6 +363,44 @@ const header = JSON.parse(buf.subarray(16, 16 + headerSize).toString('utf8'));
   "meta": { "title": "…", "description": "…" }          // ← 这个 DSH 不读
 }
 ```
+
+### 2.7 声明了图片能力却没给 `resolveAttachments` → 带图会话整体失败
+
+**现象**（很有迷惑性）：
+
+- **新会话（纯文本）**调用该 provider 的模型 **完全正常**
+- 但**带图片/附件上下文**的会话里切到该模型，报：
+
+  ```
+  本轮运行失败 pi-ai image input requires the durable attachment service
+  ```
+
+**根因**
+
+模型条目声明了 `input: ["text", "image"]`（本插件的 GLM-5.3-Flash 官方 modalities 含
+image/video），但 `createProvider()` **没传 `resolveAttachments`**。
+
+pi-ai 遇到图片输入时，需要该服务把**图片引用**换成**可请求的字节**
+（`attachments.readImageRequest(ref, target)`）；服务缺席时它**直接抛错** ⇒
+**整个会话**的模型调用失败。纯文本会话不触发该路径，故"新会话能用、旧会话不能用"。
+
+**修法**（`dsh-connect-trae` 同款，**软取**而非硬 `inject`）：
+
+```js
+...mods.createProvider({
+  id, name, auth, models, api,
+  resolveAttachments: () => ctx.get('attachments'),   // ← 补这一行
+})
+```
+
+- **为什么软取**：`attachments` 缺席时返回 `undefined`，纯文本场景照常工作，
+  **不扩大启动失败面**（trae 的 host 半 `inject` 同样只有 `["llm"]`）
+- **已知边界**：宿主若真的没有 `attachments` 服务（非 Desktop 环境），
+  图片输入仍会失败 —— 这是 pi-ai 的硬要求，插件无法绕过；
+  此时应在该模型上关掉图片能力（本插件面板的图片开关，仅对**无官方数据**的模型可改）
+
+> **通用教训**：**"部分会话正常、部分会话失败"往往指向"某种输入形态触发了未接的能力"**，
+> 而不是凭据或网络问题。先看失败会话与正常会话的**输入差异**（图片/文件/长上下文）。
 
 ---
 
