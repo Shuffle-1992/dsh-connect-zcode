@@ -748,6 +748,34 @@ async function assertRejects(promise, pattern, label) {
     `vendor=${cfgVendor}${cfgVendor === 'dsh-connect-zcode-fallback' ? '（本目录解析不到 schemastery，走降级；装进 profile 后应为 schemastery）' : ''}`,
   );
 
+  /* ⚠️ 绊线：schemastery API 面必须真实存在（2026-10-01 真机事故）。
+   * 事故链：写了 `z.enum([...])` → schemastery 3.18.4 **没有 Schema.enum** → 构造时抛
+   * TypeError → 被 loadConfig 的 catch 吞掉 → 静默降级手写 schema → DSH 判
+   * `!isNativeConfigSchema` → 入口 status=unsupported → **插件整体不激活**
+   * （provider 消失、面板状态路由 404）。
+   * 为何自检原本抓不到：本目录解析不到 schemastery → 走降级 → `.enum` 那行**根本不执行**。
+   * 故这里做**静态 API 面断言**：index.js 里出现的每个 `z.<method>(` 都必须在实测白名单内。
+   * 白名单来源：asar 抽取真实 schemastery 3.18.4 后逐个 `typeof Schema[m]` 实测。 */
+  {
+    /* 白名单 = 真实 schemastery 3.18.4 静态方法（asar 抽取后 Object.getOwnPropertyNames 实测）：
+     * extend resolve from lazy natural percent date regExp arrayBuffer is any never const string
+     * number boolean bitset function array dict tuple object union intersect transform
+     * 事故里用的 `enum` **不在其中**。 */
+    const REAL_SCHEMASTERY_API = ['extend', 'resolve', 'from', 'lazy', 'natural', 'percent', 'date', 'regExp', 'arrayBuffer', 'is', 'any', 'never', 'const', 'string', 'number', 'boolean', 'bitset', 'function', 'array', 'dict', 'tuple', 'object', 'union', 'intersect', 'transform'];
+    const src = readFileSync(join(PLUGIN_ROOT, 'index.js'), 'utf8');
+    /* 必须先剥注释：本文件的注释里就写着「写成 z.enum(...) 会抛」的说明文字，
+     * 不剥会把注释当代码 → 误报。 */
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '').replace(/\s+/g, ' ');
+    /* 允许 `z .union(` 这种换行链式写法（源码里 z 与 .method 常分行）。 */
+    const used = new Set([...code.matchAll(/\bz\s*\.\s*([A-Za-z_$][\w$]*)\s*\(/g)].map((m) => m[1]));
+    const bogus = [...used].filter((m) => !REAL_SCHEMASTERY_API.includes(m));
+    check(
+      'Config: 只用真实存在的 schemastery API（防 enum 类静默降级）',
+      bogus.length === 0,
+      bogus.length ? `不存在的方法: ${bogus.join(', ')}（会导致静默降级→DSH status=unsupported）` : `used=${[...used].join(',')}`
+    );
+  }
+
   const registrations = { adapters: [], discoveries: [], directories: [], createProviderInputs: (globalThis.__zcodeCreateProviderInputs = []) };
   const errors = [];
   const effects = [];

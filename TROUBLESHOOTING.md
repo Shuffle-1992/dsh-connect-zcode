@@ -23,6 +23,7 @@
   - [2.5 深色主题出现白块：token 名写错 + 浅色回退值](#25-深色主题出现白块token-名写错--浅色回退值)
   - [2.6 插件列表不显示描述：字段写错位置](#26-插件列表不显示描述字段写错位置)
   - [2.7 声明了图片能力却没给 resolveAttachments](#27-声明了图片能力却没给-resolveattachments--带图会话整体失败)
+  - [2.8 面板报 HTTP 404：schemastery 没有 enum，静默降级致插件不激活](#28-面板报状态不可用http-404schemastery-没有-enum静默降级导致插件整体不激活)
 - [三、通用工程](#三通用工程)
   - [3.1 用 `fetch` 后调 `process.exit()` 会崩（Windows）](#31-用-fetch-后调-processexit-会崩windows)
   - [3.2 "换个位置就红"的测试是资产](#32-换个位置就红的测试是资产)
@@ -401,6 +402,56 @@ pi-ai 遇到图片输入时，需要该服务把**图片引用**换成**可请�
 
 > **通用教训**：**"部分会话正常、部分会话失败"往往指向"某种输入形态触发了未接的能力"**，
 > 而不是凭据或网络问题。先看失败会话与正常会话的**输入差异**（图片/文件/长上下文）。
+
+### 2.8 面板报「状态不可用（HTTP 404）」：schemastery 没有 `enum`，静默降级导致插件整体不激活
+
+**现象**
+
+面板顶部出现：
+
+```
+状态不可用（HTTP 404）。勾选保存不受影响；能力徽标与 1M 档以目录恢复后为准。
+```
+
+同时 **provider 从模型列表里消失**（因为插件整个没激活）。
+
+**根因链（逐环实证）**
+
+在 Config schema 里写了 `z.enum([...])`：
+
+```
+Schema.enum : undefined        ← schemastery 3.18.4 根本没有这个方法
+Schema.union: function         ← 正确的枚举写法
+```
+
+于是构造 schema 时抛 `TypeError: Schema.enum is not a function`：
+
+1. 被 `loadConfig()` 的 `catch` 吞掉 → **静默降级**为手写 fallback schema
+2. DSH 的 config 投影判定 `!isNativeConfigSchema(config)`
+   （`dsh-tool-cordis`：`if (!isNativeConfigSchema(config)) return { status: 'unsupported' }`）
+3. 入口 `status = unsupported` → **插件整体不激活**
+4. 没有 provider 注册 → 模型列表没有它；**状态路由从未注册 → 面板 404**
+
+**为什么自检没抓到**
+
+开发目录解析不到宿主 schemastery → `loadConfig` 在**构造 schema 之前**就 `if (!z) throw` 走了降级
+⇒ 那行 `.enum` **根本不执行**。**降级路径把错误完全掩盖了。**
+
+**修法（三件事一起做）**
+
+1. **用真实存在的 API**：`z.union(['none','low','high','max'])`（schemastery 的枚举写法）
+2. **让降级可见**：`catch` 里必须 `console.warn` 出原因 —— 否则"插件凭空消失"极难定位
+3. **加 API 面绊线**（自检）：扫描源码里所有 `z.<method>(`，断言都在**实测白名单**内
+   （真实静态方法：`extend resolve from lazy natural percent date regExp arrayBuffer is any never
+   const string number boolean bitset function array dict tuple object union intersect transform`）
+   - 扫描前**必须剥注释**（注释里可能写着 `z.enum(...)` 的说明文字 → 误报）
+   - 正则要允许**换行链式**（`z` 与 `.union(` 常分行，否则漏检 → 绊线形同虚设）
+
+**判据**：Cordis Inspect 查该插件 Config，`status` 应为 `schema`；
+若是 `unsupported` ⇒ Config schema 不是原生 schemastery（十有八九是构造时抛错降级了）。
+
+> **通用教训**：**"容错降级"会让错误静默化**。降级可以保留（可移植性），但**必须打日志**；
+> 否则一个 API 拼写错误会伪装成"插件消失 + 面板 404"这种毫无线索的故障。
 
 ---
 

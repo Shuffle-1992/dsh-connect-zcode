@@ -181,7 +181,12 @@ async function loadConfig() {
         .default(true)
         .description('凭据库回退：config.json 的 Key 验活失败时，自动回退到 ZCode 加密凭据库（credentials.json）；置 false 则只用 config.json（便于排查 / 不愿读加密存储时使用）'),
       defaultReasoningEffort: z
-        .enum(['none', 'low', 'high', 'max'])
+        /* ⚠️ 必须用 z.union([...])：schemastery 3.18.4 **没有 Schema.enum**
+         * （2026-10-01 实测 `typeof Schema.enum === 'undefined'`）。写成 z.enum(...) 会抛
+         * TypeError → 被 loadConfig 的 catch 吞掉 → 静默降级手写 schema → DSH 判定
+         * `!isNativeConfigSchema` → 入口 status=unsupported → **插件整体不激活**
+         * （provider 消失、状态路由 404）。见 TROUBLESHOOTING §2.8。 */
+        .union(['none', 'low', 'high', 'max'])
         .default('none')
         .description('默认推理档（profile.reasoning）：设为 low/high/max 后，模型切换后选择器初始显示该档、未手动选档时按该档发送。' +
           '⚠️ 只在"本 provider 全部启用模型都支持该档"时才能开：不支持该档的模型（如未开推理开关的 FlashX）会直接请求失败' +
@@ -203,7 +208,16 @@ async function loadConfig() {
           .description('无官方数据模型的推理/图片开关（设置面板写入）；官方数据锁定的模型忽略此项')
       ),
     });
-  } catch {
+  } catch (err) {
+    /* ⚠️ 降级必须可见（2026-10-01 教训）：手写 fallback **不是原生 schemastery schema**，
+     * DSH 的 config 投影会判 `!isNativeConfigSchema` → 入口 status=unsupported →
+     * **整个插件不激活**（provider 消失、状态路由 404）。
+     * 所以这里绝不能静默：把原因打出来，否则"插件凭空消失"极难定位。 */
+    console.warn(
+      '[dsh-connect-zcode] ⚠️ schemastery 路径不可用，降级为手写 schema —— 在 DSH 宿主内这会导致' +
+        '入口 status=unsupported（插件不激活、面板状态路由 404）。原因：' +
+        `${err?.message ?? err}`
+    );
     return fallbackConfigSchema();
   }
 }
