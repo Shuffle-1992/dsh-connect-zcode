@@ -393,6 +393,15 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
       },
       models,
       api,
+      /* 附件解析（图片输入必需）—— trae :438/:4424 同款软取。
+       * 缺了它会报「pi-ai image input requires the durable attachment service」：
+       * 我们的模型条目声明了 input 含 "image"（GLM-5.3-Flash 官方支持图片/视频），
+       * 一旦会话带图片上下文，pi-ai 就需要该服务把图片引用换成可请求的字节；
+       * 服务缺席时它直接抛错 ⇒ 整个会话的模型调用失败（纯文本会话不受影响，
+       * 所以症状是"新会话能用、带图/附件历史的会话不能用"）。
+       * 软取（而非硬 inject）：attachments 缺席时返回 undefined，纯文本场景照常工作，
+       * 与 trae 一致、不扩大启动失败面。 */
+      resolveAttachments: () => ctx.get('attachments'),
     }),
     getModels: () => models, // trae :421 同款覆写：目录以闭包内静态表为准（勾选变化时整体换数组）
   };

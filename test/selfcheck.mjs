@@ -698,7 +698,7 @@ async function assertRejects(promise, pattern, label) {
   tmpFile(join('stub-modules', '@earendil-works', 'pi-ai', 'package.json'), JSON.stringify({ name: '@earendil-works/pi-ai', type: 'module', version: '0.0.0-stub' }));
   tmpFile(
     join('stub-modules', '@earendil-works', 'pi-ai', 'dist', 'index.js'),
-    'export const createProvider = (input) => ({ id: input.id, name: input.name, auth: input.auth, getModels: () => input.models, stream: (m, c, o) => input.api.stream(m, c, o), streamSimple: (m, c, o) => input.api.streamSimple(m, c, o) });\n'
+    'export const createProvider = (input) => { (globalThis.__zcodeCreateProviderInputs ??= []).push(input); return { id: input.id, name: input.name, auth: input.auth, getModels: () => input.models, stream: (m, c, o) => input.api.stream(m, c, o), streamSimple: (m, c, o) => input.api.streamSimple(m, c, o) }; };\n'
   );
   tmpFile(
     join('stub-modules', '@earendil-works', 'pi-ai', 'dist', 'api', 'anthropic-messages.lazy.js'),
@@ -734,7 +734,7 @@ async function assertRejects(promise, pattern, label) {
     `vendor=${cfgVendor}${cfgVendor === 'dsh-connect-zcode-fallback' ? '（本目录解析不到 schemastery，走降级；装进 profile 后应为 schemastery）' : ''}`,
   );
 
-  const registrations = { adapters: [], discoveries: [], directories: [] };
+  const registrations = { adapters: [], discoveries: [], directories: [], createProviderInputs: (globalThis.__zcodeCreateProviderInputs = []) };
   const errors = [];
   const effects = [];
   const fakeCtx = () => ({
@@ -773,6 +773,16 @@ async function assertRejects(promise, pattern, label) {
   const registered = await waitFor(() => registrations.adapters.length === 1 && registrations.discoveries.length === 1 && registrations.directories.length === 1);
   check('注册: 三部曲齐（adapter+discovery+directory）', registered, `errors=${JSON.stringify(errors)}`);
   check('注册: adapter 绑定 provider id zcode', registrations.adapters[0]?.ids?.join(',') === 'zcode');
+  /* 附件解析（2026-10-01 真机报错「pi-ai image input requires the durable attachment service」）：
+   * 模型声明 input 含 image ⇒ pi-ai 需要 resolveAttachments 把图片引用换成可请求字节；
+   * 缺了它，**带图片/附件上下文的会话**整体调用失败（纯文本会话正常 ⇒ 症状很迷惑：
+   * "新会话能用、这个会话不能用"）。trae :438/:4424 同款：软取 ctx.get("attachments")。
+   * 该选项传给 createProvider（其产物被 spread 进 provider 对象），故从 stub 的 __input 取。 */
+  check(
+    '注册: createProvider 传 resolveAttachments（图片输入必需，trae 同款软取）',
+    typeof registrations.createProviderInputs?.[0]?.resolveAttachments === 'function',
+    `keys=${Object.keys(registrations.createProviderInputs?.[0] ?? {}).join(',')}`
+  );
   check('注册: settingsNs 取 Loader entry id（坑规避）', registrations.discoveries[0]?.ns === 'zcode-connect-selfcheck', registrations.discoveries[0]?.ns);
   const dirEntry = registrations.directories[0]?.[0];
   check('注册: directory 条目形状（declared:false）', dirEntry?.provider === 'zcode' && dirEntry?.displayName === 'ZCode Coding Plan' && dirEntry?.settingsNs === 'zcode-connect-selfcheck' && Array.isArray(dirEntry?.settingsPath) && dirEntry.settingsPath.length === 0 && dirEntry.declared === false);
