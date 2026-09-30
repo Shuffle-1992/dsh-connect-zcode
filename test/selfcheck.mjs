@@ -849,6 +849,33 @@ async function assertRejects(promise, pattern, label) {
     }
   })(PLUGIN_ROOT);
   check('零明文: 产物全目录 zhipu key 正则 0 命中', offenders.length === 0, offenders.join(';'));
+
+  /* 主题安全（2026-10-01 真机实证修复，pitfalls §10.8）：
+   * 深色主题下曾出现"白底卡片 + 低对比正文"——根因是 CSS 用了**不存在的 token 名**
+   * （text-primary / border / fill-primary / state-error-secondary），使**浅色回退值**
+   * （#fafafa / #fff / #e5e7eb 等）在深色下生效。
+   * 不变量：① 回退值必须主题无关（transparent / rgba(...) / currentColor / inherit）；
+   *         ② 只引用本机 Inspect 实测存在的 token 名。本断言防回归。 */
+  const clientSrc = readFileSync(join(PLUGIN_ROOT, 'lib', 'client.js'), 'utf8');
+  const cssBlock = clientSrc.slice(clientSrc.indexOf('const ZCODE_PANEL_CSS'), clientSrc.indexOf('].join('));
+  const lightOnlyFallback = cssBlock.match(/#(?:ffffff|fff|fafafa|f3f4f6|f7f8fa|e5e7eb|f0f1f3|d0d5dd|6b7280|1f2329|4f46e5|d92d20|fef3f2|22a06b)\b/gi) ?? [];
+  const ghostTokens = ['--dsw-alias-text-primary', '--dsw-alias-border,', '--dsw-alias-fill-primary', '--dsw-alias-fill-secondary', '--dsw-alias-state-error-secondary'];
+  const ghostHits = ghostTokens.filter((t) => cssBlock.includes(t));
+  check(
+    '主题: CSS 无浅色硬编码回退、无虚构 token 名（深色主题安全）',
+    lightOnlyFallback.length === 0 && ghostHits.length === 0,
+    `浅色回退=${lightOnlyFallback.join(',') || '无'} 虚构token=${ghostHits.join(',') || '无'}`
+  );
+  check(
+    '主题: CSS 回退值主题无关（transparent/rgba/currentColor）',
+    /var\(--dsw-alias-label-primary,currentColor\)/.test(cssBlock) &&
+      /var\(--dsw-alias-bg-layer-1,transparent\)/.test(cssBlock) &&
+      /rgba\(128,128,128,/.test(cssBlock)
+  );
+  check(
+    '主题: 仅引用实测存在的 token 名（label/border-l1/bg-layer/brand/state-*）',
+    ['--dsw-alias-label-primary', '--dsw-alias-label-secondary', '--dsw-alias-border-l1', '--dsw-alias-border-l2', '--dsw-alias-bg-layer-1', '--dsw-alias-bg-layer-2', '--dsw-alias-brand-primary', '--dsw-alias-state-error-primary', '--dsw-alias-state-success-primary', '--dsw-alias-state-idle-primary'].every((t) => cssBlock.includes(t))
+  );
 }
 
 // ─── 收尾 ────────────────────────────────────────────────────────────────────
