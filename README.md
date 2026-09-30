@@ -25,10 +25,16 @@ ZCode 桌面端自带一个 agent（有自己的 loop、子代理、记忆）。
 
 | 套餐类型 | 凭据形态 | 能否直连 |
 |---|---|---|
-| **Coding Plan**（付费套餐） | `~/.zcode/v2/config.json` 里的**明文一等 API Key**（zhipu 平台 `id.secret` 格式） | ✅ **可以** —— 走标准 Anthropic 兼容端点 |
+| **Coding Plan**（付费套餐） | 一等 API Key（zhipu 平台 `id.secret` 格式），存于 `config.json` 或**加密凭据库** `credentials.json` | ✅ **可以** —— 走标准 Anthropic 兼容端点 |
 | **Start Plan**（赠送/活动额度） | 账户 **JWT**，且端点需要 Aliyun 无痕验证码凭证（由 ZCode renderer 逐请求签发） | ❌ **不可** —— 直连返回 `{"code":3007,"msg":"captcha verify failed"}` |
 
 社区里 [dsh-zcode-connector](https://github.com/ZhaoAndy821/dsh-zcode-connector) 等项目断言"ZCode 无可提取 Key"，**那是 Start Plan 形态的限制，不是 ZCode 的普遍限制**。本项目只接 Coding Plan（api-key 形态），并对 start-plan 的 JWT 形态**显式拒绝**而不是静默失败。
+
+> **Coding Plan 的 Key 有两个存放位置**（这很关键，见「故障排查」）：
+> - `~/.zcode/v2/config.json` → `provider["builtin:bigmodel-coding-plan"].options.apiKey`（**明文**）
+> - `~/.zcode/v2/credentials.json` → `account-provider:coding-plan:...:api-key`（**加密** `enc:v1`）
+>
+> **OAuth 重新登录后，ZCode 只更新后者、不回写前者** —— 于是读 `config.json` 的工具集体 401。
 
 > 实测（Coding Plan）：`GET /v1/models` 与 `POST /v1/messages`（`max_tokens:1`）均 **HTTP 200**；
 > 认证头 **`x-api-key` 单头即充分**，`anthropic-version` 非必需。
@@ -194,6 +200,11 @@ wire 枚举值，不发明新映射。
 
 - **凭据零落盘、零缓存、零日志**：每次调用现读 ZCode 配置，返回值只在内存。
   ⇒ 你在 ZCode 里换 Key，本插件**自动跟随**，无需重启、无需改配置。
+- **双来源凭据 + 验活回退（方案 B，2026-10-01）**：ZCode 在 **OAuth 重新登录**后会把新
+  API Key **只写进加密凭据库** `~/.zcode/v2/credentials.json`、**不回写 `config.json`**，
+  于是所有读 `config.json` 的程序一起 401（**连 ZCode 自己的 Agent CLI 也 401**）。
+  本插件因此支持第二来源：`config.json` 优先，**验活失败**时自动回退到凭据库候选
+  （解密 `enc:v1` → 逐把验活 → 取第一把通过的）。**必须验活才切换**；全部失败则沿用原值。
 - **不发送任何不应发送的东西**：除套餐端点外无出站请求；登记台账前对错误摘要做**密钥形态脱敏**。
 - **额度冻结开关**：`switchPath` 文件里 `enabled:false` ⇒ 每次实际调用前抛错拒绝
   （连 `GET /v1/models` 也不发）。默认路径不存在 ⇒ 视为开启，未部署开关的场景零配置可用。
@@ -211,6 +222,37 @@ wire 枚举值，不发明新映射。
   schema，面板保存会收到明确报错（降级路径无法表达 volatile 标记，属已知限制）。
 - **启动安全**：`apply()` 同步不抛；注册以「凭据有效」为前提，凭据不可用时**不注册任何入口**、
   只留可操作错误日志，绝不拖垮宿主。
+
+## 故障排查：报「身份验证失败 / 密钥无效」
+
+**先判断是不是 ZCode 侧的凭据同步问题**（最常见，且与插件无关）：
+
+1. **ZCode 桌面端自己还能正常对话吗？** 若 GUI 也不通 → 在 ZCode 里重新登录。
+2. **跑一次恢复工具**（它会告诉你真相，并自动修好 `config.json`）：
+
+   ```bash
+   node scripts/sync-key-to-config.mjs --dry-run   # 只诊断，不写入
+   node scripts/sync-key-to-config.mjs             # 验活通过才写回（写前自动备份）
+   ```
+
+   典型输出（真机实测）：
+
+   ```
+   [sync-key] 现状 key head=a4b54fc1*** tail=***p4vU → ❌ 无效（HTTP 200 但 body: code=1000 身份验证失败。）
+   [sync-key]   候选 bigmodel-team-coding-plan        head=a4b54fc1*** → ❌ HTTP 200 但 body: code=1000 身份验证失败。
+   [sync-key]   候选 bigmodel-individual-coding-plan  head=852f2f9d*** → ✅ 11 个模型
+   [sync-key] 选定：bigmodel-individual-coding-plan
+   [sync-key] 已备份 → config.json.bak-dsh-<时间戳>
+   [sync-key] 回读校验：✅ 一致
+   ```
+
+   该工具修的是 **`config.json` 本身**，所以 **ZCode CLI 与其他任何读 `config.json` 的工具
+   都会一起恢复**；插件内建回退（方案 B）只覆盖本插件。**建议先跑它止血。**
+
+> ⚠️ **验活的陷阱**：bigmodel 网关对**失效 key** 的 `GET /v1/models` 也返回 **HTTP 200**，
+> body 却是 `{"code":1000,"msg":"身份验证失败。","success":false}`。
+> **只看状态码会把无效 key 判为有效** —— 判断必须校验响应体（`data` 非空且 `success !== false`）。
+
 
 ---
 

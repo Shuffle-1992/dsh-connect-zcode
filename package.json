@@ -14,7 +14,9 @@
     "./package.json": "./package.json"
   },
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "inject": [
@@ -28,7 +30,10 @@
       ]
     }
   },
-  "meta": { "title": "ZCode Coding Plan", "description": "把 ZCode Coding Plan 注册为 DSH 的 LLM provider（凭据零落盘，含模型显隐/能力面板）" },
+  "meta": {
+    "title": "ZCode Coding Plan",
+    "description": "把 ZCode Coding Plan 注册为 DSH 的 LLM provider（凭据零落盘，含模型显隐/能力面板）"
+  },
   "peerDependencies": {
     "@deepseek-ai/dsh-client-ui-primitives": ">=0.1.7-rc.1 <0.3.0-0",
     "@deepseek-ai/dsh-llm": ">=0.1.7-rc.1 <0.3.0-0",
@@ -38,5 +43,12 @@
     "@earendil-works/pi-ai": ">=0.85.1",
     "react": "^18.2.0"
   },
-  "files": ["index.js", "lib", "cordis.patch.yml", "README.md", "test"]
+  "files": [
+    "index.js",
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "test",
+    "scripts"
+  ]
 }
