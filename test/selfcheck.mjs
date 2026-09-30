@@ -155,9 +155,9 @@ async function assertRejects(promise, pattern, label) {
   })();
 
   check('凭据库: 解密 enc:v1（AES-256-GCM + sha256(secret)，与 zcode.cjs 同式）', (() => {
-    const store = tmpFile('credstore.json', JSON.stringify({ 'account-provider:coding-plan:account:acct-x:api-key': enc }));
+    const store = tmpFile('credstore.json', JSON.stringify({ 'account-provider:coding-plan:account:acct-x-plan:account:1:api-key': enc }));
     const list = credStore.readStoredApiKeys(store);
-    return list.length === 1 && list[0].id === 'acct-x' && list[0].apiKey === storedKey;
+    return list.length === 1 && list[0].id === 'acct-x-plan' && list[0].apiKey === storedKey;
   })());
   check('凭据库: 非 enc 值/坏 JSON/缺文件 → 空数组（绝不抛）', (() => {
     const bad1 = tmpFile('credstore-bad1.json', JSON.stringify({ 'account-provider:coding-plan:account:a:api-key': 'plain-not-enc' }));
@@ -166,13 +166,67 @@ async function assertRejects(promise, pattern, label) {
   })());
   check('凭据库: 只收 coding-plan 前缀 + 只收 api-key 形态', (() => {
     const store = tmpFile('credstore-filter.json', JSON.stringify({
-      'account-provider:coding-plan:account:ok:api-key': enc,
-      'account-provider:coding-plan:account:ok:other': enc,
+      'account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:123:api-key': enc,
+      'account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:123:other': enc,
       'oauth:bigmodel:access_token': enc,
-      'account-provider:other:account:x:api-key': enc,
+      'account-provider:other:account:x:account:1:api-key': enc,
     }));
     const list = credStore.readStoredApiKeys(store);
-    return list.length === 1 && list[0].id === 'ok';
+    return list.length === 1 && list[0].id === 'bigmodel-individual-coding-plan';
+  })());
+
+  /* 形态校验是**静默过滤**：若 ZCode 换 key 形态，全部候选会被滤掉、调用方只看到"空数组"。
+   * 故要求：形态不符/解密失败/库不可读 都要经 onDiagnostic 报出来（只报长度与原因，零明文）。 */
+  check('凭据库诊断: 形态不符（非 32hex.16alnum）→ 报诊断且不含 key 内容', (() => {
+    // 用一段合法加密、但明文形态不符的假值（长度 20）
+    const wrongShapePlain = 'not-a-valid-zhipu-key'; // 21 字符，明显不符 32hex.16alnum
+    const wrongShape = (() => {
+      const { createCipheriv, createHash } = crypto;
+      const secret = `zcode-credential-fallback:${process.platform}:${homedir()}:${userInfo().username}`;
+      const key = createHash('sha256').update(secret).digest();
+      const iv = Buffer.alloc(12, 9);
+      const c = createCipheriv('aes-256-gcm', key, iv);
+      const data = Buffer.concat([c.update(wrongShapePlain, 'utf8'), c.final()]);
+      return `enc:v1:${iv.toString('base64url')}.${c.getAuthTag().toString('base64url')}.${data.toString('base64url')}`;
+    })();
+    const store = tmpFile('credstore-shape.json', JSON.stringify({ 'account-provider:coding-plan:account:p:account:1:api-key': wrongShape }));
+    const msgs = [];
+    const list = credStore.readStoredApiKeys(store, { onDiagnostic: (m) => msgs.push(m) });
+    const joined = msgs.join(' ');
+    return (
+      list.length === 0 &&
+      msgs.length > 0 &&
+      joined.includes('形态校验未通过') &&
+      joined.includes(`长度=${wrongShapePlain.length}`) &&
+      !joined.includes(wrongShapePlain)
+    );
+  })());
+  check('凭据库诊断: 解密失败 → 报诊断（secret 不匹配/格式变更）', (() => {
+    const store = tmpFile('credstore-dec.json', JSON.stringify({ 'account-provider:coding-plan:account:p:account:1:api-key': 'enc:v1:AAAA.BBBB.CCCC' }));
+    const msgs = [];
+    const list = credStore.readStoredApiKeys(store, { onDiagnostic: (m) => msgs.push(m) });
+    return list.length === 0 && msgs.some((m) => m.includes('解密失败'));
+  })());
+  check('凭据库诊断: 文件缺失/坏 JSON → 报诊断', (() => {
+    const msgs1 = [];
+    credStore.readStoredApiKeys(join(tmp, 'no-such-store.json'), { onDiagnostic: (m) => msgs1.push(m) });
+    const msgs2 = [];
+    credStore.readStoredApiKeys(tmpFile('credstore-badjson.json', 'not-json{{'), { onDiagnostic: (m) => msgs2.push(m) });
+    return msgs1.some((m) => m.includes('不可读')) && msgs2.some((m) => m.includes('不可读'));
+  })());
+  check('凭据库诊断: 命中条目但全被过滤 → 汇总诊断给出分类计数', (() => {
+    const store = tmpFile('credstore-allfiltered.json', JSON.stringify({
+      'account-provider:coding-plan:account:p1:account:1:api-key': 'enc:v1:AAAA.BBBB.CCCC',
+      'account-provider:coding-plan:account:p2:account:2:api-key': 'enc:v1:DDDD.EEEE.FFFF',
+    }));
+    const msgs = [];
+    const list = credStore.readStoredApiKeys(store, { onDiagnostic: (m) => msgs.push(m) });
+    return list.length === 0 && msgs.some((m) => m.includes('全部被过滤') && m.includes('解密失败 2'));
+  })());
+  check('凭据库: keyIdOf 段数不足 → unknown（不抛）', (() => {
+    const store = tmpFile('credstore-shortkey.json', JSON.stringify({ 'account-provider:coding-plan:account:api-key': enc }));
+    const list = credStore.readStoredApiKeys(store);
+    return list.length === 1 && list[0].id === 'unknown';
   })());
   check('凭据库: keyFingerprint 不含完整 key', (() => {
     const k = mkKey('a');

@@ -142,15 +142,38 @@ async function main() {
   }
   const store = JSON.parse(readFileSync(STORE_PATH, 'utf8'));
   const candidates = [];
+  let matched = 0;
+  let decryptFailed = 0;
+  let shapeRejected = 0;
   for (const [k, v] of Object.entries(store)) {
     if (!k.startsWith('account-provider:coding-plan:') || !k.endsWith(':api-key')) continue;
+    matched += 1;
     const plain = decrypt(v);
-    if (typeof plain !== 'string' || !API_KEY_RE.test(plain)) continue;
+    if (typeof plain !== 'string') {
+      decryptFailed += 1;
+      console.warn(`[sync-key]   ⚠️ 解密失败：${k.split(':')[3] ?? 'unknown'}（secret 不匹配或 ZCode 更换了加密格式）`);
+      continue;
+    }
+    if (!API_KEY_RE.test(plain)) {
+      shapeRejected += 1;
+      console.warn(
+        `[sync-key]   ⚠️ 形态校验未通过：${k.split(':')[3] ?? 'unknown'} 长度=${plain.length}（期望 49，形态 32hex.16alnum）` +
+          ' —— 若 ZCode 更换了 key 形态，需更新脚本里的 API_KEY_RE，否则候选会被静默过滤'
+      );
+      continue;
+    }
     candidates.push({ id: k.split(':')[3] ?? 'unknown', apiKey: plain });
   }
-  console.log(`[sync-key] 凭据库候选 ${candidates.length} 把`);
+  console.log(`[sync-key] 凭据库候选 ${candidates.length} 把（命中 ${matched} 条）`);
   if (candidates.length === 0) {
-    console.error('[sync-key] ❌ 凭据库中没有可用的 coding-plan api-key（或解密不可用）。请打开 ZCode 桌面端重新登录。');
+    if (matched > 0) {
+      console.error(
+        `[sync-key] ❌ 命中的 ${matched} 条全部被过滤（解密失败 ${decryptFailed} / 形态不符 ${shapeRejected}）。` +
+          '请检查上面的 ⚠️ 诊断；若 ZCode 更换了 key 形态，需更新本脚本的 API_KEY_RE。'
+      );
+    } else {
+      console.error('[sync-key] ❌ 凭据库中没有 coding-plan 的 api-key 条目。请打开 ZCode 桌面端重新登录。');
+    }
     return 1;
   }
 
