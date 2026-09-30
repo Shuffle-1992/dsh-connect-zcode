@@ -225,33 +225,55 @@ wire 枚举值，不发明新映射。
 
 ## 故障排查：报「身份验证失败 / 密钥无效」
 
-**先判断是不是 ZCode 侧的凭据同步问题**（最常见，且与插件无关）：
+> **一句话结论**：这**几乎总是 ZCode 侧的凭据同步问题，不是本插件的 bug**。
+> 典型场景：你在 ZCode 里**退出登录 → 删密钥 → 改用 OAuth 重新授权**，此后
+> **ZCode 只把新 Key 写进加密凭据库、不回写 `config.json`**，而 `config.json` 里留着
+> **已失效的旧 Key** ⇒ 一切读 `config.json` 的程序集体 401，**连 ZCode 自己的 Agent CLI 也一样**。
 
-1. **ZCode 桌面端自己还能正常对话吗？** 若 GUI 也不通 → 在 ZCode 里重新登录。
-2. **跑一次恢复工具**（它会告诉你真相，并自动修好 `config.json`）：
+### 第 1 步：判断是不是 ZCode 侧的问题
 
-   ```bash
-   node scripts/sync-key-to-config.mjs --dry-run   # 只诊断，不写入
-   node scripts/sync-key-to-config.mjs             # 验活通过才写回（写前自动备份）
-   ```
+- **ZCode 桌面端自己还能正常对话吗？** 若 GUI 也不通 → 在 ZCode 里重新登录。
+- **看两个文件的修改时间**（最快的判据）：
+  - `~/.zcode/v2/credentials.json`（凭据库，随登录更新）
+  - `~/.zcode/v2/config.json`（插件与 CLI 读它）
 
-   典型输出（真机实测）：
+  若前者很新、后者停在很早以前 ⇒ **基本可判定是失配**。
 
-   ```
-   [sync-key] 现状 key head=a4b54fc1*** tail=***p4vU → ❌ 无效（HTTP 200 但 body: code=1000 身份验证失败。）
-   [sync-key]   候选 bigmodel-team-coding-plan        head=a4b54fc1*** → ❌ HTTP 200 但 body: code=1000 身份验证失败。
-   [sync-key]   候选 bigmodel-individual-coding-plan  head=852f2f9d*** → ✅ 11 个模型
-   [sync-key] 选定：bigmodel-individual-coding-plan
-   [sync-key] 已备份 → config.json.bak-dsh-<时间戳>
-   [sync-key] 回读校验：✅ 一致
-   ```
+### 第 2 步：跑恢复工具（推荐，一次修好所有工具）
 
-   该工具修的是 **`config.json` 本身**，所以 **ZCode CLI 与其他任何读 `config.json` 的工具
-   都会一起恢复**；插件内建回退（方案 B）只覆盖本插件。**建议先跑它止血。**
+```bash
+node scripts/sync-key-to-config.mjs --dry-run   # 只诊断，不写入
+node scripts/sync-key-to-config.mjs             # 验活通过才写回（写前自动备份）
+```
 
-> ⚠️ **验活的陷阱**：bigmodel 网关对**失效 key** 的 `GET /v1/models` 也返回 **HTTP 200**，
-> body 却是 `{"code":1000,"msg":"身份验证失败。","success":false}`。
-> **只看状态码会把无效 key 判为有效** —— 判断必须校验响应体（`data` 非空且 `success !== false`）。
+典型输出（真机实测）：
+
+```
+[sync-key] 现状 key head=a4b54fc1*** tail=***p4vU → ❌ 无效（HTTP 200 但 body: code=1000 身份验证失败。）
+[sync-key]   候选 bigmodel-team-coding-plan        head=a4b54fc1*** → ❌ HTTP 200 但 body: code=1000 身份验证失败。
+[sync-key]   候选 bigmodel-individual-coding-plan  head=852f2f9d*** → ✅ 11 个模型
+[sync-key] 选定：bigmodel-individual-coding-plan
+[sync-key] 已备份 → config.json.bak-dsh-<时间戳>
+[sync-key] 回读校验：✅ 一致
+```
+
+> 💡 **为什么建议"把密钥写回 `config.json`"**：该工具修的是 **`config.json` 本身**，
+> 而 ZCode CLI、其他项目、任何读 `config.json` 的工具**都依赖它** —— 所以这一步能
+> **一次性恢复全部工具**。插件内建回退（方案 B）只覆盖本插件自己。
+> **遇到问题先跑它止血，再谈别的。**
+
+该工具的安全边界：**只在验活通过后才写入**；全部候选都无效则**拒绝写入**（绝不做无依据修改）；
+写前自动备份、写后回读校验；**全程不打印 key 原文**（只打指纹）。
+
+> ⚠️ **验活的陷阱（务必记住）**：bigmodel 网关对**失效 key** 的 `GET /v1/models`
+> 也返回 **HTTP 200**，body 却是 `{"code":1000,"msg":"身份验证失败。","success":false}`。
+> **只看状态码会把无效 key 判为有效** —— 判断必须校验响应体
+> （`data` 非空 且 `success !== false`）。
+
+### 第 3 步：仍不通时
+
+见 **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** —— 那里系统整理了本插件开发过程中
+**在真机上踩过的全部坑**（含误判、假绿、以及每个坑的判据与修法）。
 
 
 ---

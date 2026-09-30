@@ -49,6 +49,7 @@
     "cordis.patch.yml",
     "README.md",
     "test",
-    "scripts"
+    "scripts",
+    "TROUBLESHOOTING.md"
   ]
 }
