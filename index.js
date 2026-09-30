@@ -124,6 +124,8 @@ function normalizeConfig(config) {
     credentialPath: typeof v.credentialPath === 'string' ? v.credentialPath : '',
     switchPath: nonEmptyStr(v.switchPath, DEFAULT_SWITCH_PATH),
     ledgerPath: nonEmptyStr(v.ledgerPath, DEFAULT_LEDGER_PATH),
+    // 回退开关：仅显式 false 时关闭（缺省/非布尔 = 开启，保持既有行为）。
+    credentialFallback: v.credentialFallback !== false,
     // 降级路径也要保真这些字段（活读，剥 volatile 引用），否则 validate 会把面板写入剥掉。
     enabledModelIds: enabledModelIdsOf(v),
     contextBudgets: contextBudgetsOf(v),
@@ -172,6 +174,10 @@ async function loadConfig() {
       credentialPath: z.string().default('').description('ZCode config.json 路径；留空 = ~/.zcode/v2/config.json'),
       switchPath: z.string().default(DEFAULT_SWITCH_PATH).description('派发总开关真值文件（PROTOCOL §7.1）；缺文件/损坏视为开启'),
       ledgerPath: z.string().default(DEFAULT_LEDGER_PATH).description('额度台账 zcode-runs.jsonl（PROTOCOL §5.2，channel=provider 追加行）'),
+      credentialFallback: z
+        .boolean()
+        .default(true)
+        .description('凭据库回退：config.json 的 Key 验活失败时，自动回退到 ZCode 加密凭据库（credentials.json）；置 false 则只用 config.json（便于排查 / 不愿读加密存储时使用）'),
       // 面板写入目标字段，必须 volatile（见 asVolatile 注释）；空 = 全部显示。
       enabledModelIds: asVolatile(
         z.array(z.string()).default([]).description('模型显隐勾选（设置面板写入）；空 = 全部显示')
@@ -337,6 +343,7 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
   const gate = async () => {
     assertSwitchEnabled(cfg.switchPath);
     return resolvePlanCredential(credentialPath, cfg.planKey, {
+      fallback: cfg.credentialFallback,
       onDiagnostic: (msg) => {
         try {
           console.warn(`[dsh-connect-zcode] ${msg}`);
@@ -435,6 +442,7 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
         // 方案 B：与调用门同一凭据解析（config.json 验活失败则回退凭据库），
         // 否则会出现"推理可用但目录发现用旧 key 401"的不一致。
         const credential = await resolvePlanCredential(credentialPath, cfg.planKey, {
+          fallback: cfg.credentialFallback,
           ...(cancellation === undefined ? {} : { signal: cancellation }),
         });
         const rows = await discoverModels(credential, {

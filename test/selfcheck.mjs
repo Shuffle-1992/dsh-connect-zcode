@@ -303,6 +303,20 @@ async function assertRejects(promise, pattern, label) {
     const joined = msgs.join(' ');
     return msgs.length > 0 && !joined.includes(fakeKey) && !joined.includes(storedKey);
   })());
+  /* 逃生口：fallback:false 时**不读凭据库**（与 zcode-run.mjs 的 --no-cred-fallback 同义）。
+   * 便于排查"到底是 config 还是库在起作用"，也供不愿读加密存储的部署选择。 */
+  check('回退: fallback=false → 不读凭据库，直接用 config 原值', await (async () => {
+    const cfgPath = tmpFile('rb-nofb-cfg.json', fixtureConfig());
+    const store = tmpFile('rb-nofb-store.json', JSON.stringify({ 'account-provider:coding-plan:account:p3:account:3:api-key': enc }));
+    let calls = 0;
+    const r = await credential.resolvePlanCredential(cfgPath, undefined, {
+      storePath: store,
+      fallback: false,
+      fetchFn: async () => { calls += 1; return authFailRes(); },
+    });
+    // 只验活 config 一次（不进入凭据库候选循环）
+    return r.source === 'config' && r.apiKey === fakeKey && calls === 1;
+  })());
 }
 
 // ─── 2. 开关（§3.2，三种态） ─────────────────────────────────────────────────
