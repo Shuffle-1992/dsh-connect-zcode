@@ -242,14 +242,46 @@ ZCode 自家的 `account:*-start-plan` provider（`apiKey:'' + apiKeyRequired:tr
 **根本不在 `config.json` 里**，而由账号/OAuth 侧解析（加密库中可见 `zcodejwttoken` /
 `oauth:bigmodel:access_token` / `oauth:active_provider`）——即 GUI 才走得通的那条路。
 
-**结论**：派发台的无头 CLI **无法**用 Start Plan（至少不能像 Coding Plan 那样"注入 api-key 规则"）。
-要在无头环境用 Start Plan，需要复刻 GUI 的账号登录态 + 签名凭据获取链路，
-这不是当前 runner 能表达的形态。**实用建议**：派发/provider 一律用 Coding Plan；
+#### 第二轮实验：走 CLI 自己的账号路径（全量账号态沙箱）
+
+既然纯注入不行，再验"CLI 自己的账号解析路径能否用 Start Plan"：
+把**整个 `~/.zcode` 账号态**复制进沙箱（`v2` 含 `runtime/provider/**/zcode-builtin.json` 等，
+跳过 987MB 的 `cli/`），重定向 `USERPROFILE`，并用 `ZCODE_CREDENTIAL_SECRET` 还原凭据库解密
+（fallback secret 含 `homedir`，重定向后会失效）。
+⚠️ 第一次只复制 `config.json + credentials.json` 时 CLI 报 `ZCode Built-in missing` ——
+缺的是 `v2/runtime/provider/<平台>/<版本>/endpoint-*/zcode-builtin.json`。
+
+| 测试 | 沙箱 config 状态 | 结果 |
+|---|---|---|
+| A | 原样 | **exit 0**，响应正常 |
+| B | **只**启用 start-plan（coding-plan/bigmodel 禁用） | **exit 0** |
+| C | **全部** provider 禁用 | **exit 0** |
+
+三例都成功 ⇒ **`config.json` 的 enabled 开关根本不约束 CLI 的账号路径**。
+那到底扣了谁的额度？查 GUI 周期刷新的 `billing/balance` 日志：
+
+```json
+{"entitlement_id":"zcode-v3-start-plan-trust-1001","show_name":"GLM-5.3-Flash",
+ "total_units":100000000,"used_units":0,"remaining_units":100000000}
+```
+
+**Start Plan `used_units` 始终为 0** —— 跑完 A/B/C 三例后仍未消耗。
+而 `coding-plan-cache.json` 显示 `builtin:bigmodel-coding-plan: available`、
+`builtin:zai-start-plan: unavailable (coding_plan_not_entitled)`。
+⇒ CLI 走账号路径时用的是**账号里 available 的那个（付费 Coding）套餐**，
+**从不路由到 Start Plan**。
+
+**最终结论**：派发台的无头 CLI **用不了 Start Plan**（三重独立证据：注入→V4 签名不兼容；
+账号路径→Start Plan 额度零消耗；ZCode 自评→start-plan 对 CLI 不可用）。
+Start Plan 是 **GUI（renderer）专属**的授权路径。**实用建议**：派发/provider 一律用 Coding Plan；
 Start Plan 额度请在 ZCode 桌面端使用。
 
 > **通用教训**：**别把单一账号形态的结论当成普遍结论**。
 > 排查"能不能接"时，先分清对方有几种凭据形态、你手上是哪一种；
 > 以及"**401/404 只是表象，要看客户端为此做了什么额外工作**"（这里是请求签名）。
+> 另有方法论两点：① **归因要看"谁被消耗了"**（余额/用量），而不是"跑通了"——
+> 测试 B/C 都"成功"，但成功并不等于用了目标通道；② **对照组不可省**：
+> 第一版注入配方连已知可用的 coding-plan 也失败，没有对照就会得出错误结论。
 
 ---
 
