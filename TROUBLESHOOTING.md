@@ -408,22 +408,62 @@ pi-ai 遇到图片输入时，需要该服务把**图片引用**换成**可请�
 （`attachments.readImageRequest(ref, target)`）；服务缺席时它**直接抛错** ⇒
 **整个会话**的模型调用失败。纯文本会话不触发该路径，故"新会话能用、旧会话不能用"。
 
-**修法**（`dsh-connect-trae` 同款，**软取**而非硬 `inject`）：
+**修法（两段式 —— 缺一不可）**
+
+**第 1 段：`resolveAttachments`，且必须挂在 adapter options 上**
 
 ```js
-...mods.createProvider({
-  id, name, auth, models, api,
-  resolveAttachments: () => ctx.get('attachments'),   // ← 补这一行
+new mods.PiAiAdapter({
+  profiles, auth, resolveApiKey,
+  resolveAttachments: () => ctx.get('attachments'),   // ← 挂这里
 })
 ```
 
+- **挂载点是关键**：dsh-llm-pi-ai 读的是 `this.config.resolveAttachments`，而 `this.config`
+  就是 `PiAiAdapter` 构造函数收到的 options（`:1753-1755`）。**挂到 `createProvider({...})`
+  会静默无效**，带图请求照样抛同一个错。
+  trae `:433-437` 与 DSH 自家注册内置 provider `:2569-2573` 都挂在 adapter options 上。
 - **为什么软取**：`attachments` 缺席时返回 `undefined`，纯文本场景照常工作，
   **不扩大启动失败面**（trae 的 host 半 `inject` 同样只有 `["llm"]`）
 - **已知边界**：宿主若真的没有 `attachments` 服务（非 Desktop 环境），
   图片输入仍会失败 —— 这是 pi-ai 的硬要求，插件无法绕过；
   此时应在该模型上关掉图片能力（本插件面板的图片开关，仅对**无官方数据**的模型可改）
 
-> **通用教训**：**"部分会话正常、部分会话失败"往往指向"某种输入形态触发了未接的能力"**，
+**第 2 段：profile 必须带图片请求预算**（否则修好第 1 段后会撞上**下一个**错）
+
+第 1 段修好后，带图请求会改报：
+
+```
+本轮运行失败 Image request width must be a positive integer.
+```
+
+根因：pi-ai 用 `profile.requestImagePixelBudget` / `profile.requestImageMaxBytes` 组装
+`requestImagePolicy`，再交给 `requestImageTarget` 算目标宽高；`dsh-attachment-local` 用
+`checkedInteger` 校验 width/height/maxBytes 为正整数。
+
+⚠️ **注意 `?? {}` 的陷阱**：pi-ai 写的是
+`const requestImagePolicy = images.requestImagePolicy ?? {maxPixels: 4194304, maxBytes: 1048576}` ——
+但调用方若传了个**对象**（哪怕字段全是 `undefined`），默认值就**不生效**，
+于是 `maxPixels: undefined` → 宽高算不出 → 报错。
+
+修法（trae `REQUEST_IMAGE_BUDGETS` 同款同值，数值即 DSH 自身默认，不自创阈值）：
+
+```js
+const REQUEST_IMAGE_BUDGETS = {
+  maxRequestImageBytes: 20971520,   // 20MB base64 上界
+  requestImagePixelBudget: 4194304, // 像素预算（= pi-ai 默认 maxPixels）
+  requestImageMaxBytes: 1048576,    // 单图字节（= pi-ai 默认 maxBytes）
+};
+const profile = { /* … */ ...REQUEST_IMAGE_BUDGETS };
+```
+
+> **通用教训**：**"能力声明 + 服务接线"只是第一步，还要把该能力用到的预算/策略参数补齐**。
+> 这类缺失会以"下一个看似无关的错误"形式出现（本例：`durable attachment service`
+> → `Image request width`），一次只修一个表象容易来回折腾 —— **照抄一个已跑通的同类实现
+> （trae）的全部相关字段**，比逐个试错快得多。
+> 另：**`?? 默认值` 对"传了空字段的对象"无效**，这也是静默失败的常见来源。
+
+> **通用教训（前段）**：**"部分会话正常、部分会话失败"往往指向"某种输入形态触发了未接的能力"**，
 > 而不是凭据或网络问题。先看失败会话与正常会话的**输入差异**（图片/文件/长上下文）。
 
 ### 2.8 面板报「状态不可用（HTTP 404）」：schemastery 没有 `enum`，静默降级导致插件整体不激活

@@ -68,6 +68,29 @@ function unwrapLive(value) {
 }
 
 /**
+ * 图片请求预算（**必须放进 profile**；trae `REQUEST_IMAGE_BUDGETS` 同款同值）。
+ *
+ * 为什么必需：dsh-llm-pi-ai 组装图片请求时读
+ *   `profile.requestImagePixelBudget` / `profile.requestImageMaxBytes`
+ * 组成 `requestImagePolicy`，再经 `requestImageTarget` 算目标宽高，交给
+ * `attachments.readImageRequest`；`dsh-attachment-local` 用 `checkedInteger` 校验
+ * width/height/maxBytes 为正整数。
+ *
+ * ⚠️ 缺字段的后果（2026-10-01 真机）：`requestImagePolicy` 变成
+ * `{maxPixels: undefined, maxBytes: undefined}`（**注意 `?? {}` 默认值因此不生效**），
+ * 目标宽高算不出来 ⇒ 抛 `Image request width must be a positive integer.`
+ * 表现为"图片能力声明了、attachment 服务也接上了，但一发图就失败"。
+ *
+ * 数值取 DSH 自身默认（pi-ai 内 `requestImagePolicy ?? {maxPixels: 4194304, maxBytes: 1048576}`）
+ * 与 trae 的 `maxRequestImageBytes`（20MB base64 上界）保持一致，不自创阈值。
+ */
+const REQUEST_IMAGE_BUDGETS = {
+  maxRequestImageBytes: 20971520,
+  requestImagePixelBudget: 4194304,
+  requestImageMaxBytes: 1048576,
+};
+
+/**
  * 活读面板勾选（T21 §3.1）：enabledModelIds 必须每次现读原始 config（可能是活引用），
  * 不能在 apply 时归一成快照——否则面板保存后 host 永远看不到新值。
  * 空/缺失/形状不对一律 = [] = 全部显示。
@@ -459,6 +482,9 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
      * deepseek 系"记住档位"的机制就是它配了 profile.reasoning —— 并非按模型记忆，
      * DSH 选择器只有单一 current，本就不存 per-model 选择（2026-10-01 反编译实证）。 */
     ...(cfg.defaultReasoningEffort === 'none' ? {} : { reasoning: cfg.defaultReasoningEffort }),
+    /* 图片请求预算（必需，见 REQUEST_IMAGE_BUDGETS 注释）：缺了它带图请求会抛
+     * 「Image request width must be a positive integer.」——trae :428 同款展开。 */
+    ...REQUEST_IMAGE_BUDGETS,
     configuredMaxTokens: new Map(),
     modelErrors: new Map(),
     defaultContextWindow: cfg.contextWindow,

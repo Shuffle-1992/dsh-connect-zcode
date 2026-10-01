@@ -827,6 +827,22 @@ async function assertRejects(promise, pattern, label) {
       registrations.createProviderInputs?.[0]?.resolveAttachments === undefined,
     `adapterOpts=${Object.keys(registrations.adapters[0]?.adapter?.options ?? {}).join(',')} providerKeys=${Object.keys(registrations.createProviderInputs?.[0] ?? {}).join(',')}`
   );
+  /* 图片请求预算（2026-10-01 **第二个**真机故障）：profile 缺 requestImagePixelBudget /
+   * requestImageMaxBytes 时，pi-ai 的 requestImagePolicy 变成 {maxPixels:undefined,maxBytes:undefined}
+   * （`?? {默认}` 因对象本身存在而不生效）⇒ requestImageTarget 算不出目标宽高 ⇒
+   * dsh-attachment-local 的 checkedInteger 抛「Image request width must be a positive integer.」。
+   * 断言三个预算字段都在 profile（真实读取点）上且为正整数（trae REQUEST_IMAGE_BUDGETS 同款）。 */
+  {
+    /* 注意：opts 变量在下方才定义，这里用内联表达式取 adapter options（避免 TDZ）。 */
+    const p0 = registrations.adapters[0]?.adapter?.options?.profiles?.()?.get('zcode');
+    const budgetKeys = ['maxRequestImageBytes', 'requestImagePixelBudget', 'requestImageMaxBytes'];
+    const ok = budgetKeys.every((k) => Number.isSafeInteger(p0?.[k]) && p0[k] > 0);
+    check(
+      '适配器: profile 带图片请求预算（缺则带图请求抛 Image request width must be a positive integer）',
+      ok,
+      budgetKeys.map((k) => `${k}=${p0?.[k]}`).join(' ')
+    );
+  }
   check('注册: settingsNs 取 Loader entry id（坑规避）', registrations.discoveries[0]?.ns === 'zcode-connect-selfcheck', registrations.discoveries[0]?.ns);
   const dirEntry = registrations.directories[0]?.[0];
   check('注册: directory 条目形状（declared:false）', dirEntry?.provider === 'zcode' && dirEntry?.displayName === 'ZCode Coding Plan' && dirEntry?.settingsNs === 'zcode-connect-selfcheck' && Array.isArray(dirEntry?.settingsPath) && dirEntry.settingsPath.length === 0 && dirEntry.declared === false);
