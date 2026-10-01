@@ -815,15 +815,17 @@ async function assertRejects(promise, pattern, label) {
   const registered = await waitFor(() => registrations.adapters.length === 1 && registrations.discoveries.length === 1 && registrations.directories.length === 1);
   check('注册: 三部曲齐（adapter+discovery+directory）', registered, `errors=${JSON.stringify(errors)}`);
   check('注册: adapter 绑定 provider id zcode', registrations.adapters[0]?.ids?.join(',') === 'zcode');
-  /* 附件解析（2026-10-01 真机报错「pi-ai image input requires the durable attachment service」）：
-   * 模型声明 input 含 image ⇒ pi-ai 需要 resolveAttachments 把图片引用换成可请求字节；
-   * 缺了它，**带图片/附件上下文的会话**整体调用失败（纯文本会话正常 ⇒ 症状很迷惑：
-   * "新会话能用、这个会话不能用"）。trae :438/:4424 同款：软取 ctx.get("attachments")。
-   * 该选项传给 createProvider（其产物被 spread 进 provider 对象），故从 stub 的 __input 取。 */
+  /* 附件解析（图片输入必需）：**必须挂在 adapter options 上**。
+   * dsh-llm-pi-ai :1857 读 `this.config.resolveAttachments`，而 this.config = PiAiAdapter 的 options。
+   * ⚠️ 2026-10-01 事故：曾把它挂到 createProvider 选项 → 静默无效 → 带图请求仍抛
+   * 「pi-ai image input requires the durable attachment service」；而当时自检断言的正是
+   * createProviderInputs（错位置）⇒ **断言放在错误的位置 = 假绿**。
+   * 故此处只断言 adapter options（真实读取点），并顺带锁定 createProvider 侧不承担该职责。 */
   check(
-    '注册: createProvider 传 resolveAttachments（图片输入必需，trae 同款软取）',
-    typeof registrations.createProviderInputs?.[0]?.resolveAttachments === 'function',
-    `keys=${Object.keys(registrations.createProviderInputs?.[0] ?? {}).join(',')}`
+    '适配器: resolveAttachments 挂在 adapter options（图片输入必需；挂 createProvider 会静默无效）',
+    typeof registrations.adapters[0]?.adapter?.options?.resolveAttachments === 'function' &&
+      registrations.createProviderInputs?.[0]?.resolveAttachments === undefined,
+    `adapterOpts=${Object.keys(registrations.adapters[0]?.adapter?.options ?? {}).join(',')} providerKeys=${Object.keys(registrations.createProviderInputs?.[0] ?? {}).join(',')}`
   );
   check('注册: settingsNs 取 Loader entry id（坑规避）', registrations.discoveries[0]?.ns === 'zcode-connect-selfcheck', registrations.discoveries[0]?.ns);
   const dirEntry = registrations.directories[0]?.[0];

@@ -441,15 +441,6 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
       },
       models,
       api,
-      /* 附件解析（图片输入必需）—— trae :438/:4424 同款软取。
-       * 缺了它会报「pi-ai image input requires the durable attachment service」：
-       * 我们的模型条目声明了 input 含 "image"（GLM-5.3-Flash 官方支持图片/视频），
-       * 一旦会话带图片上下文，pi-ai 就需要该服务把图片引用换成可请求的字节；
-       * 服务缺席时它直接抛错 ⇒ 整个会话的模型调用失败（纯文本会话不受影响，
-       * 所以症状是"新会话能用、带图/附件历史的会话不能用"）。
-       * 软取（而非硬 inject）：attachments 缺席时返回 undefined，纯文本场景照常工作，
-       * 与 trae 一致、不扩大启动失败面。 */
-      resolveAttachments: () => ctx.get('attachments'),
     }),
     getModels: () => models, // trae :421 同款覆写：目录以闭包内静态表为准（勾选变化时整体换数组）
   };
@@ -479,6 +470,17 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
     profiles: () => profiles,
     auth: INERT_AUTH,
     resolveApiKey: async () => (await gate()).apiKey, // 适配器每请求 await（T20 实证）：开关+凭据的真正调用门
+    /* 附件解析（图片输入必需）——**必须挂在 adapter options 上，不能挂 createProvider**。
+     * dsh-llm-pi-ai 读的是 `this.config.resolveAttachments`（:1860），而 `this.config` 就是
+     * 构造函数收到的这组 options（:1753-1755）。挂到 createProvider 会静默无效：
+     * 带图请求仍抛「pi-ai image input requires the durable attachment service」。
+     * trae :433-437 同位置；DSH 自家注册内置 provider 也是这么挂的（:2569-2573）。
+     * 软取（非硬 inject）：attachments 缺席时返回 undefined，纯文本照常工作，不扩大启动失败面。
+     *
+     * `resolveImageAccess` **不必传**（已核实）：图片字节来自 `requestImages.get(...)`
+     * （由 attachments 服务管线按 requestImagePolicy 构建，:1195-1204），该回调只用于
+     * 生成句柄说明文字与离屏图片回放；且 :1874 用 `?.()` 包装，缺席安全返回 undefined。 */
+    resolveAttachments: () => ctx.get('attachments'),
   });
 
   const offs = [];
