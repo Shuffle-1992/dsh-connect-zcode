@@ -213,7 +213,7 @@ account-provider:coding-plan:account:<planId>:account:<accountId>:api-key
 | 套餐类型 | 凭据形态 | 能否直连 |
 |---|---|---|
 | **Coding Plan**（付费套餐） | 一等 API Key（zhipu `id.secret` 格式），明文存于 `config.json` 或加密存于凭据库 | ✅ **可以** —— 走标准 Anthropic 兼容端点 |
-| **Start Plan**（赠送/活动额度） | 账户 **JWT**，且端点需要 **Aliyun 无痕验证码凭证**（由 ZCode renderer 逐请求签发） | ❌ **不可** —— 直连返回 `{"code":3007,"msg":"captcha verify failed"}` |
+| **Start Plan**（赠送/活动额度） | 账户 **JWT**；端点 `zcode.z.ai/api/v1/zcode-plan/anthropic` 要求 **V4 客户端请求签名** | ❌ **不可**（见下方 2026-10-01 实测） |
 
 社区项目（如 `dsh-zcode-connector`）断言"ZCode 无可提取 Key、只能 CDP 驱动 GUI"，
 **那是 Start Plan 形态的限制，不是 ZCode 的普遍限制**。
@@ -225,8 +225,31 @@ account-provider:coding-plan:account:<planId>:account:<accountId>:api-key
 请改用 builtin:bigmodel-coding-plan（api-key 形态）的登录条目。
 ```
 
+#### 2026-10-01 补充实测：Start Plan 的真实阻断点是**V4 请求签名**，不是验证码
+
+之前把原因记为"Aliyun 无痕验证码"（T18 时期的观察）。用**无头 CLI 实跑**后拿到更精确的根因：
+
+| 路径 | 结果 |
+|---|---|
+| 裸 HTTP `GET {plan}/v1/models` | **404**（该 plan 端点没有 models 路由） |
+| 裸 HTTP `POST {plan}/v1/messages`（`x-api-key` 或 Bearer） | **401**（路由存在、鉴权被拒） |
+| **无头 CLI**（真实 runner + start-plan 置 enabled 的沙箱） | `ClientRequestSigningV4Error: **Client signing credential must contain one separator**`（`resolveCredential`→`ensurePrivateKey`→`getKeyOrSendUnsigned`），`kind: invalid-config`，4.1s 失败 |
+| **对照组**（同沙箱 + coding-plan） | **exit 0** ⇒ 方法学有效，上条是真实结论 |
+
+解读：`zcode.z.ai` 的 plan 端点要求**客户端请求签名 V4**，签名凭据必须是 `id.secret`
+（**恰好一个分隔符**）；而 Start Plan 只签发 **JWT（两个点）** ⇒ 形态结构性不兼容。
+ZCode 自家的 `account:*-start-plan` provider（`apiKey:'' + apiKeyRequired:true`）说明这类凭据
+**根本不在 `config.json` 里**，而由账号/OAuth 侧解析（加密库中可见 `zcodejwttoken` /
+`oauth:bigmodel:access_token` / `oauth:active_provider`）——即 GUI 才走得通的那条路。
+
+**结论**：派发台的无头 CLI **无法**用 Start Plan（至少不能像 Coding Plan 那样"注入 api-key 规则"）。
+要在无头环境用 Start Plan，需要复刻 GUI 的账号登录态 + 签名凭据获取链路，
+这不是当前 runner 能表达的形态。**实用建议**：派发/provider 一律用 Coding Plan；
+Start Plan 额度请在 ZCode 桌面端使用。
+
 > **通用教训**：**别把单一账号形态的结论当成普遍结论**。
-> 排查"能不能接"时，先分清对方有几种凭据形态、你手上是哪一种。
+> 排查"能不能接"时，先分清对方有几种凭据形态、你手上是哪一种；
+> 以及"**401/404 只是表象，要看客户端为此做了什么额外工作**"（这里是请求签名）。
 
 ---
 
