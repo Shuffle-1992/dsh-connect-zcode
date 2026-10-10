@@ -33,6 +33,12 @@ const MODEL = flag('model', START_PLAN_CATALOG[0].id);
 const PROMPT = flag('prompt', '只回复两个字：就绪');
 const TOOLS = flag('tools', 'deny-all'); // 验证脚本默认不放行工具（最小权限）
 const TIMEOUT_MS = Number(flag('timeout-ms', '180000'));
+/**
+ * `--image <绝对路径>`：把该 PNG 当作 DSH 图片块走一遍**完整附件链路**
+ * （`collectImageBlocks` → `materializeImages` → `session/send {attachments}`）。
+ * 这条路径不依赖 DSH 宿主（用假的物化函数喂真实文件），用来单独验证「图片能不能进模型请求」。
+ */
+const IMAGE = flag('image', '');
 
 /** 最小 logger（生产里是 ctx.logger；这里只要 info/warn/error 三个方法）。 */
 const seen = [];
@@ -87,6 +93,19 @@ if (cliPath === '') {
     options: () => cfg,
     logger,
     gate: () => {}, // 真机验证不受派发开关约束（开关语义已由自检覆盖）
+    /* `--image` 时喂一个**真的**物化函数（生产里由宿主 ctx.attachments.imageHostPath 提供）：
+     * 这样 collectImageBlocks → materializeImages → send{attachments} 整条适配器链路都被走到。 */
+    ...(IMAGE === ''
+      ? {}
+      : {
+          materializeImages: async (blocks) =>
+            blocks.map((_block, index) => ({
+              kind: 'image',
+              filename: `verify-image-${index + 1}.png`,
+              mimeType: 'image/png',
+              localPath: IMAGE,
+            })),
+        }),
   });
 
   let text = '';
@@ -99,7 +118,17 @@ if (cliPath === '') {
     for await (const chunk of adapter.stream({
       provider: 'zcode-appserver',
       model: MODEL,
-      messages: [{ role: 'user', content: [{ type: 'text', text: PROMPT }] }],
+      messages: [
+        {
+          role: 'user',
+          content: [
+            ...(IMAGE === ''
+              ? []
+              : [{ type: 'image', attachment: { attachmentId: `sha256:${'a'.repeat(64)}`, mediaType: 'image/png' } }]),
+            { type: 'text', text: PROMPT },
+          ],
+        },
+      ],
       sessionId: `verify-${Date.now()}`,
     })) {
       kinds[chunk.type] = (kinds[chunk.type] ?? 0) + 1;
@@ -148,6 +177,7 @@ if (cliPath === '') {
 
   console.log('\n\n================ 结果 ================');
   console.log('chunk 统计 :', JSON.stringify(kinds));
+  console.log('附件行     :', seen.find((m) => m.includes('随消息转发')) ?? (IMAGE === '' ? '(未启用 --image)' : '(未观测到 —— 图片没被物化)'));
   console.log('块序列     :', starts.map((c) => `#${c.index}:${c.blockType}`).join(' ') || '(无块)');
   console.log('收尾块     :', ends.map((c) => `#${c.index}(${String(c.block?.text ?? '').length}字)`).join(' ') || '(无)');
   console.log('块不变量   :', problems.length === 0 ? 'PASS' : `FAIL — ${problems.join('; ')}`);

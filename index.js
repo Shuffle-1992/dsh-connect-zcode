@@ -821,9 +821,41 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
             'app-server 通道未注册（该基类是 DSH `registerAdapter` 的契约）。'
         );
       } else {
+        /* DSH 图片块 → app-server 附件（`Rar`：kind/filename/mimeType/localPath）。
+         * 取**绝对宿主路径**（`attachments.imageHostPath(ref)`）：ZCode agent 是独立进程，
+         * 只认真实 OS 路径；DSH 的"执行世界路径"（readonlyPath）对它无效。
+         * ⚠️ 必须作为**顶层注入**传给适配器：2026-10-11 真机事故里它被写在 `options()` 内，
+         * 而适配器只读顶层 ⇒ 恒为 undefined ⇒ 有图也按纯文本发且**零告警**（CLI 侧
+         * `attachmentCount: 0`、模型请求 0 个 image 块）。适配器现在两条路都认，这里也归位。 */
+        const materializeImages = async (blocks) => {
+          const service = ctx.get?.('attachments');
+          if (typeof service?.imageHostPath !== 'function') return [];
+          const out = [];
+          for (let index = 0; index < blocks.length; index += 1) {
+            const block = blocks[index];
+            if (block?.ref === null || block?.ref === undefined) continue;
+            let hostPath;
+            try {
+              hostPath = service.imageHostPath(block.ref);
+            } catch (error) {
+              ctx.logger?.warn?.(`[dsh-connect-zcode] 图片附件定位失败（本轮跳过该图）：${error?.message ?? error}`);
+              continue;
+            }
+            if (typeof hostPath !== 'string' || hostPath === '') continue;
+            const mimeType = block.mimeType ?? 'image/png';
+            out.push({
+              kind: 'image',
+              filename: `dsh-image-${index + 1}${imageExtension(mimeType)}`,
+              mimeType,
+              localPath: hostPath,
+            });
+          }
+          return out;
+        };
         const appServerAdapter = createAppServerAdapter({
           BaseAdapter: mods.LlmAdapter,
           LlmError: mods.LlmError,
+          materializeImages,
           // 活读配置（与既有通道一致）：每次调用现取，配置改动下一次会话生效。
           options: () => ({
             ...cfg,
@@ -832,34 +864,8 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
             appServerModels: readGiftModels(),
             contextBudgets: readBudgets(),
             supportsImages: canImages(),
-            /* DSH 图片块 → app-server 附件（`Rar`：kind/filename/mimeType/localPath）。
-             * 取**绝对宿主路径**（`attachments.imageHostPath(ref)`）：ZCode agent 是独立进程，
-             * 只认真实 OS 路径；DSH 的"执行世界路径"（readonlyPath）对它无效。 */
-            materializeImages: async (blocks) => {
-              const service = ctx.get?.('attachments');
-              if (typeof service?.imageHostPath !== 'function') return [];
-              const out = [];
-              for (let index = 0; index < blocks.length; index += 1) {
-                const block = blocks[index];
-                if (block?.ref === null || block?.ref === undefined) continue;
-                let hostPath;
-                try {
-                  hostPath = service.imageHostPath(block.ref);
-                } catch (error) {
-                  ctx.logger?.warn?.(`[dsh-connect-zcode] 图片附件定位失败（本轮跳过该图）：${error?.message ?? error}`);
-                  continue;
-                }
-                if (typeof hostPath !== 'string' || hostPath === '') continue;
-                const mimeType = block.mimeType ?? 'image/png';
-                out.push({
-                  kind: 'image',
-                  filename: `dsh-image-${index + 1}${imageExtension(mimeType)}`,
-                  mimeType,
-                  localPath: hostPath,
-                });
-              }
-              return out;
-            },
+            /* 同函数的第二条通道（适配器兼容读法；顶层那条才是主路径）。 */
+            materializeImages,
             ...(mods.resolveRetryPolicy
               ? { retryPolicy: mods.resolveRetryPolicy(undefined, 'dsh-connect-zcode appServerRetryPolicy') }
               : {}),

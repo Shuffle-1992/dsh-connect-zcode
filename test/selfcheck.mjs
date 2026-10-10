@@ -1737,7 +1737,8 @@ async function assertRejects(promise, pattern, label) {
     };
     const runScript = async (fake, cfg, opts = {}) => {
       const adapter = appServer.createAppServerAdapter({
-        BaseAdapter: class {}, LlmError: class LlmError extends Error {}, options: () => cfg, logger: {}, gate: () => {},
+        BaseAdapter: class {}, LlmError: class LlmError extends Error {}, options: () => cfg,
+        logger: opts.logger ?? {}, gate: () => {},
       });
       adapter.client = fake;
       if (opts.seed !== false) {
@@ -1748,7 +1749,7 @@ async function assertRejects(promise, pattern, label) {
         provider: 'zcode-appserver', model: 'GLM-5.2', sessionId: opts.sessionId ?? 's1',
         ...(opts.effort === undefined ? {} : { reasoningEffort: opts.effort }),
         ...(opts.purpose === undefined ? {} : { purpose: opts.purpose }),
-        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+        messages: opts.messages ?? [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
       })) chunks.push(chunk);
       adapter.dispose();
       return chunks;
@@ -1853,6 +1854,96 @@ async function assertRejects(promise, pattern, label) {
       !titleChunks.some((c) => c.type === 'usage') && titleChunks.some((c) => c.type === 'finish'),
       JSON.stringify(titleChunks.filter((c) => c.type === 'usage'))
     );
+
+    /* ⑦ 图片链路接线（2026-10-11 真机事故：物化函数被放进 options()，适配器只读顶层
+     *    ⇒ 恒 undefined ⇒ 有图也按纯文本发且**零告警**；CLI 侧 attachmentCount=0、
+     *    模型请求 0 个 image 块）。这里两件事都断言：物化成功要真的下发附件；
+     *    有图却物化不出东西必须**出声**。 */
+    const imageMessages = [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: '看图' },
+          { type: 'image', attachment: { attachmentId: `sha256:${'a'.repeat(64)}`, mediaType: 'image/png' } },
+        ],
+      },
+    ];
+    const imageFake = makeScriptClient([done('ok')]);
+    await runScript(
+      imageFake,
+      {
+        ...cfgBlock,
+        materializeImages: async () => [
+          { kind: 'image', filename: 'dsh-image-1.png', mimeType: 'image/png', localPath: 'C:\\tmp\\dsh-image-1.png' },
+        ],
+      },
+      { messages: imageMessages }
+    );
+    const imageSend = imageFake.calls.find((c) => c.method === 'session/send')?.params;
+    check(
+      'appserver: 物化函数放在 options() 里也被认（顶层缺席时回退 options().materializeImages）→ 附件真的随 send 下发',
+      JSON.stringify(imageSend?.attachments) ===
+        JSON.stringify([{ kind: 'image', filename: 'dsh-image-1.png', mimeType: 'image/png', localPath: 'C:\\tmp\\dsh-image-1.png' }]) &&
+        String(imageSend?.content ?? '').includes('图片附件'),
+      JSON.stringify(imageSend?.attachments)
+    );
+    const imageWarns = [];
+    const emptyImageFake = makeScriptClient([done('ok')]);
+    await runScript(
+      emptyImageFake,
+      { ...cfgBlock, materializeImages: async () => [] },
+      { messages: imageMessages, logger: { warn: (m) => imageWarns.push(String(m)), info: () => {} } }
+    );
+    check(
+      'appserver: 有图却没物化出附件 ⇒ 告警 + 按纯文本发送（这类静默失败必须出声）',
+      imageWarns.some((m) => m.includes('一张都没能物化成附件')) &&
+        emptyImageFake.calls.find((c) => c.method === 'session/send')?.params.attachments === undefined,
+      JSON.stringify(imageWarns)
+    );
+
+    /* ⑧ 卡死恢复阶梯（2026-10-11 事故：900s 超时后 DSH 重试撞上
+     *   `A prompt is already running for this session`，旧实现只等 1.5s 就放弃 ⇒ 用户这一轮判死）。
+     *   期望：stop×2（1.5s/6s）→ 硬重启 CLI → 重建会话 → 第 4 次送信成功。 */
+    {
+      const calls = [];
+      const listeners = new Set();
+      const stops = [];
+      let sends = 0;
+      let restarts = 0;
+      const stuckFake = {
+        disposed: false, calls, cliPath: '', cliNode: '', cwd: '', rpcTimeoutMs: 0, env: {}, lastChannel: null, onServerRequest: null,
+        onNotification(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+        write() {},
+        notify(method) { if (method === 'session/stop') stops.push(method); },
+        async ensureStarted() {},
+        dispose() { this.disposed = true; },
+        restart() { restarts += 1; this.disposed = false; },
+        async request(method, params) {
+          calls.push({ method, params });
+          if (method === 'session/create') return { session: { sessionId: `sess-stuck-${restarts}` } };
+          if (method === 'session/read') return { projection: { contextUsed: 999, contextWindow: 1000000 } };
+          if (method === 'session/send') {
+            sends += 1;
+            if (sends <= 3) throw new Error('A prompt is already running for this session');
+            for (const listener of listeners) listener({ method: 'session/event', params: done('ok') });
+            return {};
+          }
+          return {};
+        },
+      };
+      const stuckChunks = await runScript(
+        stuckFake,
+        { ...cfgBlock, appServerCredentialStorePath: join(tmp, 'no-creds.json') },
+        { seed: false, sessionId: 's3' }
+      );
+      check(
+        'appserver: 卡死恢复阶梯（stop×2 → 硬重启 CLI → 重建会话 → 第 4 次送信成功，不再把这一轮判死）',
+        sends === 4 && stops.length === 2 && restarts === 1 &&
+          calls.filter((c) => c.method === 'session/create').length === 2 &&
+          stuckChunks.some((c) => c.type === 'finish' && c.reason?.kind === 'stop'),
+        `sends=${sends} stops=${stops.length} restarts=${restarts} creates=${calls.filter((c) => c.method === 'session/create').length}`
+      );
+    }
 
     /* ⑤ 思考档真的下发给了 CLI：同一会话内换档 ⇒ 重发 session/setModel
      *   （旧实现只在建会话时设一次 ⇒ 用户在输入框换档位完全不生效）。 */

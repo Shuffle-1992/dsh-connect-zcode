@@ -452,8 +452,18 @@ DSH 消息里的图片块 {type:"image", attachment:<ref>}
   给真实 OS 路径最省事，也避免把大图塞进 JSON-RPC 帧。
 - **能力是按需声明的**：只有 `ctx.get("attachments")?.imageHostPath` 可用时才在模型元数据里声明 `image`；
   否则一律声明 `text`（"声明了却拿不到图"会让带图会话整体失败 —— TROUBLESHOOTING §2.7）。
-- 图片解析失败**降级为纯文本**并告警，不会整轮失败。
+- 图片解析失败**降级为纯文本**并告警；**有图却没物化出附件也一定告警**（2026-10-11 的"静默丢图"
+  就是缺这条 —— 物化函数被放进 `options()` 而非顶层注入，见 TROUBLESHOOTING §2.15）。
 - 只转发**最后一条用户消息**里的图：历史图片由 agent 自己的会话历史承载。
+- **真机验证（不经 DSH，零额度可复现）**：
+
+  ```bash
+  node scripts/verify-appserver-channel.mjs --tools deny-all \
+    --image "$HOME/.dsh/attachments/v1/objects/02/02fd8051…" \
+    --prompt "只回答一件事：这张图里最上面那行标题文字是什么？原样引用。"
+  # 实测：附件行 = 本轮随消息转发 1 张图片
+  #       回复正文 = 图里最上面那行标题文字是：**你要做的**   ← 模型确实读到了图内文字
+  ```
 
 ### ⚠️ 安全须知（开之前必读）
 
@@ -664,6 +674,15 @@ provider.models 输出）、面板行控件（锁定 disabled、1M 按官方数�
     全支持 ⇒ 自动设（`Default` 项消失，且与官方 `defaultVariant=max` 一致）；
     混入非推理模型（如未开推理开关的 FlashX）⇒ 不设（避免其请求硬失败）。面板保存后即时重算。
     见 TROUBLESHOOTING §2.14。
+22. **官方 MCP 工具在桥接进程里不可用**：CLI agent 会看到 ZCode 配置里的官方 MCP 服务器
+    （`node_repl` / `image_search` 等），但它们需要**桌面端才有的官方签名头**
+    （CLI 日志：`Official MCP auth headers unavailable` → `MCP server connection failed`）。
+    实测后果：代理可能在这些坏工具上反复重试，把一轮拖到本地超时（默认 15 分钟，
+    `appServerTurnTimeoutMs`）。MCP 相关失败**不是通道故障**；若频繁遇到，请在 ZCode 里
+    关掉这些插件，或把这类任务交给直连通道（`zcode`）。
+23. **超时/中止后的会话自愈**：回合未落定时会补发 `session/stop`；若下一轮仍撞
+    `A prompt is already running for this session`，按阶梯升级恢复（stop+1.5s → stop+6s →
+    **硬重启 CLI 子进程并重建会话**），不再把用户这一轮直接判死。见 TROUBLESHOOTING §2.16。
 
 ---
 

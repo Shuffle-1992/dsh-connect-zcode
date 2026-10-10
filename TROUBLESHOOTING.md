@@ -31,6 +31,8 @@
   - [2.12 pwsh 整文件编码往返写坏源码；未提交文件无法用 git 恢复](#212-用-pwsh-做整文件编码往返把源码写坏未提交的文件无法用-git-恢复)
   - [2.13 provider 报「零 usage」会把上下文占用清零](#213-provider-报零-usage-会把上下文占用清零弹窗-0明细却有几万)
   - [2.14 模型档位选择器里多出一个 `Default` 项](#214-模型档位选择器里多出一个-default-项)
+  - [2.15 图片静默丢失：物化函数被放错口袋](#215-图片静默丢失物化函数被放错口袋deps-顶层-vs-options)
+  - [2.16 回合超时后重试撞上 `A prompt is already running`](#216-回合超时后重试撞上-a-prompt-is-already-running-for-this-session)
 - [三、通用工程](#三通用工程)
   - [3.1 用 `fetch` 后调 `process.exit()` 会崩（Windows）](#31-用-fetch-后调-processexit-会崩windows)
   - [3.2 "换个位置就红"的测试是资产](#32-换个位置就红的测试是资产)
@@ -954,6 +956,78 @@ Get-Content "$env:USERPROFILE\.dsh\zcode-runs.jsonl" | Select-Object -Last 3
 > **通用教训**：UI 上"多出来的一项"往往来自**某个字段缺席**（这里是 `defaultEffort`），
 > 而不是前端写死。定位路径 = 先在宿主包里搜该文案/常量，再顺藤摸到提供该字段的**唯一入口**
 > （provider profile），最后确认这个入口有没有 per-model 变体（本例没有 ⇒ 只能在 provider 级做取舍）。
+
+---
+
+### 2.15 图片「静默丢失」：物化函数被放错口袋（deps 顶层 vs `options()`）
+
+**现象**（2026-10-11 真机，用户在赠送额度通道上发图）：界面显示图片已附上、回合能跑，
+但**模型完全看不到图**。取证三条（零额度）：CLI 日志 `attachmentCount: 0`；
+该会话 rollout 里 `"type":"image"` **0 个**；插件**一条告警都没有**。
+
+**根因**：适配器从**顶层注入**取物化函数 —— `createAppServerAdapter({ …, materializeImages })`；
+而 `index.js` 把它写在了 **`options()` 返回的配置袋里**。于是
+`typeof materializeImages !== 'function'` 恒成立，代码走 `return undefined`（按纯文本发送），
+**既不报错也不告警** —— 典型的"配置袋放函数"式静默失效。
+
+**修法**：
+
+1. 适配器**两条路都认**：`typeof materializeImages === 'function' ? materializeImages : cfg.materializeImages`；
+2. `index.js` 归位到顶层注入（`options()` 里保留同一函数作兼容读法）；
+3. **只要"本轮有图却没物化出附件"就必须告警**（有图 + 无函数；有图 + 物化结果为空）。
+
+**判据（真机，不经 DSH 宿主）**：
+
+```powershell
+node scripts/verify-appserver-channel.mjs --tools deny-all `
+  --image "$env:USERPROFILE\.dsh\attachments\v1\objects\02\02fd8051…" `
+  --prompt "只回答一件事：这张图里最上面那行标题文字是什么？原样引用。"
+# 期望：附件行 = 本轮随消息转发 1 张图片
+#       回复正文 = 图里最上面那行标题文字是：**你要做的**   ← 模型真的读到了图内文字
+#       CHUNKS PASS / VERIFY PASS
+```
+
+`--image` 用**真的**文件路径（假物化函数喂真文件），走的仍是生产同一条
+`collectImageBlocks → materializeImages → session/send{attachments}` 链路。
+
+> **通用教训**：**依赖注入的形状必须对齐** —— "函数型依赖"放进配置袋（options）里，
+> 读它的人只会看到 `undefined`，而且通常不报错。凡是"可选能力"（图片/推理/回调），
+> 判断缺席时**必须留痕**（warn），否则一次接线错位就会伪装成"上游不支持"。
+
+---
+
+### 2.16 回合超时后，重试撞上 `A prompt is already running for this session`
+
+**现象**（2026-10-11 真机）：赠送额度通道的一轮跑满 15 分钟（900s）被本地超时掐掉；
+DSH 自动重试（1/5）**立刻失败**：`app-server 通道失败：A prompt is already running for this session`
+—— 用户看到"这一轮直接判死"。
+
+**取证**：插件账本两行相邻记录 ——
+`{input:0,exit:"app-server turn not settled",elapsedMs:908188}`（超时那轮）
+与 `{input:0,exit:"…not settled",elapsedMs:1537,endpoint:null}`（重试那轮：1.5 秒就死、连渠道都没到）。
+
+**根因**：超时后我们在 `finally` 里补发了 `session/stop`，但 CLI 释放回合锁需要**更久**；
+旧恢复策略只做一次"stop + 等 1.5s + 重试"，第二次仍撞锁就把这一轮判死。
+
+**修法**（`lib/app-server.js` 的送信恢复阶梯）：
+
+| 第几次撞锁 | 动作 |
+|---|---|
+| 1 | 补发 `session/stop` + 等 1.5s 后重试 |
+| 2 | 再 `session/stop` + 等 6s 后重试 |
+| 3 | **硬重启 app-server 子进程**（`AppServerClient.restart()`）+ 重建会话（新进程没有残留回合） |
+| 4+ | 才放弃并如实抛错 |
+
+`restart()` = `dispose()` 但**不置 `disposed`**（否则 `ensureStarted()` 直接抛）；硬重启期间用
+`suppressDeath` 屏蔽本次流自己的"进程已退出"判定 —— 否则重启等于自杀。
+
+**判据**（自检假 transport 打满阶梯）：`sends=4 stops=2 restarts=1 creates=2`，且该轮最终 `finish:stop`。
+
+> 附带发现（同一次取证）：那 15 分钟**不是卡在模型上**，而是 CLI agent 反复调用
+> **官方 MCP 工具**（`node_repl` / `image_search`），而桥接进程拿不到桌面端才有的
+> **官方 MCP 签名头**（CLI 日志：`Official MCP auth headers unavailable` → `MCP server connection failed`）
+> ⇒ 工具一直失败、代理一直在试。**"跑满超时"与通道本身无关**，是 MCP 能力在桥接环境不可用的代理行为；
+> 对策 = 超时 + 恢复阶梯（见上），并把这条限制写进 README 已知限制。
 
 ---
 
