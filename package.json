@@ -1,8 +1,8 @@
 {
   "name": "dsh-connect-zcode",
   "displayName": "DSH Connect ZCode",
-  "description": "把 ZCode（Z.ai / 智谱 BigModel Coding Plan）接入 DeepSeek Harness：复用本机已登录的套餐凭据，提供模型显隐、200K/1M 上下文预算与推理档/图片能力面板。",
-  "version": "0.4.0",
+  "description": "把 ZCode（Z.ai / 智谱 BigModel）接入 DeepSeek Harness：Coding Plan 走标准 anthropic 通道，Start Plan / 活动赠送额度走官方 agent app-server 通道；含模型显隐、200K/1M 上下文预算、推理档/图片能力面板与赠送额度进度条。",
+  "version": "0.5.0",
   "license": "MIT",
   "type": "module",
   "icon": "./icon.svg",
@@ -46,8 +46,8 @@
     }
   },
   "meta": {
-    "title": "ZCode Coding Plan",
-    "description": "把 ZCode Coding Plan 注册为 DSH 的 LLM provider（凭据零落盘，含模型显隐/能力面板）"
+    "title": "ZCode Coding Plan / Start Plan",
+    "description": "把 ZCode 注册为 DSH 的 LLM provider：Coding Plan 走 anthropic 通道，Start Plan 走 app-server 通道（凭据零落盘，含模型显隐/能力面板）"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-client-ui-primitives": ">=0.1.7-rc.1 <0.3.0-0",

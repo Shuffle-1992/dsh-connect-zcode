@@ -1,15 +1,19 @@
 # dsh-connect-zcode
 
-**把 ZCode（Z.ai / 智谱 BigModel Coding Plan）作为模型通道接进 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）** —— 让 DSH 自己的 agent loop 直接消费你的 ZCode 套餐额度。
+**把 ZCode（Z.ai / 智谱 BigModel）作为模型通道接进 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）** —— 让 DSH 直接消费你的 ZCode 套餐额度。
 
-一个 DSH 原生 provider 插件：注册 `zcode` provider，模型在 DSH 模型选择器里直接可选。
+一个 DSH 原生 provider 插件，**两条互补通道**：
 
 ```
-provider id : zcode
-线协议       : anthropic-messages
-端点         : 由 ~/.zcode/v2/config.json 提供（如 https://open.bigmodel.cn/api/anthropic）
+provider id : zcode              provider id : zcode-appserver（可选，默认关）
+线协议       : anthropic-messages  线协议       : ZCode app-server（stdio JSON-RPC）
+谁发模型请求 : DSH 自己             谁发模型请求 : 官方 agent 进程（zcode.cjs）
+端点         : ~/.zcode/v2/config.json 的 baseURL
 凭据         : 零落盘、零缓存、每次调用现读
+适用         : Coding Plan（一等 API Key）   适用 : Start Plan / 活动赠送额度（账号型）
 ```
+
+> 第二条见 [Start Plan 通道（app-server）](#start-plan-通道app-server)。
 
 ---
 
@@ -25,10 +29,21 @@ ZCode 桌面端自带一个 agent（有自己的 loop、子代理、记忆）。
 
 | 套餐类型 | 凭据形态 | 能否直连 |
 |---|---|---|
-| **Coding Plan**（付费套餐） | 一等 API Key（zhipu 平台 `id.secret` 格式），存于 `config.json` 或**加密凭据库** `credentials.json` | ✅ **可以** —— 走标准 Anthropic 兼容端点 |
-| **Start Plan**（赠送/活动额度） | 账户 **JWT**，且端点需要 Aliyun 无痕验证码凭证（由 ZCode renderer 逐请求签发） | ❌ **不可** —— 直连返回 `{"code":3007,"msg":"captcha verify failed"}` |
+| **Coding Plan**（付费套餐） | 一等 API Key（zhipu 平台 `id.secret` 格式），存于 `config.json` 或**加密凭据库** `credentials.json` | ✅ **可以** —— 走标准 Anthropic 兼容端点（本插件 `zcode` provider） |
+| **Start Plan**（赠送/活动额度） | 账户 **JWT** + 端点要求**逐请求的客户端证明** | ❌ 不能**直连**；✅ 但能**托管官方 agent 代发**（本插件 `zcode-appserver` provider） |
 
-社区里 [dsh-zcode-connector](https://github.com/ZhaoAndy821/dsh-zcode-connector) 等项目断言"ZCode 无可提取 Key"，**那是 Start Plan 形态的限制，不是 ZCode 的普遍限制**。本项目只接 Coding Plan（api-key 形态），并对 start-plan 的 JWT 形态**显式拒绝**而不是静默失败。
+社区里 [dsh-zcode-connector](https://github.com/ZhaoAndy821/dsh-zcode-connector) 断言"ZCode 无可提取 Key"，**那是"不能直连"的限制，不是"用不上"的结论** —— 正确解法是**让官方 agent 去发请求**。
+
+#### 2026-10-10 实测订正：直连的阻断点是**风控 3012**，不是验证码 3007
+
+早期把 Start Plan 直连失败归因为"需要阿里云无痕验证码"（`3007 captcha verify failed`）。本机带齐验证码头再打一次：
+
+| 请求形态 | 上游响应 |
+|---|---|
+| `POST {plan}/anthropic/v1/messages`，**带**现场解出的 `X-Aliyun-Captcha-Verify-Param` | `HTTP 405 {"code":3012,"msg":"request has been blocked due to unusual activity."}` |
+| 同上，**不带**验证码头 | **同样** `405 / 3012` |
+
+⇒ **验证码只是必要条件**：上游还按客户端指纹判定（设备 ID、companion 头、安装序仿真、客户端版本对齐）。要么做完整桌面指纹仿真（如 [dengyie/zcode2api](https://github.com/dengyie/zcode2api)），要么**根本不自己发请求** —— 后者才是本插件选的路线：**托管官方 agent，让二进制自己去签**。
 
 > **Coding Plan 的 Key 有两个存放位置**（这很关键，见「故障排查」）：
 > - `~/.zcode/v2/config.json` → `provider["builtin:bigmodel-coding-plan"].options.apiKey`（**明文**）
@@ -300,6 +315,236 @@ ZCode 有两条消费路径，**互补而非替代**：
 
 ---
 
+## Start Plan 通道（app-server）
+
+**默认关闭**（`appServer: false`）。开启后额外注册一个 provider `zcode-appserver`，用于消费
+**Start Plan / 活动赠送额度**这类**账号型**（非 API Key）额度。
+
+### 它为什么必须"托管一个进程"
+
+Start Plan 的端点 `https://zcode.z.ai/api/v1/zcode-plan/anthropic` 要求**逐请求的客户端证明**。
+本机实测：外部 HTTP 直连（哪怕带齐现场解出的验证码头）被上游拦成
+`405 / code 3012 unusual activity`；而**官方 agent 二进制自己发出的请求能过**。
+
+所以本通道不是 HTTP 网关，而是：
+
+```
+DSH ──► provider "zcode-appserver" ──► 常驻 zcode.cjs app-server（stdio JSON-RPC）
+                                          ├─ provider/updateAccountConfig  注入 account:{bigmodel|zai}-start-plan
+                                          ├─ session/setMode               权限模式（见下「安全须知」）
+                                          ├─ session/setModel              切到 Start Plan 模型
+                                          ├─ session/send                  发回合
+                                          └─ interaction/requestProviderRuntimeHeaders
+                                                └─ 宿主把 zcodejwttoken 递回去，agent 自己算签名
+                                                     └──► zcode.z.ai/api/v1/zcode-plan/anthropic
+```
+
+三个"错了会**静默失效**"的点（都已在代码里加了对策与断言）：
+
+1. spawn 必须按 GUI 同款设置 `ZCODE_APP_VERSION` / `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` /
+   `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` / `ZCODE_BASE_URL`，否则 CLI 落到 `0.0.0-dev` 运行时目录；
+2. `basedOnZCodeBuiltinRevision` 必须**逐字符等于** `zcode-builtin:<revision>:<sha256(路径)>`，
+   否则 registry 合并守卫**静默跳过**（不报错）；
+3. 鉴权 token 必须是共享凭证里的 **`zcodejwttoken`** —— `oauth:*:access_token` 早已过期，回它上游 401。
+
+### 开启方式
+
+```yaml
+# cordis.patch.yml（profile 的 patch 层）或设置面板
+appServer: true
+appServerToolPolicy: allow-all        # 见下「安全须知」；要收紧改 deny-all
+zcodeCliPath: 'F:\Program Files\ZCode\resources\glm\zcode.cjs'   # ZCode 装在非系统盘时显式指定
+```
+
+> ⚠️ **profile 里可能有同 id 的两条 `- id: <entry>`**（一条你手写、一条插件管理器把本 bundle 的
+> `cordis.patch.yml` 物化出来的）。同 id 相遇时**后一条整体覆盖前一条**（不是逐键合并）——
+> 写在前一条里的开关**完全不生效，而且没有任何报错**。改配置前先数一数：
+>
+> ```powershell
+> Select-String -Path "$env:USERPROFILE\.dsh\profiles\desktop\cordis.patch.yml" -Pattern '^- id: zcode-connect$'
+> ```
+>
+> 生效值要写在**最后**那条。详见 [TROUBLESHOOTING §2.9](TROUBLESHOOTING.md)。
+
+开启后模型选择器里会多出一条**独立的** provider 与模型：
+
+```
+ZCode Coding Plan          → GLM-5.3-Flash                  ← 付费 Coding Plan 额度
+ZCode Start Plan（赠送额度）→ GLM-5.3-Flash（赠送额度）        ← Start Plan / 活动赠送额度
+```
+
+**两者是两笔账**（ZCode 桌面端里也是分开列的）：选谁就烧谁的额度，输入框下方的
+赠送额度进度条**只在选中「赠送额度」那条时显示**（判据是宿主自己的 `modelSelection` 投影，
+即模型选择器写什么、下一次请求就用什么，所以不会出现"显示着赠送额度、实际烧 Coding Plan"的错配）。
+
+### 配置项
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `appServer` | `false` | 总开关 |
+| `zcodeCliPath` | 空 = 自动探测 | `zcode.cjs` 路径。**ZCode 常装在非系统盘**，自动探测含盘符扫描；仍找不到就显式填绝对路径 |
+| `zcodeCliNode` | `node` | 运行 `zcode.cjs` 的 node |
+| `zcodeDataBaseDir` | 空 = 用户主目录 | 读 `runtime/provider/**/zcode-builtin.json` 的根 |
+| `appServerCredentialStorePath` | 空 = `~/.zcode/v2/credentials.json` | Start Plan token 来源 |
+| `appServerAccountProviderId` | 空 = 按 `oauth:active_provider` 自动选 | 注入 `account:bigmodel-start-plan` / `account:zai-start-plan` |
+| `appServerModels` | `['GLM-5.3-Flash']` | 暴露给 DSH 的模型（内置目录：GLM-5.3-Flash / GLM-5.2 / GLM-5-Turbo；**不含 GLM-5.3**，builtin 未给 start-plan 声明它） |
+| `appServerReasoningLevel` | `max` | `session/setModel` 的推理档（low/high/max） |
+| `appServerToolPolicy` | `allow-all` | ⚠️ **安全面，见下** |
+| `appServerInjectAccount` | `true` | 注入套餐账户（GUI 同款） |
+| `appServerWorkspace` | 空 = 用户主目录 | 会话工作目录（勿指向巨型目录树，agent 启动会扫它） |
+| `appServerRpcTimeoutMs` | `120000` | 单次 RPC 超时 |
+| `appServerTurnTimeoutMs` | `900000` | 单回合超时 |
+| `childEnvAllow` | `[]` | 额外透传给子进程的 env 名（默认只放行系统基础变量与 `ZCODE_*`） |
+
+### 面板里能配什么（设置 → 插件 → 本插件）
+
+面板底部有一块**独立的**「赠送额度通道（Start Plan）」区块，与上面 Coding Plan 的模型列表并列：
+
+| 控件 | 写回的配置 | 说明 |
+|---|---|---|
+| 状态行 | — | `未启用` / `已启用但未注册：<原因>` / `已注册 · CLI=… · 工具策略=…` —— **"模型选项里没有它"时先看这一行** |
+| 模型勾选 | `appServerModels` | 勾上的模型出现在选择器的「ZCode Start Plan（赠送额度）」分组下；全不勾 = 回默认单条 `GLM-5.3-Flash` |
+| 200K / 1M | `contextBudgets[<id>]` | 与 Coding Plan **共用同一份预算表**（模型 id 不重叠，互不影响） |
+| 图片 | — | 显示**当前能力**：接了 DSH `attachments` 服务 → `支持`；否则 `未启用`（如实反映，不写死） |
+| 推理档 | — | **锁定显示**：由 `appServerReasoningLevel` 统一决定，与既有通道的 per-model 档位机制不重复 |
+
+保存按钮一次写回 `enabledModelIds / contextBudgets / modelOverrides / appServerModels`，每项都做**写后回读校验**。
+
+> 面板写入的这些字段都是 **volatile**（DSH 面板可写的硬前提），host 半**活读**——保存后下一次会话生效。
+
+### 图片怎么走（Start Plan 通道）
+
+支持。链路是**文件路径**而不是 base64：
+
+```
+DSH 消息里的图片块 {type:"image", attachment:<ref>}
+      └─ attachments.imageHostPath(ref)  →  绝对宿主路径（同步方法，返回 string | undefined）
+             └─ session/send { content, attachments:[{kind:"image", filename, mimeType, localPath}] }
+                    └─ 官方 agent 按路径读取该文件（它自带 Read 工具认得图片）
+```
+
+- 为什么用 `localPath` 而不是 `dataBase64`：协议两种都支持，但 agent 是**独立进程**，
+  给真实 OS 路径最省事，也避免把大图塞进 JSON-RPC 帧。
+- **能力是按需声明的**：只有 `ctx.get("attachments")?.imageHostPath` 可用时才在模型元数据里声明 `image`；
+  否则一律声明 `text`（"声明了却拿不到图"会让带图会话整体失败 —— TROUBLESHOOTING §2.7）。
+- 图片解析失败**降级为纯文本**并告警，不会整轮失败。
+- 只转发**最后一条用户消息**里的图：历史图片由 agent 自己的会话历史承载。
+
+### ⚠️ 安全须知（开之前必读）
+
+这个"模型 provider"的真身是一个**以你当前用户权限运行、且带有全套工具执行能力的 agent**：
+
+- `appServerToolPolicy: 'allow-all'`（默认）会把会话切到 `yolo`，并**自动放行** agent 的每一次
+  工具请求 —— 它执行 Bash、读写文件、联网**不会弹任何确认**。
+- agent 的输入是 DSH 拍平后的整段对话（含网页抓取、工具结果等外部内容）。**不要把不可信
+  内容喂进挂着本通道的会话**。
+- 想收紧就设 `appServerToolPolicy: 'deny-all'`：留 `build` 模式并一律拒绝工具请求。
+  代价是 agent 基本只能纯对话（它本就靠自己的原生工具干活）。
+- 子进程 env 按白名单透传（系统基础变量 + `ZCODE_*` + `NODE_EXTRA_CA_CERTS`），
+  **不继承 DSH 宿主的全部 env**（防止把其他供应商的密钥漏给它）。
+- 鉴权 token 只经**本机 stdio**交给 agent 进程，不发往任何第三方；日志只打长度。
+
+### 与 Coding Plan 通道的能力差异
+
+| | `zcode`（anthropic 直连） | `zcode-appserver`（托管 agent） |
+|---|---|---|
+| 额度 | Coding Plan | Start Plan / 活动赠送 |
+| 并发 | `maxConcurrent`（默认 2） | 一个会话同时 **1 个在途回合**（插件内部排队串行化） |
+| 图片输入 | ✅（pi-ai 附件链路） | ✅（DSH 图片 → `localPath` 附件，见下） |
+| 工具调用 | DSH 的工具直通模型 | **用 agent 自己的原生工具**，DSH 工具不透传 |
+| 冻结开关 / 台账 | ✅ | ✅（同一把开关、同一本台账） |
+
+### 真机验证
+
+```bash
+node scripts/verify-appserver-channel.mjs           # 驱动的是生产模块本身
+node scripts/verify-appserver-channel.mjs --tools allow-all
+node scripts/probe-session-read.mjs                 # 零额度：只验按次上下文读数（见下）
+```
+
+⚠️ 会消耗真实额度（一轮对话）。判定看输出末行 `VERIFY PASS/FAIL`，以及
+`本轮执行渠道 providerId=… baseURL=…` 是否命中 `zcode.z.ai/api/v1/zcode-plan/anthropic`。
+`probe-session-read.mjs` **不发消息、不消耗额度**，只确认 `session/read` 仍下发
+`projection.contextUsed`（usage 口径折算的数据源，ZCode 升版时最先失效的就是它）。
+
+> **"已领取" ≠ "已生效"**：活动套餐在 `billing/balance` 里可能是 `status: active`，
+> 但 entitlement 带 `effective_at`（本机实测 `ZCode Weekend Build`：`starts_at 20:12` /
+> `effective_at 23:00`）。窗口开始前调用会拿到 `code 1005 exceed quota limit` ——
+> **那是额度时序，不是通道故障**（判据：`providerId`/`baseURL` 已命中 plan 端点）。
+
+---
+
+## 赠送额度进度条（面板 + 输入框下方）
+
+显示位置（两处同源，口径不会漂移）：
+
+- **设置面板**（设置 → 插件 → 本插件）概览里一行「赠送额度」；
+- **输入框下方**（模型选择器之下）一条细进度条 —— **悬浮显示 `剩余 X / 总量 Y`**。
+  填充比例 = 剩余/总量；**剩余 ≤10% 变红**；未生效时为灰底满格 + 「待生效 HH:MM」。
+
+### 显示门禁：只在你选中"赠送额度"那条模型时才出现
+
+进度条**不是常显**的 —— 只有当前选中的是赠送额度通道
+（provider `zcode-appserver`，即选择器里的 `ZCode Start Plan（赠送额度）`）才渲染：
+
+| 当前选中 | 进度条 |
+|---|---|
+| `ZCode Start Plan（赠送额度）` 下的任一模型 | **显示** |
+| `ZCode Coding Plan` 下的 5.3 Flash（或其它任何 provider） | 不显示 |
+
+判据取自宿主自己的 **`modelSelection` 投影**（官方 UI 同款数据源，`dsh-connect-trae`
+的 composer 门禁也用同一招），所以它与"下一次请求实际用哪个模型"永远一致。
+投影读不到 / 形状不认识时**整块不渲染并告警一次**（不猜、不误导）。
+
+> 实现细节：投影字段名在 DSH 内部有 `next` / `pending` / `lastUsed` 两套写法，
+> 代码三个候选都读（顺序 `next → pending → lastUsed`），避免上游一改就静默消失。
+
+### 数据从哪来（为什么不是实时查询）
+
+**读 ZCode 桌面端自己写的日志**（`~/.zcode/v2/logs/<date>.log` 里它自己的
+`billing/balance` 响应），**不自己调上游**：
+
+```
+ZCode 桌面端 ──► GET {origin}/api/v1/zcode-plan/billing/balance   （它本来就在轮询）
+                        └─► 响应逐次落在 ~/.zcode/v2/logs/<date>.log
+                                  └─► 本插件尾部倒读最后一条 ──► 面板 / 进度条
+```
+
+原因是**风险**：该端点属 Plan 通道，外部直连实测会被上游风控拦（同类 plan 端点本机实测
+`405 / code 3012 unusual activity`）。而客户端本来就在调、结果就在本机日志里 ——
+**零新请求、零风控面**。代价是新鲜度取决于桌面端是否在运行（悬浮提示里会带**数据时间**）。
+
+### 三种状态（**刻意不混同**）
+
+| 上游状态 | 显示 |
+|---|---|
+| 已生效，有余额桶 | 进度条，悬浮 `剩余 X / 总量 Y` |
+| **未生效**（`effective_at` 未到，余额桶还没建） | 灰底满格 + `待生效 HH:MM`，悬浮 `剩余 —（未生效） / 总量 Y` |
+| 已过期 / 读不到日志 / 非 start-plan | **整块不渲染** |
+
+> ⚠️ 「未生效」**不会**拿 `grant_units` 冒充"剩余" —— 那会在面板上显示成"一分没用"的假象。
+> 这是本项目对"静默误导"的一贯取舍：**宁可不显示，也不给错数字**（自检里有专门断言守着）。
+
+### 刷新机制
+
+两处显示**共用一个轮询器**（单定时器 + 单 in-flight 请求）：
+
+| 时机 | 行为 |
+|---|---|
+| 组件挂载 | 立即拉一次状态文档 |
+| **每 60 秒** | 自动刷新；面板与进度条**同步**更新 |
+| 面板从 summary 切到 page / 设置命名空间变更 | 重订阅并立即拉一次 |
+| 最后一个消费者卸载 | **撤掉定时器**（不留后台空转） |
+
+> 为什么必须"共用"而不是各拉各的：除了省一半请求，更要紧的是**一致性** —— 各自持有
+> 状态副本时，进度条刷新不会让面板重渲染，同一个额度会在两处显示成**不同时刻**的值
+> （用户看到的是"两个数对不上"）。自检里有单定时器 / 单 fetch 源的结构断言守着。
+
+上游余额本身是分钟级刷新的，宿主每次 GET 又只做一次**有界尾部读**（64KB 块倒读、命中即止），
+所以 60s 一次的代价可以忽略。
+
+---
+
 ## 自检
 
 ```bash
@@ -321,6 +566,8 @@ provider.models 输出）、面板行控件（锁定 disabled、1M 按官方数�
 1. 上下文窗口：基础档保守声明 200k（CLI 实测有效窗口）；1M 为 ZCode config 官方声明值，
    仅官方 Max 档模型可选（勾选后 `contextWindow` 按官方值声明，实测有效窗口仍以 CLI 为准）。
 2. usage（input/output token）由网关返回、从事件流提取，取不到时台账记 `null`。
+   **app-server 通道额外做口径折算**（第 17 条）：CLI 给的是"整回合 N 次调用之和"，
+   直接上报会让宿主把上下文占用算成 N 倍。
 3. 模型能力声明（T22）：官方行按 ZCode config `models` 段如实声明（Flash 的
    `input` 含 image/video——**video 为官方声明、未实测**；无官方数据的行默认纯文本，
    推理/图片由用户开关显式开启）。推理档的 wire 下发（thinkingLevelMap / effort 枚举）
@@ -347,6 +594,34 @@ provider.models 输出）、面板行控件（锁定 disabled、1M 按官方数�
     启动日志会输出宿主栈版本（`宿主 LLM 栈：pi-ai=… / dsh-llm-pi-ai=…`）并做 C5 形状自检
     （未通过时告警），**升级 DSH 后请先看这两行**。
 
+### app-server 通道（`zcode-appserver`，默认关）
+
+11. **DSH 的工具不会透传给 agent**：模型实际是"用 agent 自己的原生工具干完活再把结果讲给你"，
+    所以 DSH 侧的 `pwsh` / `fs-local` 等工具在这条通道上不生效；adapter 会把模型误写的
+    `<antml:…>` 伪调用文本拦下（并在聊天窗留一条拦截说明）。
+12. **图片输入**：已支持 —— DSH 的图片附件经 `attachments.imageHostPath(ref)` 取**绝对宿主路径**，
+    以 app-server 的 `{kind:'image', filename, mimeType, localPath}` 附件随消息转发（见「图片怎么走」）。
+    仅当宿主 `attachments` 服务在位时才声明 `image`（否则一律 `text`）；服务缺席时面板会显示「图片：未启用」。
+13. **单会话同时只允许一个在途回合**（app-server 的硬约束）。插件内部做了排队串行化、撞锁
+    自愈（补发 `session/stop` 后重试）与会话失效重建，但**吞吐仍低于直连通道**；长任务建议
+    按会话分摊。
+14. **Start Plan 的是账号型额度**：额度与"是否生效"由服务端按窗口授予，`status: active`
+    不等于可消费（见上文 `effective_at`）。窗口未开始时表现为 `code 1005 exceed quota limit`。
+15. 通道打通依赖 ZCode 的 `app-server` 子协议（`session/create` → `setModel` → `send` →
+    `session/event`）与 `basedOnZCodeBuiltinRevision` 的算法。**ZCode 升版后若改协议，本通道会失效**
+    —— 启动/回合日志里的 `已注入 …（providerCount=… status=…）` 与
+    `本轮执行渠道 providerId=…` 就是第一手判据。
+16. **赠送额度进度条的数据新鲜度**取决于 ZCode 桌面端是否在运行/轮询（见
+    「赠送额度进度条」一节）：它是**读客户端日志**而非实时查询上游 —— 这是为规避
+    Plan 通道风控（3012）付出的代价。悬浮提示里的「数据 HH:MM」就是这条日志的时刻。
+17. **usage 口径已折算**（`lib/app-server.js` 的 `deriveReportedUsage`）：CLI 的
+    `turn.completed.usage` 是**本回合 N 次模型调用之和**（`modelRequestCount` 即次数），
+    而宿主的 usage 是**单次请求**口径（tokenMeter 拿它当 `contextPressure` 锚点）。
+    单调用回合原样上报；多调用回合改读 CLI 的 `session/read → projection.contextUsed`
+    （按次上下文读数），读不到则按次数取均值。**若不折算，1M 窗口会被算成 708%**，
+    表现为弹窗顶部 100%/~7.1M 与同弹窗的启发式明细（~24.9K）自相矛盾，并连续触发压缩
+    —— 完整取证与三条判据见 TROUBLESHOOTING §2.10。
+
 ---
 
 ## 免责声明
@@ -354,8 +629,9 @@ provider.models 输出）、面板行控件（锁定 disabled、1M 按官方数�
 - 本项目**不是** Z.ai / 智谱官方项目，与官方无关联。
 - 它通过读取**你本机已登录的 ZCode 客户端配置**来复用你自己的套餐额度。请自行确认这符合
   你所同意的服务条款；相关风险（含账号风控）由使用者自负。
-- 本项目**不破解、不绕过**任何验证机制：它只支持凭据本身就是标准 API Key 的套餐形态；
-  对需要验证码凭证的形态**明确拒绝**。
+- 本项目**不破解、不绕过**任何验证机制：`zcode` 通道只接凭据本身就是标准 API Key 的套餐形态；
+  `zcode-appserver` 通道则**完全不动验证链路** —— 它托管的是官方 agent 本体，请求由官方二进制
+  自己签发（本插件只在本机 stdio 上把 token 递给它）。两条通道都不伪造设备指纹、不模拟验证码。
 - 请勿提交任何凭据。仓库内不含、也不会要求你提供任何密钥。
 
 ## License

@@ -51,6 +51,8 @@ const ledger = await import('../lib/ledger.js');
 const discovery = await import('../lib/discovery.js');
 const modelMeta = await import('../lib/model-meta.js');
 const webStatus = await import('../lib/web-status.js');
+const appServer = await import('../lib/app-server.js');
+const planQuota = await import('../lib/plan-quota.js');
 const { Semaphore, instrumentApi } = await import('../lib/api-instrument.js');
 
 const tmp = mkdtempSync(join(tmpdir(), 'dsh-connect-zcode-selfcheck-'));
@@ -808,7 +810,14 @@ async function assertRejects(promise, pattern, label) {
     'export class PiAiAdapter { constructor(options) { this.options = options; } }\n'
   );
   tmpFile(join('stub-modules', '@deepseek-ai', 'dsh-llm', 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-llm', type: 'module', version: '0.0.0-stub' }));
-  tmpFile(join('stub-modules', '@deepseek-ai', 'dsh-llm', 'lib', 'index.js'), 'export const resolveRetryPolicy = () => ({ stub: true });\n');
+  tmpFile(
+    join('stub-modules', '@deepseek-ai', 'dsh-llm', 'lib', 'index.js'),
+    /* `LlmAdapter` / `LlmError` 是 app-server 通道的接线契约（DSH `registerAdapter` 收的是
+     * LlmAdapter 子类实例）；stub 必须同形，否则那条注册路径在自检里走不到（永久假绿）。 */
+    'export const resolveRetryPolicy = () => ({ stub: true });\n' +
+      'export class LlmAdapter {}\n' +
+      'export class LlmError extends Error { constructor(message, code) { super(message); this.name = "LlmError"; this.code = code; } }\n'
+  );
 
   const credPath = tmpFile('live-cred.json', fixtureConfig());
   const switchPath = tmpFile('live-switch.json', JSON.stringify({ enabled: true }));
@@ -1054,6 +1063,141 @@ async function assertRejects(promise, pattern, label) {
     }
   }
 
+  /* ── app-server 通道注册（T23）：默认关零回归；开则第二 provider 正确接线 ── */
+  {
+    const before = registrations.adapters.length; // 前面已注册 3 次（ctx1/ctx1b/ctx1c）
+    const ctxOff = fakeCtx();
+    index.apply(ctxOff, { switchPath, credentialPath: credPath, ledgerPath, credentialFallback: false });
+    await waitFor(() => registrations.adapters.length === before + 1);
+    check(
+      'appserver: 默认 appServer=false → 不注册第二 provider（零回归）',
+      registrations.adapters.length === before + 1 && !registrations.adapters.some((a) => a.ids?.includes('zcode-appserver')),
+      `adapters=${registrations.adapters.length}`
+    );
+
+    const before2 = registrations.adapters.length;
+    const dirsBefore = registrations.directories.length;
+    const ctxOn = fakeCtx();
+    index.apply(ctxOn, {
+      switchPath,
+      credentialPath: credPath,
+      ledgerPath,
+      credentialFallback: false,
+      appServer: true,
+      zcodeCliPath: process.execPath, // 只为"探测到 CLI"这一步（本段不会真的 spawn）
+      appServerModels: ['GLM-5.3-Flash', 'NOT_A_MODEL'],
+    });
+    const regOn = await waitFor(() => registrations.adapters.length === before2 + 2);
+    const appEntry = registrations.adapters.find((a) => a.ids?.includes('zcode-appserver'));
+    const appAdapter = appEntry?.adapter;
+    check(
+      'appserver: 开启后注册第二 provider zcode-appserver',
+      regOn === true && appEntry?.ids?.join(',') === 'zcode-appserver',
+      `adapters=${registrations.adapters.length} ids=${appEntry?.ids?.join(',')}`
+    );
+    /* BaseAdapter 接线：原型链上必须出现 LlmAdapter（stub 类名）。
+     * 只断言"有 stream 方法"区分不了"填了基类"与"没填"（后者 stream 仍是自有实现）。 */
+    const baseProto = Object.getPrototypeOf(Object.getPrototypeOf(appAdapter ?? {}));
+    check(
+      'appserver: 适配器继承宿主注入的 LlmAdapter 基类（registerAdapter 的契约）',
+      appAdapter !== undefined && typeof appAdapter.stream === 'function' && baseProto?.constructor?.name === 'LlmAdapter',
+      `proto=${baseProto?.constructor?.name}`
+    );
+    {
+      const models = await appAdapter.listModels('zcode-appserver');
+      const resolved = await appAdapter.resolveModel('zcode-appserver', 'GLM-5.3-Flash');
+      const unknown = await appAdapter.resolveModel('zcode-appserver', 'NOT_A_MODEL');
+      check(
+        'appserver: providerInfo / listModels 形状（未知 id 已从目录剔除；inputModalities 只声明 text）',
+        appAdapter.providerInfo('zcode-appserver')?.id === 'zcode-appserver' &&
+          models.length === 1 && models[0].id === 'GLM-5.3-Flash' &&
+          JSON.stringify(models[0].inputModalities) === JSON.stringify(['text'])
+      );
+      check(
+        'appserver: resolveModel 返回正整数 context（不暴露 0/undefined 上下文）',
+        Number.isSafeInteger(resolved.context.contextWindow) && resolved.context.contextWindow > 0 &&
+          Number.isSafeInteger(resolved.defaultMaxTokens) && resolved.defaultMaxTokens > 0 &&
+          JSON.stringify(resolved.inputModalities) === JSON.stringify(['text'])
+      );
+      check('appserver: resolveModel 对目录外模型也返回合法元数据（不抛）', Number.isSafeInteger(unknown.context.contextWindow) && unknown.id === 'NOT_A_MODEL');
+    }
+    {
+      const dirs = registrations.directories[registrations.directories.length - 1];
+      check(
+        'appserver: 目录条目两条（zcode + zcode-appserver，同 settingsNs）',
+        Array.isArray(dirs) && dirs.length === 2 && dirs[0].provider === 'zcode' &&
+          dirs[1].provider === 'zcode-appserver' && dirs[1].settingsNs === 'zcode-connect-selfcheck' &&
+          dirs[1].declared === false && dirs[1].settingsPath.length === 0,
+        `dirs=${dirs?.map?.((d) => d.provider).join(',')}`
+      );
+      check('appserver: 目录注册次数与本次 apply 一致（+1）', registrations.directories.length === dirsBefore + 1);
+    }
+
+    /* 目录发现必须包含赠送额度行 —— 宿主的图片策略按目录行判能力（2026-10-10 实测：
+     * 缺这些行时 attachmentCount=0，用户发的截图在适配器之前就被剥掉）。 */
+    {
+      writeFileSync(switchPath, JSON.stringify({ enabled: false }), 'utf8');
+      const discover = registrations.discoveries[registrations.discoveries.length - 1];
+      const rows = await discover.fn({}, undefined);
+      const giftRow = rows.find((row) => row?.id === 'GLM-5.3-Flash');
+      check(
+        'appserver: 目录发现含赠送额度行（图片策略能力源；attachments 缺席 → 如实 text-only）',
+        giftRow !== undefined && giftRow.inputModalities?.join(',') === 'text' &&
+          rows.some((row) => row?.id === 'glm-5.3-flash') && rows.length === 4,
+        `rows=${rows.length} gift=${JSON.stringify(giftRow ?? null)}`
+      );
+      writeFileSync(switchPath, JSON.stringify({ enabled: true }), 'utf8');
+    }
+
+    /* 冻结开关对 app-server 通道同样生效（PROTOCOL §7.1），且**在起子进程之前**拒绝。
+     * 语义与既有 zcode 通道一致：抛 SwitchFrozenError（宿主会规范化成终态 error chunk），
+     * 而不是自己吐一个 finish —— 两条通道的冻结表现必须一致，否则用户看到两种文案。 */
+    writeFileSync(switchPath, JSON.stringify({ enabled: false }), 'utf8');
+    const appChunks = [];
+    let frozenMsg = '';
+    try {
+      for await (const chunk of appAdapter.stream({ provider: 'zcode-appserver', model: 'GLM-5.3-Flash', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })) {
+        appChunks.push(chunk);
+      }
+    } catch (err) {
+      frozenMsg = err?.message ?? String(err);
+    }
+    check('appserver: 冻结期 stream 抛 §7.1 文案（与既有 zcode 通道同语义）', /派发总开关已关闭/.test(frozenMsg), frozenMsg);
+    check('appserver: 冻结期零产出 chunk', appChunks.length === 0, `chunks=${appChunks.length}`);
+    check('appserver: 冻结期未起子进程（gate 在 spawn 之前）', appAdapter.client?.child === undefined);
+
+    /* 服务端请求应答：运行时偏好 / 权限 / 浏览器（均不触发凭据读取）。 */
+    const written = [];
+    appAdapter.client.write = (msg) => written.push(msg);
+    appAdapter._answerServerRequest({ id: 7, method: 'session/requestRuntimePreferences' });
+    check(
+      'appserver: 运行时偏好应答形状（不回则 agent 卡住）',
+      written[0]?.id === 7 && written[0]?.result?.modelContextBudgetStrategy === 'preflight-v1' && written[0]?.result?.memoryEnabled === false
+    );
+    written.length = 0;
+    appAdapter._answerServerRequest({ id: 8, method: 'interaction/requestPermission' });
+    check('appserver: 工具策略 allow-all → decision=allow', written[0]?.result?.decision === 'allow');
+    written.length = 0;
+    appAdapter._answerServerRequest({ id: 9, method: 'interaction/browserList' });
+    check('appserver: 浏览器能力缺席 → 空列表（不假装提供）', JSON.stringify(written[0]?.result) === JSON.stringify({ browsers: [] }));
+
+    /* 鉴权应答：**不可解**的临时凭据库 → 必须明确拒绝（headersApplied:false）而不是挂死。
+     * 红线：绝不读真实 ~/.zcode/v2/credentials.json（R-01），故这里把存储路径指向 tmp。 */
+    written.length = 0;
+    const realOptions = appAdapter.options;
+    appAdapter.options = () => ({ ...realOptions(), appServerCredentialStorePath: join(tmp, 'nope.json') });
+    appAdapter._answerServerRequest({ id: 10, method: 'interaction/requestProviderRuntimeHeaders' });
+    appAdapter.options = realOptions;
+    check(
+      'appserver: 凭据不可用 → headersApplied:false（让 agent 走兜底，不挂死）',
+      written[0]?.result?.headersApplied === false && typeof written[0]?.result?.errorMessage === 'string',
+      JSON.stringify(written[0]?.result ?? null).slice(0, 100)
+    );
+    check('appserver: 鉴权失败路径零明文', !JSON.stringify(written[0]).includes(fakeKey));
+
+    writeFileSync(switchPath, JSON.stringify({ enabled: true }), 'utf8');
+  }
+
   for (const off of effects.splice(0)) off?.();
   check('卸载: 三部曲对称移除（两次注册一并卸载）', registrations.adapters.length === 0 && registrations.discoveries.length === 0 && registrations.directories.length === 0);
 
@@ -1070,6 +1214,493 @@ async function assertRejects(promise, pattern, label) {
   const noModules = await waitFor(() => errors.some((e) => e.includes('宿主 LLM 栈不可用')));
   check('失败面: 宿主栈不可解析 → 可操作错误且不注册', noModules === true, errors.find((e) => e.includes('宿主 LLM 栈不可用'))?.slice(0, 80));
 }
+
+// ─── 7.4 app-server 通道（Start Plan 直连；T23，纯静态零网络零真实凭据） ──────
+{
+  const src = readFileSync(join(PLUGIN_ROOT, 'lib', 'app-server.js'), 'utf8');
+
+  /* 纪律：link 插件**不能**裸 import 宿主包（TROUBLESHOOTING §2.4）——本模块靠调用方
+   * 注入 LlmAdapter 基类，源码里出现裸宿主说明符就是接线回退到了不可靠路径。 */
+  check(
+    'appserver: 零静态宿主包 import（LlmAdapter 靠调用方注入，§2.4）',
+    !/^\s*import\s[^;]*from\s+['"]@(?:deepseek-ai|earendil-works)\//m.test(src)
+  );
+  /* 凭据红线：token 只允许进鉴权应答；日志最多打长度。 */
+  check(
+    'appserver: 凭据不进日志（源码里未出现 `auth.token` 值插值）',
+    !/console\.[a-z]+\([^)]*auth\.token\b(?!\.length)/.test(src)
+  );
+
+  // ── 账户条目与注入补丁 ──
+  check(
+    'appserver: startPlanProviderId 按账号家族选条目（bigmodel/zai，非法回 zai）',
+    appServer.startPlanProviderId('bigmodel') === 'account:bigmodel-start-plan' &&
+      appServer.startPlanProviderId('zai') === 'account:zai-start-plan' &&
+      appServer.startPlanProviderId(undefined) === 'account:zai-start-plan' &&
+      appServer.startPlanProviderId('nonsense') === 'account:zai-start-plan'
+  );
+  {
+    const pid = appServer.startPlanProviderId('bigmodel');
+    const patch = appServer.buildAccountConfigPatch('rev:1', pid, ['GLM-5.3-Flash'], 42);
+    /* access 的 schema 严格：只接受 `{type:'zhipu-account', entitled}`；
+     * states[s] 必须带 current —— 形状错了注入会被拒（或静默跳过）。 */
+    check(
+      'appserver: 注入补丁形状（access 两键 / states.current / basedOn 逐字符保留）',
+      patch.basedOnZCodeBuiltinRevision === 'rev:1' &&
+        JSON.stringify(patch.providers[pid].access) === JSON.stringify({ type: 'zhipu-account', entitled: true }) &&
+        patch.states[pid].current === true &&
+        patch.providers[pid].builtinModelIds.join(',') === 'GLM-5.3-Flash'
+    );
+  }
+
+  // ── 子进程 env 白名单 ──
+  {
+    const env = appServer.buildChildEnv(
+      { PATH: 'x', SECRET_TOKEN: 'leak-me', ZCODE_FOO: '1', ProgramFiles: 'C:\\PF' },
+      { ZCODE_BASE_URL: 'https://zcode.z.ai' },
+      ['my_var']
+    );
+    check(
+      'appserver: 子进程 env 只透传白名单 + ZCODE_*（不泄漏宿主其他密钥）',
+      env.SECRET_TOKEN === undefined && env.ZCODE_FOO === '1' && env.ZCODE_BASE_URL === 'https://zcode.z.ai' && env.PATH === 'x'
+    );
+  }
+
+  // ── CLI 探测（ZCode 常装在非系统盘：只查 %ProgramFiles% 会漏）──
+  check(
+    'appserver: resolveZcodeCliPath 支持盘符扫描 + 显式配置优先',
+    appServer.resolveZcodeCliPath('') === '' || appServer.resolveZcodeCliPath('').endsWith('zcode.cjs')
+  );
+  {
+    const explicit = appServer.resolveZcodeCliPath(process.execPath);
+    check('appserver: 显式配置的 CLI 路径被优先采用', explicit === process.execPath, explicit);
+  }
+
+  // ── builtin revision（注入是否被静默跳过的唯一判据）──
+  {
+    const b1 = tmpFile('as-builtin.json', JSON.stringify({ revision: 30 }));
+    const b2 = tmpFile('as-builtin-other.json', JSON.stringify({ revision: 30 }));
+    const r1 = appServer.computeBuiltinRevision(b1);
+    check(
+      'appserver: computeBuiltinRevision = zcode-builtin:<revision>:<sha256(path)>（路径敏感）',
+      r1.startsWith('zcode-builtin:30:') && r1 === appServer.computeBuiltinRevision(b1) && r1 !== appServer.computeBuiltinRevision(b2)
+    );
+  }
+  {
+    /* resolveBuiltinRuntime 必须优先非 0.0.0-dev（CLI 裸跑的 fallback 目录）。 */
+    const base = join(tmp, 'as-data');
+    const root = join(base, '.zcode', 'v2', 'runtime', 'provider', 'windows-x86_64');
+    const entries = {
+      [root]: [
+        { name: '0.0.0-dev', isDirectory: () => true },
+        { name: '3.14.5', isDirectory: () => true },
+      ],
+      [join(root, '0.0.0-dev')]: [{ name: 'endpoint-a', isDirectory: () => true }],
+      [join(root, '3.14.5')]: [{ name: 'endpoint-b', isDirectory: () => true }],
+    };
+    const fsImpl = {
+      readdirSync: (p) => {
+        if (entries[p]) return entries[p];
+        throw new Error('ENOENT');
+      },
+      statSync: (p) => ({ mtimeMs: p.includes('3.14.5') ? 200 : 100 }),
+    };
+    const hit = appServer.resolveBuiltinRuntime(base, { platformDir: 'windows-x86_64', fsImpl });
+    check(
+      'appserver: builtin 运行时优先非 0.0.0-dev（版本目录选最新）',
+      hit?.version === '3.14.5' && hit.activeFilePath.includes('endpoint-b'),
+      `version=${hit?.version}`
+    );
+    check('appserver: 运行时目录缺失 → undefined（调用方告警而非抛）', appServer.resolveBuiltinRuntime(join(tmp, 'nope')) === undefined);
+  }
+
+  // ── 模型目录解析（未知 id 必丢弃：写错 id 会让 setModel 失败）──
+  {
+    const cat = appServer.resolveAppServerCatalog(['GLM-5.2', 'NOT_A_MODEL']);
+    check('appserver: 目录只暴露内置真实模型（未知 id 丢弃）', cat.length === 1 && cat[0].id === 'GLM-5.2');
+    const dflt = appServer.resolveAppServerCatalog([]);
+    check('appserver: 空配置回默认单条（不会暴露 0 个模型）', dflt.length === 1 && dflt[0].id === 'GLM-5.3-Flash');
+    check(
+      'appserver: 内置目录不含 GLM-5.3（builtin 未给 start-plan 声明它）',
+      !appServer.START_PLAN_CATALOG.some((m) => m.id === 'GLM-5.3')
+    );
+  }
+
+  // ── 对话拍平 ──
+  {
+    const flat = appServer.flattenConversation(
+      [
+        { role: 'user', content: [{ type: 'text', text: '你好' }] },
+        { role: 'assistant', content: [{ type: 'text', text: '在' }, { type: 'tool-call', name: 'Bash', arguments: '{}' }] },
+        { role: 'tool', content: [{ type: 'text', text: 'ok' }] },
+      ],
+      'SYS'
+    );
+    check(
+      'appserver: flattenConversation 保留 system/用户/助手/工具结果四段',
+      flat.includes('# 系统提示') && flat.includes('# 用户') && flat.includes('[调用工具 Bash]') && flat.includes('# 工具结果')
+    );
+    check(
+      'appserver: lastUserText 取末条用户消息（续轮只发它）',
+      appServer.lastUserText([{ role: 'user', content: [{ type: 'text', text: 'A' }] }, { role: 'assistant', content: [{ type: 'text', text: 'B' }] }]) === 'A' &&
+        appServer.lastUserText([{ role: 'assistant', content: [{ type: 'text', text: 'B' }] }]) === ''
+    );
+    check(
+      'appserver: 历史里的伪工具调用标记被压成占位（防模型照抄）',
+      appServer.sanitizeLeakedCalls('<antml:invoke name="pwsh">x</antml:invoke>ok').startsWith('（历史') &&
+        appServer.sanitizeLeakedCalls('正常文本') === '正常文本'
+    );
+    const f1 = appServer.conversationFingerprint([{ role: 'user', content: 'a' }], 's');
+    check(
+      'appserver: 会话指纹对内容与 system 都敏感（历史分叉检测）',
+      f1 !== appServer.conversationFingerprint([{ role: 'user', content: 'b' }], 's') &&
+        f1 !== appServer.conversationFingerprint([{ role: 'user', content: 'a' }], 's2') &&
+        f1 === appServer.conversationFingerprint([{ role: 'user', content: 'a' }], 's')
+    );
+  }
+
+  // ── 事件信封：**type 在 params 顶层**（不是 payload.type）——搞错会静默收不到任何流 ──
+  {
+    const a = appServer.eventPayload({ params: { type: 'turn.completed', payload: { response: 'hi' } } });
+    const b = appServer.eventPayload({ params: { payload: { type: 'inner.type' } } });
+    const c = appServer.eventPayload({});
+    check(
+      'appserver: 事件信封按 params.type 取（顶层优先，回落 payload.type）',
+      a.type === 'turn.completed' && a.payload.response === 'hi' && b.type === 'inner.type' && c.type === '' && JSON.stringify(c.payload) === '{}'
+    );
+
+    // ── 图片附件：DSH 图片块 → app-server 的 attachments（走 localPath）──
+    {
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: '旧' }, { type: 'image', attachment: { attachmentId: 'old' } }] },
+      { role: 'assistant', content: [{ type: 'text', text: '好' }] },
+      { role: 'user', content: [{ type: 'text', text: '看这张' }, { type: 'image', attachment: { attachmentId: 'a1', name: 'shot.png' } }, { type: 'image', mimeType: 'image/jpeg' }] },
+    ];
+    const blocks = appServer.collectImageBlocks(messages);
+    check(
+      'appserver: 图片块只取最后一条用户消息（历史图由 agent 自己的会话历史承载）',
+      blocks.length === 2 && blocks[0].ref.attachmentId === 'a1' && blocks[1].ref === null && blocks[1].mimeType === 'image/jpeg',
+      JSON.stringify(blocks)
+    );
+    check(
+      'appserver: 无用户消息 / 非数组输入 → 空数组（不抛）',
+      appServer.collectImageBlocks([]).length === 0 && appServer.collectImageBlocks(undefined).length === 0 &&
+        appServer.collectImageBlocks([{ role: 'assistant', content: [{ type: 'image' }] }]).length === 0
+    );
+    check(
+      'appserver: 扩展名映射与 dsh-llm 同套（png/jpeg/webp/gif，未知 .bin）',
+      appServer.imageExtension('image/png') === '.png' && appServer.imageExtension('image/jpeg') === '.jpg' &&
+        appServer.imageExtension('image/webp') === '.webp' && appServer.imageExtension('image/gif') === '.gif' &&
+        appServer.imageExtension('image/avif') === '.bin'
+    );
+    check('appserver: 转发图片时正文带附件说明（否则 agent 只看到路径、不知是本轮新图）', appServer.IMAGE_ATTACH_NOTE.includes('图片附件'));
+    }
+  }
+
+  /* ── usage 口径折算（2026-10-10 真机事故）────────────────────────────────────────
+   * CLI 的 `turn.completed.usage` 是**本回合全部模型调用之和**（zcode.cjs: ZO→Jgr 逐桶累加，
+   * 带 modelRequestCount），而 DSH 的 usage 是单次请求口径 —— tokenMeter 直接拿它当
+   * contextPressure 锚点（pressureFrom = input + cacheRead + cacheWrite）。
+   * 照搬聚合值 = 上下文占用虚高 N 倍（实测 17 次调用 ⇒ 7.08M / 1M = 708%，原生弹窗
+   * 顶部 100% 与同弹窗启发式明细 24.9K 自相矛盾，且连触发两次压缩）。 */
+  {
+    const j = (x) => JSON.stringify(x);
+    /* ① 单调用回合：聚合值**就是**按次值 ⇒ 原样上报（含 cache 分桶）。 */
+    const single = appServer.deriveReportedUsage(
+      { inputTokens: 220089, outputTokens: 7604, cacheReadTokens: 12800, cacheWriteTokens: 0, modelRequestCount: 1 },
+      undefined
+    );
+    check(
+      'appserver: usage 口径=cli-single（单调用回合原样上报，含 cache 分桶）',
+      single.basis === 'cli-single' &&
+        j(single.usage) === j({ inputTokens: 220089, outputTokens: 7604, cacheReadTokens: 12800, cacheWriteTokens: 0 }),
+      `${single.basis} ${j(single.usage)}`
+    );
+    /* ② 多调用回合 + 有 CLI 按次读数 ⇒ 用 contextUsed，output 记 0（已含在 contextUsed 里，防重复计）。 */
+    const multi = appServer.deriveReportedUsage(
+      { inputTokens: 3871622, outputTokens: 20391, cacheReadTokens: 3200000, cacheWriteTokens: 12, modelRequestCount: 17 },
+      731402
+    );
+    check(
+      'appserver: usage 口径=context-used（多调用回合改用 CLI 按次读数，不再上报 3.87M 聚合值）',
+      multi.basis === 'context-used' && j(multi.usage) === j({ inputTokens: 731402, outputTokens: 0 }),
+      `${multi.basis} ${j(multi.usage)}`
+    );
+    /* ③ 多调用但拿不到按次读数 ⇒ 按次数取均值（宁小不大，绝不虚高）。 */
+    const divided = appServer.deriveReportedUsage(
+      { inputTokens: 3400000, outputTokens: 17000, cacheReadTokens: 1700000, modelRequestCount: 17 },
+      undefined
+    );
+    check(
+      'appserver: usage 口径=divided-by-count（读不到按次读数时取均值，不虚高）',
+      divided.basis === 'divided-by-count' && divided.usage.inputTokens === 200000 &&
+        divided.usage.outputTokens === 1000 && divided.usage.cacheReadTokens === 100000,
+      `${divided.basis} ${j(divided.usage)}`
+    );
+    /* ④ 口径漂移护栏：按次读数大于整回合聚合总量 ⇒ 不采信，退回均值。 */
+    const drift = appServer.deriveReportedUsage(
+      { inputTokens: 100000, outputTokens: 500, modelRequestCount: 4 },
+      999999
+    );
+    check(
+      'appserver: usage 口径漂移护栏（contextUsed 大于回合聚合 ⇒ 不采信，退回均值）',
+      drift.basis === 'divided-by-count' && drift.usage.inputTokens === 25000,
+      `${drift.basis} ${j(drift.usage)}`
+    );
+    /* ⑤ 老 CLI 不带 modelRequestCount 但有按次读数 ⇒ 仍按按次值用；两者都没有 ⇒ 不抛。
+     * ⚠️ 聚合值必须 ≥ 按次读数（真实世界里回合聚合恒 ≥ 末次调用），否则先被漂移护栏拦下——
+     * 这条护栏正是用来识别"contextUsed 语义变了"（比如某版把它换成会话累计值）。 */
+    const legacy = appServer.deriveReportedUsage({ inputTokens: 900000, outputTokens: 90000 }, 5000);
+    const empty = appServer.deriveReportedUsage(undefined, undefined);
+    check(
+      'appserver: usage 口径兜底（次数未知但可按次 / 全缺 → 零值，不抛）',
+      legacy.basis === 'context-used' && legacy.usage.inputTokens === 5000 &&
+        empty.basis === 'cli-raw' && empty.usage.inputTokens === 0 && empty.usage.outputTokens === 0,
+      `${legacy.basis}/${empty.basis}`
+    );
+
+    /* ── 接线断言（源码级，防"折算了但没接上"）── */
+    check(
+      'appserver: 折算函数必须真接在回合结束路径上（多调用回合才读 session/read）',
+      /derived = deriveReportedUsage\(turnUsage, probe\?\.contextUsed\)/.test(src) &&
+        /const needProbe = !\(typeof turnCalls === 'number' && turnCalls <= 1\)/.test(src) &&
+        /session\/read/.test(src) && /messageLimit: 1/.test(src)
+    );
+    check(
+      'appserver: 不再把 CLI 聚合 usage 直接当作用量（turnUsage 只进折算与账本）',
+      !/usage = \{\s*\n\s*inputTokens: payload\.usage\.inputTokens/.test(src) &&
+        /turnUsage = \{/.test(src) && /deriveReportedUsage\(turnUsage/.test(src)
+    );
+    check(
+      'appserver: 账本仍记回合聚合（真实消耗），不是上报给 DSH 的按次折算值',
+      /input: turnUsage\?\.inputTokens \?\? 0/.test(src) && /output: turnUsage\?\.outputTokens \?\? 0/.test(src)
+    );
+
+    /* ── 端到端（假 transport 驱动**真实 stream()**，零 spawn 零额度）──────────────
+     * 只有真的把折算接在回合结束路径上，这个断言才会过 —— 纯函数单测做不到这一点。 */
+    const cfgLike = {
+      zcodeCliPath: process.execPath, zcodeCliNode: 'node', appServerWorkspace: homedir(),
+      zcodeDataBaseDir: '', appServerCredentialStorePath: '', appServerAccountProviderId: '',
+      appServerModels: ['GLM-5.2'], appServerReasoningLevel: 'max', appServerToolPolicy: 'deny-all',
+      appServerInjectAccount: false, appServerRpcTimeoutMs: 5000, appServerTurnTimeoutMs: 20000,
+      childEnvAllow: [], contextWindow: 1000000,
+    };
+    const makeFakeClient = ({ turnUsage, contextUsed, readFails = false }) => {
+      const listeners = new Set();
+      const calls = [];
+      return {
+        disposed: false,
+        calls,
+        cliPath: '', cliNode: '', cwd: '', rpcTimeoutMs: 0, env: {}, lastChannel: null, onServerRequest: null,
+        onNotification(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+        write() {}, notify() {}, dispose() {},
+        async ensureStarted() {},
+        async request(method, params) {
+          calls.push({ method, params });
+          if (method === 'session/read') {
+            if (readFails) throw new Error('session/read 故意失败');
+            return { projection: { contextUsed, contextWindow: 1000000 } };
+          }
+          if (method === 'session/send') {
+            /* 事件在 send 返回后到达（与真实时序一致：先 200 再流事件）。 */
+            queueMicrotask(() => {
+              for (const listener of listeners) {
+                listener({ method: 'session/event', params: { type: 'turn.completed', payload: { response: 'ok', resultType: 'success', usage: turnUsage } } });
+              }
+            });
+            return {};
+          }
+          return {};
+        },
+      };
+    };
+    /** 跑一轮：会话条目直接预置（跳过 ensureSession 的 3.5s 建会话等待，本测只验 usage 接线）。 */
+    const runTurn = async (fake, ledger) => {
+      const adapter = appServer.createAppServerAdapter({
+        BaseAdapter: class {},
+        LlmError: class LlmError extends Error {},
+        options: () => cfgLike,
+        logger: {},
+        record: (info) => ledger.push(info),
+        gate: () => {},
+      });
+      adapter.client = fake;
+      adapter.sessions.set('s1', { sessionId: 'sess-fake', firstTurn: false, modelId: 'GLM-5.2', sentFingerprint: undefined });
+      const chunks = [];
+      for await (const chunk of adapter.stream({
+        provider: 'zcode-appserver', model: 'GLM-5.2', sessionId: 's1',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      })) chunks.push(chunk);
+      adapter.dispose();
+      return chunks;
+    };
+
+    const multiFake = makeFakeClient({
+      turnUsage: { inputTokens: 3400000, outputTokens: 17000, cacheReadTokens: 1700000, cacheWriteTokens: 0, modelRequestCount: 17 },
+      contextUsed: 731402,
+    });
+    const multiLedger = [];
+    const multiChunks = await runTurn(multiFake, multiLedger);
+    const multiUsage = multiChunks.find((c) => c.type === 'usage')?.usage;
+    check(
+      'appserver: 多调用回合上报的是按次读数（不是 3.4M 聚合值，output 记 0 防重复计）',
+      j(multiUsage) === j({ inputTokens: 731402, outputTokens: 0 }),
+      j(multiUsage)
+    );
+    check(
+      'appserver: 多调用回合真的读了 session/read（带 sessionId 与 messageLimit:1，快照构建才便宜）',
+      multiFake.calls.some((c) => c.method === 'session/read' && c.params.sessionId === 'sess-fake' && c.params.messageLimit === 1),
+      JSON.stringify(multiFake.calls.map((c) => c.method))
+    );
+    check(
+      'appserver: 账本记回合聚合 + 调用次数（真实消耗不被折算值污染）',
+      multiLedger.length === 1 && multiLedger[0].input === 3400000 && multiLedger[0].output === 17000 && multiLedger[0].modelRequestCount === 17,
+      j(multiLedger)
+    );
+
+    const singleFake = makeFakeClient({
+      turnUsage: { inputTokens: 220089, outputTokens: 7604, cacheReadTokens: 12800, cacheWriteTokens: 0, modelRequestCount: 1 },
+      contextUsed: 999999,
+    });
+    const singleChunks = await runTurn(singleFake, []);
+    const singleUsage = singleChunks.find((c) => c.type === 'usage')?.usage;
+    check(
+      'appserver: 单调用回合原样上报且**不**多打 session/read（占多数路径零额外 RPC）',
+      j(singleUsage) === j({ inputTokens: 220089, outputTokens: 7604, cacheReadTokens: 12800, cacheWriteTokens: 0 }) &&
+        !singleFake.calls.some((c) => c.method === 'session/read'),
+      `${j(singleUsage)} calls=${JSON.stringify(singleFake.calls.map((c) => c.method))}`
+    );
+
+    const failFake = makeFakeClient({
+      turnUsage: { inputTokens: 3400000, outputTokens: 17000, modelRequestCount: 17 },
+      contextUsed: undefined,
+      readFails: true,
+    });
+    const failChunks = await runTurn(failFake, []);
+    const failUsage = failChunks.find((c) => c.type === 'usage')?.usage;
+    check(
+      'appserver: session/read 失败不打断回合（退回均值折算，仍不虚高）',
+      failUsage?.inputTokens === 200000 && failUsage?.outputTokens === 1000 && failChunks.some((c) => c.type === 'finish'),
+      j(failUsage)
+    );
+  }
+
+  // ── 凭据读取（只读 tmp fixture，零真实凭据）──
+  {
+    const secret = `zcode-credential-fallback:${process.platform}:${homedir()}:${(() => { try { return userInfo().username; } catch { return 'unknown'; } })()}`;
+    const key2 = crypto.createHash('sha256').update(secret).digest();
+    const encrypt = (plain) => {
+      const iv = crypto.randomBytes(12);
+      const cipher = crypto.createCipheriv('aes-256-gcm', key2, iv);
+      const body = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
+      return `enc:v1:${iv.toString('base64url')}.${cipher.getAuthTag().toString('base64url')}.${body.toString('base64url')}`;
+    };
+    /* ⚠️ fixture 里 `oauth:active_provider` **必须也加密**（2026-10-10 真机踩到的坑）：
+     * 真实凭据库里它同样是 `enc:v1:` 密文。若 fixture 用明文，`readStartPlanAuth` 就算
+     * 忘了解密也照样通过 —— 于是"注入错家族"（静默回落 zai）在自检里永久假绿。
+     * 这正是 §3.3「过紧/过松的断言会保护 bug」的同构案例。 */
+    const good = tmpFile(
+      'as-creds.json',
+      JSON.stringify({ zcodejwttoken: encrypt('FAKE.JWT.TOKEN'), 'oauth:active_provider': encrypt('bigmodel') })
+    );
+    const auth = appServer.readStartPlanAuth(good);
+    check(
+      'appserver: 凭据库解密出 token + activeProvider（**两者都是密文**，决定注入哪个家族）',
+      auth.token === 'FAKE.JWT.TOKEN' && auth.activeProvider === 'bigmodel',
+      `activeProvider=${auth.activeProvider}`
+    );
+
+    const bad = tmpFile('as-creds-bad.json', JSON.stringify({ zcodejwttoken: 'enc:v1:AAAA.BBBB.CCCC' }));
+    const badRejected = await assertRejects(Promise.resolve().then(() => appServer.readStartPlanAuth(bad)), /zcodejwttoken/);
+    check('appserver: 凭据不可解 → 可操作错误（文案不含明文）', badRejected === true);
+
+    const missing = await assertRejects(Promise.resolve().then(() => appServer.readStartPlanAuth(join(tmp, 'no-creds.json'))), /共享凭证库/);
+    check('appserver: 凭据库缺失 → 可操作错误', missing === true);
+
+    check('appserver: resolveAccountProviderId 依 activeProvider 自动选家族', appServer.resolveAccountProviderId({ appServerCredentialStorePath: good }) === 'account:bigmodel-start-plan');
+    check('appserver: resolveAccountProviderId 显式配置优先', appServer.resolveAccountProviderId({ appServerCredentialStorePath: good, appServerAccountProviderId: 'account:zai-start-plan' }) === 'account:zai-start-plan');
+    check('appserver: resolveAccountProviderId 读不到凭据也不抛（回 zai）', appServer.resolveAccountProviderId({ appServerCredentialStorePath: join(tmp, 'nope.json') }) === 'account:zai-start-plan');
+  }
+
+  // ── JSON-RPC 客户端：帧形状 / 应答 / 匹配 / 不悬挂 ──
+  {
+    const { EventEmitter } = await import('node:events');
+    const { Readable, Writable } = await import('node:stream');
+    const written = [];
+    const fakeChild = new EventEmitter();
+    fakeChild.pid = 4242;
+    fakeChild.stdout = new Readable({ read() {} });
+    fakeChild.stderr = new Readable({ read() {} });
+    fakeChild.stdin = new Writable({ write(chunk, _e, cb) { written.push(String(chunk)); cb(); } });
+    fakeChild.kill = () => {};
+
+    const client = new appServer.AppServerClient({
+      spawnImpl: () => fakeChild,
+      cliPath: process.execPath, // 只为 existsSync 判定
+      cliNode: 'node',
+      env: {},
+      cwd: tmp,
+      rpcTimeoutMs: 2000,
+      logger: {},
+    });
+    await client.ensureStarted();
+
+    const pending = client.request('session/create', { a: 1 });
+    check(
+      'appserver: 请求帧 = 裸 {id, method, params}（带 jsonrpc 会被 -32600 拒）',
+      JSON.stringify(JSON.parse(written[0])) === JSON.stringify({ id: 1, method: 'session/create', params: { a: 1 } })
+    );
+
+    let answered = null;
+    client.onServerRequest = (msg) => {
+      answered = msg;
+      client.write({ id: msg.id, result: { ok: true } });
+    };
+    fakeChild.stdout.push(`${JSON.stringify({ id: 99, method: 'session/requestRuntimePreferences', params: { scope: 'x' } })}\n`);
+    await new Promise((r) => setTimeout(r, 20));
+    check('appserver: 服务端请求被派发到 onServerRequest（必须应答，否则 agent 卡住）', answered?.method === 'session/requestRuntimePreferences');
+
+    fakeChild.stdout.push(`${JSON.stringify({ id: 1, result: { session: { sessionId: 'sess_x' } } })}\n`);
+    const res = await pending;
+    check('appserver: 响应按 id 匹配并 resolve', res.session.sessionId === 'sess_x');
+
+    const failing = client.request('session/send', {});
+    const failId = JSON.parse(written[written.length - 1]).id;
+    fakeChild.stdout.push(`${JSON.stringify({ id: failId, error: { message: 'boom' } })}\n`);
+    let rejectedMsg = '';
+    try {
+      await failing;
+    } catch (err) {
+      rejectedMsg = err.message;
+    }
+    check('appserver: error 响应 → reject（上游文案透传）', rejectedMsg === 'boom');
+
+    const split = client.request('x', {});
+    const splitId = JSON.parse(written[written.length - 1]).id;
+    fakeChild.stdout.push('not-json\n{"id":');
+    fakeChild.stdout.push(`${splitId},"result":{"ok":1}}\n`);
+    const okLine = await split;
+    check('appserver: 坏行忽略 + NDJSON 分片重组', okLine.ok === 1);
+
+    const seen = [];
+    client.onNotification((msg) => seen.push(msg.method));
+    fakeChild.stdout.push(`${JSON.stringify({ method: 'session/event', params: { type: 'turn.started' } })}\n`);
+    await new Promise((r) => setTimeout(r, 20));
+    check('appserver: 通知派发到监听器', seen.join(',') === 'session/event');
+
+    const hanging = client.request('never/answers', {});
+    fakeChild.emit('exit', 1);
+    let exitErr = '';
+    try {
+      await hanging;
+    } catch (err) {
+      exitErr = err.message;
+    }
+    check('appserver: 子进程退出 → 挂起请求 reject（绝不悬挂）', /已退出/.test(exitErr), exitErr);
+    client.dispose();
+  }
+}
+
 
 // ─── 7.5 client 半行为（stub 宿主 + stub react；T21 §3.5 + T22 §1.5-6） ──────
 {
@@ -1156,11 +1787,53 @@ async function assertRejects(promise, pattern, label) {
     } catch (err) {
       applyThrew = err;
     }
-    check('client: apply 在服务缺失 stub ctx 下不抛且注册 bundle.config 卡（§0.3）', applyThrew === null && slotInjects.length === 1 && slotInjects[0].slotName === 'plugins.bundle.config', applyThrew?.message);
+    check(
+      'client: apply 在服务缺失 stub ctx 下不抛且注册两个槽位（设置卡 + composer 进度条）',
+      applyThrew === null &&
+        slotInjects.length === 2 &&
+        slotInjects[0].slotName === 'plugins.bundle.config' &&
+        slotInjects[1].slotName === 'conversation.composer.dock',
+      `injects=${slotInjects.map((s) => s.slotName).join(',')} ${applyThrew?.message ?? ''}`
+    );
     slotInjects[0]?.registrar?.();
+    slotInjects[1]?.registrar?.();
     const card = slotRegisters[0];
     check('client: 卡 key = bundle 包名 + priority 30（slot 契约）', card?.desc?.key === 'dsh-connect-zcode' && card?.desc?.priority === 30 && card?.desc?.name === 'plugins.bundle.config', JSON.stringify(card?.desc ?? null));
     check('client: 卡组件为函数（React 函数组件，无构建链）', typeof card?.component === 'function');
+    /* list 型槽位（composer.dock）的注册契约与 single 不同：必须带 `id`（同 priority 下唯一），
+     * `order` 参与同槽位排序。官方先例：chat 注册 { id: "stats", order: 0 }。 */
+    const dock = slotRegisters.find((entry) => entry.desc?.id === 'zcode-quota-bar');
+    check(
+      'client: composer dock 注册描述符符合 list 型契约（name + id + order）',
+      dock !== undefined &&
+        dock.desc.name === 'conversation.composer.dock' &&
+        typeof dock.desc.id === 'string' && dock.desc.id.length > 0 &&
+        Number.isInteger(dock.desc.order),
+      JSON.stringify(dock?.desc ?? null)
+    );
+    /* 刷新机制：面板与输入框进度条必须**共用**一个轮询器（单定时器 + 单 fetch 源）。
+     * 各自 setInterval 有两个后果：① 双份请求；② 两处 `useState` 副本各自演进
+     * ⇒ 同一个额度在两处显示成不同时刻的值，用户看到"两个数对不上"。 */
+    const clientSrcForPoll = readFileSync(join(PLUGIN_ROOT, 'lib', 'client.js'), 'utf8');
+    const countOf = (re) => (clientSrcForPoll.match(re) ?? []).length;
+    check(
+      'client: 状态文档共享轮询 —— 单一定时器 + 单一 fetch 源（面板与进度条不各自轮询）',
+      countOf(/setInterval\(/g) === 1 && /STATUS_POLL_MS\s*=\s*60000/.test(clientSrcForPoll) && countOf(/fetch\(STATUS_PATH/g) === 1,
+      `setInterval=${countOf(/setInterval\(/g)} fetch=${countOf(/fetch\(STATUS_PATH/g)}`
+    );
+    check(
+      'client: 两个消费者都走 subscribeStatusDoc（面板 + composer 进度条）',
+      countOf(/subscribeStatusDoc\(\{/g) === 2,
+      `sites=${countOf(/subscribeStatusDoc\(\{/g)}`
+    );
+    check(
+      'client: 定时器随订阅者增减（最后一个消费者卸载即撤销，不留后台空转）',
+      /listeners\.size === 0[\s\S]{0,120}clearInterval\(STATUS_STORE\.timer\)/.test(clientSrcForPoll)
+    );
+    check(
+      'client: 面板刷新受 view 门禁（summary 视图不订阅、不拉状态）',
+      /if \(view !== "page"\) return void 0;[\s\S]{0,400}subscribeStatusDoc\(\{/.test(clientSrcForPoll)
+    );
 
     const scope = { getSnapshot: () => ({ status: 'unavailable', value: void 0, writable: false }), subscribe: () => () => {}, set: async () => false };
     let summaryEl = null;
@@ -1224,6 +1897,148 @@ async function assertRejects(promise, pattern, label) {
     check('client: FlashX 无官方数据提示在场', JSON.stringify(factsPage).includes('未提供官方数据'));
     check('client: 概览含上下文预算行（1 个模型已切 1M）', JSON.stringify(factsPage).includes('上下文预算') && JSON.stringify(factsPage).includes('1 个模型已切 1M'));
     check('client: 1M 实测差异提示在场（CLI 实测 200k）', JSON.stringify(factsPage).includes('CLI 实测有效窗口 200k'));
+
+    /* ── 赠送额度进度条（composer dock）：**行为**断言而非源码正则 ──
+     * 三种 state 的语义差异是本功能的红线：
+     *   active  → 填充 = 剩余/总量，悬浮「剩余 X / 总量 Y」；
+     *   pending → 余额桶还没建，剩余**不可知** ⇒ 绝不能用总量冒充剩余（那会显示成"一分没用"）；
+     *   其余    → 整块不渲染（宁可不显示，也不给误导数字）。 */
+    const dockComp = dock?.component;
+    const activeQuota = {
+      ok: true, state: 'active', totalUnits: 300000000, remainingUnits: 30000000, usedUnits: 270000000,
+      model: 'GLM-5.3-Flash', planName: 'ZCode Weekend Build', effectiveAt: 0, observedAt: '2026-10-10T12:12:30.119Z',
+    };
+    const pendingQuota = {
+      ok: true, state: 'pending', totalUnits: 300000000, remainingUnits: null, usedUnits: null,
+      model: 'GLM-5.3-Flash', planName: 'ZCode Weekend Build', effectiveAt: 1791644400, observedAt: null,
+    };
+    const pickBar = (node, cls) =>
+      findAllEls(node, (n) => typeof n.props?.className === 'string' && n.props.className.split(' ').includes(cls))[0];
+    /* 门禁所需的 `modelSelection` 投影桩（宿主真实形状：{next|pending|lastUsed:{provider,model}}）。
+     * 默认选中赠送额度那条 provider —— 否则按新门禁**整块不渲染**（这正是本轮新增的行为）。 */
+    const projectionFor = (provider, model = 'GLM-5.3-Flash') => () => ({ next: { provider, model } });
+    const ownedProjection = projectionFor('zcode-appserver');
+    const barActive = dockComp({ statusRef: { current: { planQuota: activeQuota } }, useProjection: ownedProjection });
+    const barPending = dockComp({ statusRef: { current: { planQuota: pendingQuota } }, useProjection: ownedProjection });
+    const barNone = dockComp({ statusRef: { current: {} }, useProjection: ownedProjection });
+    const rootActive = pickBar(barActive, 'dzc-quota');
+    const rootPending = pickBar(barPending, 'dzc-quota');
+    check(
+      'client: 进度条 active — 悬浮提示为「剩余/总量」（用户要求的确切形状）',
+      typeof rootActive?.props?.title === 'string' && rootActive.props.title.includes('剩余 30,000,000 / 总量 300,000,000'),
+      rootActive?.props?.title
+    );
+    check(
+      'client: 进度条 active — 填充比例 = 剩余/总量（10%）',
+      pickBar(barActive, 'dzc-quota-fill')?.props?.style?.width === '10.00%' &&
+        JSON.stringify(barActive).includes('赠送额度 剩余') && JSON.stringify(barActive).includes('10%'),
+      JSON.stringify(pickBar(barActive, 'dzc-quota-fill')?.props?.style)
+    );
+    check(
+      'client: 进度条 pending — 不把总量冒充剩余（提示「剩余 —（未生效）」+ 满格）',
+      typeof rootPending?.props?.title === 'string' &&
+        rootPending.props.title.includes('剩余 —（未生效） / 总量 300,000,000') &&
+        pickBar(barPending, 'dzc-quota-fill-idle')?.props?.style?.width === '100.00%' &&
+        JSON.stringify(barPending).includes('待生效'),
+      rootPending?.props?.title
+    );
+    check('client: 进度条 — 无额度数据/不可用时整块不渲染（不给误导数字）', barNone === null && findAllEls(barActive, (n) => n.type === 'div').length > 0, String(barNone));
+
+    /* ── 显示门禁：**只有选中赠送额度那条 provider 的模型才显示** ──
+     * 依据是宿主自己的 modelSelection 投影（模型选择器写什么、下一次请求用什么就是它），
+     * 所以不会出现"显示着赠送额度、实际烧的却是 Coding Plan"的错配。 */
+    {
+      const atProvider = (provider) => dockComp({ statusRef: { current: { planQuota: activeQuota } }, useProjection: projectionFor(provider) });
+      check(
+        'client: 门禁 — 选中 Coding Plan（zcode）时进度条不显示',
+        atProvider('zcode') === null,
+        String(atProvider('zcode'))
+      );
+      check(
+        'client: 门禁 — 选中赠送额度（zcode-appserver）时才显示',
+        pickBar(atProvider('zcode-appserver'), 'dzc-quota') !== undefined
+      );
+      /* 投影缺席/形状未知 → 不渲染（且 warn 一次，让"凭空消失"可排查）。 */
+      check('client: 门禁 — useProjection 缺席时整块不渲染（不猜）', dockComp({ statusRef: { current: { planQuota: activeQuota } } }) === null);
+      check(
+        'client: 门禁 — 投影形状不认识时也不渲染（含 next/pending/lastUsed 三种候选）',
+        dockComp({ statusRef: { current: { planQuota: activeQuota } }, useProjection: () => ({ lastUsed: null }) }) === null &&
+          dockComp({ statusRef: { current: { planQuota: activeQuota } }, useProjection: () => ({ pending: { provider: 'zcode-appserver', model: 'GLM-5.3-Flash' } }) }) !== null &&
+          dockComp({ statusRef: { current: { planQuota: activeQuota } }, useProjection: () => ({ lastUsed: { provider: 'zcode-appserver', model: 'GLM-5.3-Flash' } }) }) !== null
+      );
+      check(
+        'client: 门禁 — 投影抛异常被吞（不让输入框崩）',
+        dockComp({ statusRef: { current: { planQuota: activeQuota } }, useProjection: () => { throw new Error('boom'); } }) === null
+      );
+    }
+    check(
+      'client: 面板含「赠送额度」行且与进度条同源',
+      (() => {
+        const page = card.component({ settingsScope: scope, statusRef: { current: { planQuota: activeQuota } }, view: 'page' });
+        return JSON.stringify(page).includes('赠送额度') && JSON.stringify(page).includes('剩余 30,000,000 / 总量 300,000,000');
+      })()
+    );
+
+    /* ── 面板「赠送额度通道」区块（用户要求：把 GLM-5.3-Flash（赠送额度）也做进面板） ──
+     * 它是**独立区块**，事实来源 = 状态文档的 appServer 段；未就绪时必须给出可操作原因。 */
+    {
+      const giftStatus = {
+        enabled: true,
+        registered: true,
+        cliPath: 'F:\\Program Files\\ZCode\\resources\\glm\\zcode.cjs',
+        toolPolicy: 'allow-all',
+        reasoningLevel: 'max',
+        models: [{ id: 'GLM-5.3-Flash', name: 'GLM-5.3-Flash（赠送额度）', contextWindow: 200000 }],
+      };
+      const giftPage = card.component({ settingsScope: scope, statusRef: { current: { appServer: giftStatus } }, view: 'page' });
+      const giftBoxes = byDataRole(giftPage, 'gift-enable');
+      check(
+        'client: 面板含「赠送额度通道」独立区块 + 该通道模型行（勾选与 200K/1M 单选在场）',
+        JSON.stringify(giftPage).includes('赠送额度通道') &&
+          giftBoxes.length === 1 &&
+          giftBoxes[0]?.props?.['data-model'] === 'GLM-5.3-Flash' &&
+          byDataRole(giftPage, 'gift-ctx-1m').length === 1 &&
+          byDataRole(giftPage, 'gift-ctx-base').length === 1,
+        `giftRows=${giftBoxes.length}`
+      );
+      check(
+        'client: 赠送额度行标注「赠送额度」徽标 + 图片能力如实反映（未接 attachments → 未启用）',
+        JSON.stringify(giftPage).includes('赠送额度') &&
+          JSON.stringify(giftPage).includes('图片：未启用') &&
+          JSON.stringify(giftPage).includes('推理档：max（通道配置 appServerReasoningLevel，锁定）')
+      );
+      check(
+        'client: 通道已注册时显示 CLI 与工具策略（可核对真实注册结果）',
+        JSON.stringify(giftPage).includes('已注册') && JSON.stringify(giftPage).includes('allow-all')
+      );
+      check(
+        'client: 图片能力就绪时该行显示"支持"（与 host 的 canImages 活判一致，不写死）',
+        JSON.stringify(card.component({
+          settingsScope: scope,
+          statusRef: { current: { appServer: { ...giftStatus, imagesSupported: true } } },
+          view: 'page',
+        })).includes('图片：支持')
+      );
+      const offPage = card.component({
+        settingsScope: scope,
+        statusRef: { current: { appServer: { enabled: false, registered: false, models: [] } } },
+        view: 'page',
+      });
+      check(
+        'client: 通道未启用 → 区块给可操作提示而非空列表（不显示不存在的模型）',
+        JSON.stringify(offPage).includes('通道未就绪') && byDataRole(offPage, 'gift-enable').length === 0
+      );
+      const failPage = card.component({
+        settingsScope: scope,
+        statusRef: { current: { appServer: { enabled: true, registered: false, reason: '没探测到 ZCode CLI（zcode.cjs）', models: [] } } },
+        view: 'page',
+      });
+      check(
+        'client: 启用但注册失败 → 区块显示具体原因（"模型不见了"要能自查）',
+        JSON.stringify(failPage).includes('已启用但未注册') && JSON.stringify(failPage).includes('没探测到 ZCode CLI')
+      );
+      check('client: 面板保存路径包含 appServerModels（赠送额度显隐写回配置）', /writeField\(settingsScope, "appServerModels"/.test(clientSrcForPoll));
+    }
   } finally {
     if (hadWindow) globalThis.window = realWindow;
     else delete globalThis.window;
@@ -1285,6 +2100,218 @@ console.log = REAL_LOG;
     typeof patchId === 'string' && norm(clientSrc).includes(`NS_EXACT=${patchId}`),
     `patch id=${patchId}`
   );
+
+  // ⑤ 赠送额度通道的 provider id：client 的门禁常量必须等于 host 注册的 provider id。
+  // 漂移的后果是**静默**的：进度条永远不显示（选中了也不显示），且没有任何报错。
+  check(
+    'DE-10 守卫: client QUOTA_PROVIDER_ID 等于 host APPSERVER_PROVIDER_ID（漂移=进度条永不显示）',
+    norm(clientSrc).includes(`QUOTA_PROVIDER_ID=${appServer.APPSERVER_PROVIDER_ID}`),
+    `host=${appServer.APPSERVER_PROVIDER_ID}`
+  );
+}
+
+// ─── 7.6 赠送额度读取（lib/plan-quota.js；纯静态 + 临时日志 fixture） ──────────
+{
+  const NOW = 1791634348 * 1000; // 2026-10-10 20:12:28 CST 附近
+  const ENDS = 1791766800;       // 10-12 09:00
+  const EFFECTIVE = 1791644400;  // 10-10 23:00
+  const START_PLAN_ID = 'zcode-v3-start-plan-1010';
+
+  const payloadOf = ({ planId = START_PLAN_ID, total = 300000000, remaining = 30000000, effectiveAt = 0, endsAt = ENDS, withBucket = true } = {}) => ({
+    payload: {
+      data: {
+        server_time: Math.floor(NOW / 1000),
+        plans: [{
+          plan_id: planId, name: 'ZCode Weekend Build', status: 'active',
+          starts_at: 1791634329, ends_at: endsAt,
+          entitlements: [{ entitlement_id: 'ent-1', show_name: 'GLM-5.3-Flash', meter: 'model_usage', unit_type: 'token', grant_units: total, period: 'one_time', effective_at: effectiveAt }],
+        }],
+        balances: withBucket
+          ? [{ entitlement_id: 'ent-1', plan_id: planId, show_name: 'GLM-5.3-Flash', total_units: total, used_units: total - remaining, remaining_units: remaining, available_units: remaining, expires_at: endsAt }]
+          : [],
+      },
+    },
+  });
+
+  const active = planQuota.normalizeQuota(payloadOf(), NOW);
+  check(
+    'plan-quota: active 直接取余额桶的 remaining/total（不自算 total-used，避免口径漂移）',
+    active.ok === true && active.state === 'active' && active.totalUnits === 300000000 &&
+      active.remainingUnits === 30000000 && active.usedUnits === 270000000 &&
+      active.planName === 'ZCode Weekend Build' && active.model === 'GLM-5.3-Flash',
+    JSON.stringify({ state: active.state, total: active.totalUnits, remaining: active.remainingUnits })
+  );
+  check('plan-quota: active 带上窗口时间供面板显示生效/过期', active.effectiveAt === 0 && active.endsAt === ENDS);
+
+  const pending = planQuota.normalizeQuota(payloadOf({ effectiveAt: EFFECTIVE, withBucket: false }), NOW);
+  check(
+    'plan-quota: 权益未生效（无余额桶）→ pending，且**不拿 grant_units 冒充 remaining**',
+    pending.ok === true && pending.state === 'pending' && pending.totalUnits === 300000000 &&
+      pending.remainingUnits === null && pending.effectiveAt === EFFECTIVE,
+    JSON.stringify({ state: pending.state, remaining: pending.remainingUnits })
+  );
+  const pendingNoEffective = planQuota.normalizeQuota(payloadOf({ withBucket: false }), NOW);
+  check('plan-quota: 无桶且无 effective_at 也判 pending（不猜"剩余=总量"）', pendingNoEffective.state === 'pending' && pendingNoEffective.remainingUnits === null);
+
+  const expired = planQuota.normalizeQuota(payloadOf({ endsAt: 1791000000 }), NOW);
+  check('plan-quota: 窗口结束 → expired（面板据此不显示进度条）', expired.state === 'expired');
+
+  const codingOnly = planQuota.normalizeQuota(payloadOf({ planId: 'zcode-v3-coding-plan' }), NOW);
+  check('plan-quota: 非 start-plan 计划 → ok:false no-start-plan（本功能只服务赠送额度）', codingOnly.ok === false && codingOnly.reason === 'no-start-plan');
+  check('plan-quota: 坏负载不抛（null / 缺 data / 空对象）',
+    planQuota.normalizeQuota(null, NOW).reason === 'no-payload' &&
+    planQuota.normalizeQuota({}, NOW).reason === 'no-payload' &&
+    planQuota.normalizeQuota({ payload: {} }, NOW).reason === 'no-payload');
+
+  /* 多份 start-plan 叠加时取结束最晚的那份（避免拿一份已过期的当当前档）。 */
+  {
+    const two = payloadOf();
+    two.payload.data.plans.push({
+      plan_id: 'zcode-v3-start-plan-older', name: 'Older', status: 'active', starts_at: 1, ends_at: 100,
+      entitlements: [{ entitlement_id: 'ent-old', show_name: 'GLM-5.3-Flash', grant_units: 1, effective_at: 0 }],
+    });
+    const picked = planQuota.normalizeQuota(two, NOW);
+    check('plan-quota: 多份 start-plan → 取 ends_at 最晚者', picked.planId === START_PLAN_ID, picked.planId);
+  }
+
+  /* 端到端：从 fixture 日志尾部倒读，必须命中**最后一条** billing/balance（而不是第一条）。 */
+  {
+    const logLine = (ts, payload) => `[${ts}] [info] [pid:1] [main] [host-log] (local-1) [host] [usage-stats] billing/balance 请求完成 ${JSON.stringify(payload)}`;
+    const logDir = join(tmp, 'zq-logs');
+    tmpFile(
+      join('zq-logs', '2026-10-10.log'),
+      [
+        logLine('2026-10-10 20:12:30.119', payloadOf({ remaining: 111111111 })),
+        '中间夹杂无关行，不应干扰解析',
+        logLine('2026-10-10 21:30:00.000', payloadOf({ remaining: 222222222 })),
+      ].join('\n') + '\n'
+    );
+    const real = planQuota.readPlanQuota({ logDir, nowMs: NOW });
+    check(
+      'plan-quota: 尾部倒读命中最后一条 billing/balance（不是第一条）',
+      real.ok === true && real.remainingUnits === 222222222 && real.logFile === '2026-10-10.log',
+      JSON.stringify({ remaining: real.remainingUnits, file: real.logFile })
+    );
+    check('plan-quota: 解析出行首时刻（供面板显示"数据时间"）', typeof real.observedAt === 'string' && /^2026-10-10T/.test(real.observedAt), String(real.observedAt));
+    check('plan-quota: 目录不存在 → no-log（不抛、不猜）', planQuota.readPlanQuota({ logDir: join(tmp, 'no-such-logdir'), nowMs: NOW }).reason === 'no-log');
+  }
+  {
+    tmpFile(join('zq-empty2', '2026-10-10.log'), 'nothing here\n');
+    check('plan-quota: 有日志文件但无目标行 → no-balance-line', planQuota.readPlanQuota({ logDir: join(tmp, 'zq-empty2'), nowMs: NOW }).reason === 'no-balance-line');
+  }
+
+  /* 出站脱敏与状态文档：只出数值与短字符串，绝不夹带原始负载。 */
+  {
+    const summary = webStatus.toQuotaSummary(active);
+    check(
+      'plan-quota: 状态文档摘要只含数值与短字符串（无原始负载字段）',
+      summary.ok === true && summary.source === 'zcode-log' &&
+        !('payload' in summary) && !('balances' in summary) && !('entitlements' in summary) &&
+        summary.totalUnits === 300000000,
+      JSON.stringify(summary)
+    );
+    const failed = webStatus.toQuotaSummary({ ok: false, reason: 'no-log' });
+    check('plan-quota: 失败摘要保留可诊断 reason', failed.ok === false && failed.reason === 'no-log');
+    const docWith = webStatus.buildStatusDocument({
+      registered: () => true, readSwitch: () => ({ enabled: true }), endpointHost: () => 'x',
+      catalog: () => [], enabledModelIds: () => [], planQuota: () => active,
+    });
+    const docWithout = webStatus.buildStatusDocument({
+      registered: () => true, readSwitch: () => ({ enabled: true }), endpointHost: () => 'x',
+      catalog: () => [], enabledModelIds: () => [],
+    });
+    check('plan-quota: 状态文档带 planQuota 字段（缺 provider 时不硬塞）', docWith.planQuota?.ok === true && docWithout.planQuota === undefined);
+    const docThrows = webStatus.buildStatusDocument({
+      registered: () => true, readSwitch: () => ({ enabled: true }), endpointHost: () => 'x',
+      catalog: () => [], enabledModelIds: () => [],
+      planQuota: () => { throw new Error('boom'); },
+    });
+    check('plan-quota: 读取抛错不打挂状态文档（降级为 reason）', docThrows.planQuota?.ok === false && /read-failed/.test(docThrows.planQuota.reason));
+
+    /* ── 状态文档的 appServer 段（面板「赠送额度通道」区块的数据源）── */
+    {
+      const summary = webStatus.toAppServerSummary({
+        enabled: true,
+        registered: true,
+        reason: null,
+        cliPath: 'F:\\Program Files\\ZCode\\resources\\glm\\zcode.cjs',
+        toolPolicy: 'allow-all',
+        reasoningLevel: 'max',
+        providerId: 'zcode-appserver',
+        imagesSupported: true,
+        models: [{ id: 'GLM-5.3-Flash', name: 'GLM-5.3-Flash（赠送额度）', contextWindow: 200000 }, { bad: true }, null],
+      });
+      check(
+        'appserver: 状态摘要只出布尔/短串/模型列表（坏行被剔）',
+        summary.enabled === true && summary.registered === true && summary.models.length === 1 &&
+          summary.models[0].id === 'GLM-5.3-Flash' && summary.providerId === 'zcode-appserver' &&
+          summary.imagesSupported === true
+      );
+      check('appserver: 缺字段时安全兜底（不抛、不假报启用）', (() => {
+        const s = webStatus.toAppServerSummary(undefined);
+        return s.enabled === false && s.registered === false && Array.isArray(s.models) && s.models.length === 0;
+      })());
+      const doc = webStatus.buildStatusDocument({
+        registered: () => true, readSwitch: () => ({ enabled: true }), endpointHost: () => 'x',
+        catalog: () => [], enabledModelIds: () => [],
+        appServer: () => ({ enabled: false, registered: false, reason: 'x', models: [] }),
+      });
+      check('appserver: 状态文档带 appServer 段（未启用时面板据此显示提示）', doc.appServer?.enabled === false && doc.appServer.reason === 'x');
+      const docThrows2 = webStatus.buildStatusDocument({
+        registered: () => true, readSwitch: () => ({ enabled: true }), endpointHost: () => 'x',
+        catalog: () => [], enabledModelIds: () => [],
+        appServer: () => { throw new Error('boom'); },
+      });
+      check('appserver: 读取抛错不打挂状态文档', docThrows2.appServer?.registered === false && /read-failed/.test(docThrows2.appServer.reason));
+    }
+
+    /* ── 适配器：contextBudgets 覆盖上下文窗口（面板 200K/1M 单选真的生效）── */
+    {
+      const mk = (contextBudgets, supportsImages) => appServer.createAppServerAdapter({
+        BaseAdapter: class {},
+        LlmError: class LlmError extends Error {},
+        options: () => ({
+          zcodeCliPath: process.execPath, zcodeCliNode: 'node', appServerWorkspace: homedir(),
+          zcodeDataBaseDir: '', appServerCredentialStorePath: '', appServerAccountProviderId: '',
+          appServerModels: ['GLM-5.2'], appServerReasoningLevel: 'max', appServerToolPolicy: 'deny-all',
+          appServerInjectAccount: false, appServerRpcTimeoutMs: 5000, appServerTurnTimeoutMs: 30000,
+          childEnvAllow: [], contextWindow: 200000, contextBudgets, supportsImages,
+        }),
+        logger: {},
+      });
+      const base = mk({});
+      const bumped = mk({ 'GLM-5.2': 1000000 });
+      const huge = mk({ 'GLM-5.2': 99999999 });
+      const zero = mk({ 'GLM-5.2': 0 });
+      const a = await base.resolveModel('zcode-appserver', 'GLM-5.2');
+      const b = await bumped.resolveModel('zcode-appserver', 'GLM-5.2');
+      const c = await huge.resolveModel('zcode-appserver', 'GLM-5.2');
+      const d = await zero.resolveModel('zcode-appserver', 'GLM-5.2');
+      check(
+        'appserver: contextBudgets 覆盖上下文档（1M 生效 / 非法值忽略 / 上界夹到 1M）',
+        a.context.contextWindow === 200000 && b.context.contextWindow === 1000000 &&
+          c.context.contextWindow === 1000000 && d.context.contextWindow === 200000,
+        `base=${a.context.contextWindow} b=${b.context.contextWindow} c=${c.context.contextWindow} d=${d.context.contextWindow}`
+      );
+      check('appserver: 预算覆盖后仍返回该模型自身元数据', b.id === 'GLM-5.2' && b.defaultMaxTokens > 0);
+      /* 能力声明必须跟着真实接线走 —— 声明了 image 却拿不到图正是 §2.7 的坑。 */
+      const noImg = mk({}, false);
+      const yesImg = mk({ 'GLM-5.2': 1000000 }, true);
+      const noImgModels = await noImg.listModels('zcode-appserver');
+      const yesImgModels = await yesImg.listModels('zcode-appserver');
+      const yesImgResolved = await yesImg.resolveModel('zcode-appserver', 'GLM-5.2');
+      check(
+        'appserver: 只有真接了 attachments 才声明 image（否则一律 text，防 §2.7）',
+        JSON.stringify(noImgModels[0].inputModalities) === JSON.stringify(['text']) &&
+          JSON.stringify(yesImgModels[0].inputModalities) === JSON.stringify(['text', 'image']) &&
+          JSON.stringify(yesImgResolved.inputModalities) === JSON.stringify(['text', 'image']),
+        'no=' + JSON.stringify(noImgModels[0].inputModalities) + ' yes=' + JSON.stringify(yesImgModels[0].inputModalities)
+      );
+      noImg.dispose();
+      yesImg.dispose();
+      for (const adapter of [base, bumped, huge, zero]) adapter.dispose();
+    }
+  }
 }
 
 // ─── 8. 零明文终扫（§3.5-4） ─────────────────────────────────────────────────

@@ -15,6 +15,7 @@
   - [1.2 ⚠️ 网关对失效 key 也返回 HTTP 200](#12-️-网关对失效-key-也返回-http-200)
   - [1.3 加密凭据库 `enc:v1` 的格式与解密](#13-加密凭据库-encv1-的格式与解密)
   - [1.4 Coding Plan vs Start Plan：为什么社区说"取不到 Key"](#14-coding-plan-vs-start-plan为什么社区说取不到-key)
+  - [1.5 Start Plan 到底能不能用：app-server 通道的六个坑](#15-start-plan-到底能不能用app-server-通道的六个坑)
 - [二、DSH 插件机制](#二dsh-插件机制)
   - [2.1 声明了 `dsh.client` 却缺 `lib/client.js` → DSH 拒绝启动](#21-声明了-dshclient-却缺-libclientjs--dsh-拒绝启动)
   - [2.2 设置面板全灰不可点：`configForms` 没被激活](#22-设置面板全灰不可点configforms-没被激活)
@@ -24,6 +25,7 @@
   - [2.6 插件列表不显示描述：字段写错位置](#26-插件列表不显示描述字段写错位置)
   - [2.7 声明了图片能力却没给 resolveAttachments](#27-声明了图片能力却没给-resolveattachments--带图会话整体失败)
   - [2.8 面板报 HTTP 404：schemastery 没有 enum，静默降级致插件不激活](#28-面板报状态不可用http-404schemastery-没有-enum静默降级导致插件整体不激活)
+  - [2.9 同 id 的 patch 条目：后一条整体覆盖前一条](#29-profile-里同-id-的-patch-条目后一条整体覆盖前一条注释式默认值其实是真配置)
 - [三、通用工程](#三通用工程)
   - [3.1 用 `fetch` 后调 `process.exit()` 会崩（Windows）](#31-用-fetch-后调-processexit-会崩windows)
   - [3.2 "换个位置就红"的测试是资产](#32-换个位置就红的测试是资产)
@@ -283,7 +285,118 @@ Start Plan 额度请在 ZCode 桌面端使用。
 > 测试 B/C 都"成功"，但成功并不等于用了目标通道；② **对照组不可省**：
 > 第一版注入配方连已知可用的 coding-plan 也失败，没有对照就会得出错误结论。
 
+> ⚠️ **2026-10-10 再订正**：上面"Start Plan 是 GUI 专属、用不了"的结论**只对"自己发 HTTP"成立**。
+> 正确解法是**托管官方 agent 进程**（`zcode.cjs app-server`），让二进制自己去签 —— 本插件已实现为
+> `zcode-appserver` provider。归因也要改：直连的阻断点是**风控 3012**，不是验证码 3007。
+> 详见 [§1.5](#15-start-plan-到底能不能用app-server-通道的六个坑)。
+
 ---
+
+### 1.5 Start Plan 到底能不能用：app-server 通道的六个坑
+
+**能。但"能"的前提是：不要自己发那个 HTTP 请求。**
+
+#### 先订正归因：直连的真阻断点是 3012，不是 3007
+
+`POST https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`，本机 2026-10-10 实测：
+
+| 请求形态 | 响应 |
+|---|---|
+| 带现场解出的 `X-Aliyun-Captcha-Verify-Param`（280 字节，结构 `certifyId/sceneId/isSign/securityToken`）+ 完整身份头 | `HTTP 405 {"code":3012,"msg":"request has been blocked due to unusual activity."}` |
+| 不带验证码头（对照） | **同样** `405 / 3012` |
+
+⇒ 早期把原因记成"缺验证码（3007）"**只对了一半**：验证码是必要不充分条件，上游还看**客户端指纹**
+（设备 ID、companion 头、安装序仿真、客户端版本对齐）。3012 同时是**账号风控信号** ——
+社区实现（`zcode2api`）识别到它会把账号标 `DISABLED` 保护。**别拿主账号反复裸试。**
+
+> **教训**：**"我缺了 X"与"X 是充分条件"是两件事。** 补上 X 后仍失败，说明真正的判据还在别处；
+> 此时最省力的做法不是继续补齐仿真，而是**换一条不需要仿真的路**（这里是托管官方进程）。
+
+#### 正解：托管 `zcode.cjs app-server`
+
+```
+DSH → provider zcode-appserver → 常驻 zcode.cjs app-server（stdio JSON-RPC）
+      ├─ provider/updateAccountConfig   注入 account:{bigmodel|zai}-start-plan
+      ├─ session/setModel               切到 Start Plan 模型
+      ├─ session/send                   发回合
+      └─ interaction/requestProviderRuntimeHeaders ← 宿主把 zcodejwttoken 递回去
+             └─ agent 自己算签名 ──► zcode.z.ai/api/v1/zcode-plan/anthropic   ← 过 WAF
+```
+
+本机实测（生产模块 `scripts/verify-appserver-channel.mjs`）：
+`已注入 account:bigmodel-start-plan（providerCount=1 status=received）` →
+`应答鉴权（token 204 字符）` → `本轮执行渠道 providerId=account:bigmodel-start-plan baseURL=https://zcode.z.ai/api/v1/zcode-plan/anthropic`，
+全程 **7.2s**、无 3007 / 无 3012。
+
+#### 坑 A：`oauth:active_provider` 必须**解密**后再用（静默注入错家族）
+
+**现象**：明明账号是 `bigmodel` 家族，插件却注入了 `account:zai-start-plan`；
+**且不报任何错** —— `status:received` 照样返回，请求照样打到 plan 端点。
+
+**根因**：凭据库里 `oauth:active_provider` 与 `zcodejwttoken` 一样是 `enc:v1:` 密文。
+直接读 raw 会拿到密文串，于是 `activeProvider === 'bigmodel'` 永远不成立，静默回落到默认家族。
+
+**修法**：统一走 `decryptCredentialValue`（它对非密文原样返回，两种存储形态都安全）。
+
+**判据**：启动日志 `已注入 account:<家族>-start-plan` 必须与 `oauth:active_provider` 一致。
+
+> **连带教训（自检侧）**：这条 bug 最初**通过了自检** —— 因为 fixture 里把
+> `oauth:active_provider` 写成了明文。**fixture 形态与真实存储不一致 = 假绿**，
+> 与 §3.3「过紧/过松的断言会保护 bug」同构。修法是让 fixture **也加密**。
+
+#### 坑 B：ZCode 可能装在**非系统盘**，只查 `%ProgramFiles%` 探测不到
+
+**现象**：`appServer: true` 了，但模型列表里没有 `zcode-appserver`，且只有一行 warn。
+
+**根因**：本机 ZCode 装在 `F:\Program Files\ZCode\`，而 `%ProgramFiles%` 是 `C:\Program Files`。
+
+**修法**：探测链里加**盘符扫描**（C..H × 常规安装位），并保留 `zcodeCliPath` 显式配置为最高优先。
+**判据**：启动日志 `app-server 通道已注册：… CLI=<路径>`。
+
+#### 坑 C：`basedOnZCodeBuiltinRevision` 算错 → 注入被**静默跳过**
+
+registry 合并守卫做**逐字符相等**比较：`zcode-builtin:<release.revision>:<sha256(resolve(路径))>`。
+差一个字符注入就被丢弃，**不报错**。
+
+**两个必须同源的点**：spawn 时给的 `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` 与算 basedOn 用的
+`activeFilePath` 必须是**同一个文件**（还要按 GUI 同款设 `ZCODE_APP_VERSION` 等四个 env，
+否则 CLI 落到 `0.0.0-dev` 运行时目录，两边对不上）。
+
+**判据**：`providerCount` 只证明"收到"，真正的确证是回合里
+`session.updated.providerId` —— 即日志的 `本轮执行渠道 providerId=…`。
+
+#### 坑 D：app-server 的回合锁**不会自己释放**
+
+一轮被中止 / 超时 / 静默丢弃后，下一轮直接撞 `A prompt is already running for this session`。
+**修法**：只要本轮没正常结束（超时/中止/发送失败/`turn.failed`），`finally` 一定补发
+`session/stop`；被回"already running"就补刀 + 1.5s 后重试一次；被回"session not found"
+（进程重启/会话回收）就丢弃缓存条目、新建会话并按首轮语义重放整段对话。
+
+> 注意 `session/stop` 是**通知**（无响应），别等它的 result。
+
+#### 坑 E：`status: active` ≠ 额度可用
+
+活动套餐在 `billing/balance` 里可能是 `status:"active"`，但 entitlement 带 `effective_at`：
+
+```json
+{"plan_id":"zcode-v3-start-plan-1010","name":"ZCode Weekend Build","status":"active",
+ "starts_at":1791634329,"ends_at":1791766800,
+ "entitlements":[{"show_name":"GLM-5.3-Flash","grant_units":300000000,"period":"one_time",
+                  "effective_at":1791644400}]}
+```
+
+`effective_at`（= 界面上的"待生效 23:00"）之前调用 → 上游 `code 1005 exceed quota limit`。
+**判据**：`providerId`/`baseURL` 已命中 plan 端点、且失败码是 1005 ⇒ **是额度时序，不是通道故障**。
+
+#### 方法论小结
+
+1. **归因要先排除"充分性"**：补上缺失项仍失败 ⇒ 缺的不是那个；
+2. **能托管官方客户端就别仿真它** —— 后者的维护成本是按上游风控策略走的；
+3. **"静默跳过"类守卫必须用终点证据核对**（这里是 `providerId`），中间态回执（`status:received`）不算数；
+4. **fixture 必须与真实存储同形**（密文就写密文），否则 bug 会在自检里长期假绿。
+
+---
+
 
 ## 二、DSH 插件机制
 
@@ -547,6 +660,145 @@ Schema.union: function         ← 正确的枚举写法
 
 > **通用教训**：**"容错降级"会让错误静默化**。降级可以保留（可移植性），但**必须打日志**；
 > 否则一个 API 拼写错误会伪装成"插件消失 + 面板 404"这种毫无线索的故障。
+
+---
+
+### 2.9 profile 里同 id 的 patch 条目：**后一条整体覆盖前一条**（"注释式默认值"其实是真配置）
+
+**现象**（2026-10-10 真机）：在 profile 的 `cordis.patch.yml` 里给本插件设了
+`appServer: true` 并**重启了 DSH**，模型选择器里依然没有新 provider，**且没有任何报错**。
+
+**根因**：文件里有**两个** `- id: zcode-connect` 条目 ——
+
+| # | 来源 | 位置 |
+|---|---|---|
+| ① | 用户手写（含 `appServer: true`、机器专有 `switchPath`/`ledgerPath`） | 文件中部 |
+| ② | **插件管理器把 bundle 自带的 `cordis.patch.yml` materialize 出来的** | **文件末尾** |
+
+加载器按 id 合并，**②整体覆盖①**（⚠️ 不是逐键深合并）。于是①里的键全部无效，
+真正生效的是②——而②带着 bundle patch 里写的 `appServer: false`。
+那个 `false` 本来是当**"注释式默认值"**写的（想提示"默认关"），
+**它不是注释，是一条真配置**，把用户设的 `true` 整个压掉了。
+
+**三条免重启判据（照做就能分辨"配置没生效"还是"注册失败"）**：
+
+```bash
+# ① 读派生的有效值（本插件的状态路由；换成你的插件自己暴露的只读面）
+curl -s http://127.0.0.1:19387/plugins/dsh-connect-zcode/status | ...
+#    → 看 enabledModelIds / frozen 这类只有配置能影响的字段
+
+# ② 拿"只可能来自用户条目"的键做对照（本例 switchPath / ledgerPath）
+#    若它们表现成默认值（~/.dsh/...）⇒ 用户条目被整条覆盖了
+
+# ③ 数一数同 id 条目有几个
+Select-String -Path "$env:USERPROFILE\.dsh\profiles\desktop\cordis.patch.yml" -Pattern '^- id: zcode-connect$'
+```
+
+本例实证：status 报 `frozen=False`，而①指定的 switch 文件写着 `enabled:false`；
+台账写在 `~/.dsh/zcode-runs.jsonl` 而非①指定的项目路径 ⇒ **①整条是死的**。
+
+**修法**：
+1. 生效值写进**末尾**那条（谁在最后谁生效）；
+2. **bundle patch 里不要钉开关的默认值** —— 交给 schema（`Config` 默认值）即可；
+3. 给被覆盖的那条加注释指路，免得下一个人继续改错地方。
+
+> **通用教训**：配置系统的**合并语义**必须用**可区分的证据**测出来，别假设是逐键深合并。
+> 本例的判别物是"只出现在一条里的 `switchPath`/`ledgerPath`"——有了它，"哪条生效"就是
+> 可观测事实，而不是猜测。另外：**patch 这种"默认值层"会被下游工具物化成真配置**，
+> 写进默认值层的东西就不是建议、而是实际行为 —— 想表达"默认关"，请留给 schema 的 default。
+
+---
+
+### 2.10 agent 型通道的 usage 口径：把 CLI 的「回合聚合」当「单次调用」上报 ⇒ DSH 上下文占用虚高 N 倍
+
+**现象**（2026-10-10 真机，`zcode-appserver` 通道 / DSH 1M 窗口）：
+
+- 原生上下文弹窗顶部显示「上下文已用 **100%** ~**7.1M** / 1M」，而**同一个弹窗**里的启发式
+  明细只有 系统提示词 ~2.2K / 工具定义 ~15.2K / 对话消息 ~7.5K（合计 ~24.9K）——**自相矛盾**；
+- 同一轮里**连续触发两次压缩**（`已压缩 194 条历史记录（约 107714 tokens）` +
+  `已压缩 452 条历史记录（约 248289 tokens）`），每次都在超大估算上跑，用户体感"分析了很久"；
+- context-pilot 的用量行读的是同一个 tokenMeter 读数，于是它自己也报 708%，强制线（75%）
+  被反复击穿 —— 插件与引擎**一起**误判。
+
+**根因（两层，缺一不可）**：
+
+1. **CLI 侧**：`turn.completed.usage` **不是**一次调用的用量，而是**本回合全部模型调用之和**。
+   `zcode.cjs` 里 `ZO(events)` 收集本回合每条 `ModelComplete` 的 usage，再交给 `Jgr(...)`
+   用 `reduce` 逐桶相加，并附 `modelRequestCount`（= 本回合模型调用次数）。
+2. **DSH 侧**：`usage` 是**单次请求**口径 —— `dsh-token-meter` 直接拿它当 `contextPressure`
+   的锚点（`pressureFrom(usage) = inputTokens + cacheReadTokens + cacheWriteTokens`），
+   `measure().totalTokens` 也在 `usageTokens(usage) ≥ 启发式估值` 时取它当 baseline。
+   ⇒ N 次调用的**和**直接变成了"当前上下文"。
+
+**两条免跑模型的判据（零额度）**：
+
+```powershell
+# ① 插件账本：单调用回合 vs 多调用回合的 input 差一个数量级
+Get-Content "$env:USERPROFILE\.dsh\zcode-runs.jsonl" | Select-String 'appserver' | Select-Object -Last 6
+#    实测：117207 / 220089（与 rollout 里那一笔逐字相同）  vs  3871622（10 分钟长回合）
+
+# ② CLI 自己的**按次**记录（每次模型调用一条，含 provider usage）
+Get-ChildItem "$env:USERPROFILE\.zcode\cli\rollout\model-io-*.jsonl" | Sort-Object LastWriteTime -Descending | Select-Object -First 3
+#    单次调用 in=220089 ⇒ 与①里那个大值一比，倍数就是 modelRequestCount（≈17）
+```
+
+**修法**（已实现于 `lib/app-server.js`：`deriveReportedUsage` + `_readSessionContext`）：
+
+| 场景 | 上报 DSH 的值 | 理由 |
+|---|---|---|
+| `modelRequestCount ≤ 1` | CLI 聚合值**原样**（含 cache 分桶） | 单调用回合的聚合值**就是**按次值（判据①逐字相同），且不多花 RPC |
+| 多调用 + 有 `contextUsed` | `{inputTokens: contextUsed, outputTokens: 0}` | `contextUsed` 是 CLI 按次维护的读数（每条 `ModelComplete` 覆写成该次 `input+output`），output 已含在内，再报一次就是重复计 |
+| 多调用 + 读不到 `contextUsed` | 各桶按 `modelRequestCount` 取**均值** | 轮内上下文单调增长 ⇒ 均值 ≤ 末次值：**宁可偏小，绝不虚高** |
+| `contextUsed > 回合聚合总量` | 不采信，退回均值 | 口径漂移护栏（防某版把 `contextUsed` 换成会话累计值） |
+
+账本 `~/.dsh/zcode-runs.jsonl` **仍记回合聚合**（真实消耗，多调用回合 = N 次之和），
+两者不混用；每轮日志会打一行 `usage 口径=<basis> … ⇒ 上报 DSH input=…` 供取证。
+
+**零额度验证 `session/read` 形状**（不发消息 ⇒ 不消耗额度）：
+
+```powershell
+node scripts/probe-session-read.mjs
+# → projection 键含 contextUsed / contextWindow / totalTokenCount（新会话：0 / 200000）
+# → 若 CLI 不再下发 contextUsed，插件会自动退回"按次数取均值"，并打 warn（不会虚高）
+```
+
+**真机多调用回合验证**（会消耗少量额度；判据看 `usage 口径=` 那一行）：
+
+```powershell
+node scripts/verify-appserver-channel.mjs --tools allow-all `
+  --prompt "用 pwsh 读取 package.json 的 version，然后只回复：版本=<值>"
+# 实测输出：usage 口径=context-used（CLI 回合聚合 input=36974 output=126 调用次数=2；
+#           CLI contextUsed=18977 window=200000）⇒ 上报 DSH input=18977 output=0
+#           ——— 聚合 36974 没有泄漏到宿主侧（差 2 倍；17 次调用的长回合差 17 倍以上）
+```
+
+**③ 最直接的一条：DSH 自己的投影缓存**（弹窗顶部百分比就是它算的），一条命令读数：
+
+```powershell
+$f = Get-ChildItem "$env:USERPROFILE\.dsh\storages\session_projcache\sessions\*.json" |
+     Sort-Object LastWriteTime -Descending | Select-Object -First 1
+(Get-Content $f -Raw | ConvertFrom-Json).record.rows.contextPressure.val
+# → {surfaceTokens, contextWindow, pressureTokens, sampledSurfaceTokens}
+```
+
+判据：**`pressureTokens` 应与 `surfaceTokens` 同量级**（差值 ≈ 最后一次调用的 output，
+正常 < 5%）。实测对照：
+
+| 时刻 | pressureTokens | surfaceTokens | 比值 | 弹窗 |
+|---|---|---|---|---|
+| 修复前（17 次调用的长回合刚跑完） | ~7,060,000 | ~160,000 | **44×** | 100%（~7.1M / 1M） |
+| 修复后（当前 deepseek 会话，同一实现路径） | 224,133 | 162,137 | **1.4×** | 22% |
+
+`pressureTokens` 的算法是 `uncachedInputTokens + cacheReadTokens + cacheWriteTokens`
+（缓存里 `last.buckets` 就是原始三项：实测 `261 + 223872 + 0 = 224133`）——
+所以"上报什么 usage"直接决定这个数，与启发式的 `surfaceTokens` 一旦背离 N 倍，
+弹窗就会自相矛盾、压缩线也会被误击穿。
+
+> **通用教训**：把"外部 agent 的运行结果"映射进宿主契约时，**先确认两边同名指标的口径与量纲**，
+> 再谈取值。本例的判别物是「账本里逐回合的 input」与「CLI 每次调用的 input」——
+> 两者在单调用回合**逐字相同**、在多调用回合**差 N 倍**，这才让口径结论成为事实而非猜测。
+> 另外：**同名不同义时，宿主不会报错**——它只会安静地把你给的数字当成另一个东西用
+> （这里是"上下文占用"），症状出现在离 bug 很远的地方（压缩行为、耗时、进度条）。
 
 ---
 
