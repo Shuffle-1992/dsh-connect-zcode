@@ -1623,6 +1623,24 @@ async function assertRejects(promise, pattern, label) {
         badCfg.defaultLevel === 'max',
       `${JSON.stringify(facts)} / ${JSON.stringify(noOfficial)} / ${JSON.stringify(badCfg)}`
     );
+    /* 展示顺序 = 强度序，与官方 variants 的**书写顺序**无关（2026-10-10 用户对比截图：
+     * config 写作 ["low","max","high"]，照抄会让选择器显示 low/max/high，与
+     * DeepSeek 内建 Off/Low/High/Max 及 Coding Plan 通道的升序不一致）。 */
+    const scrambled = appServer.reasoningFacts(
+      { 'glm-5.3-flash': { variants: ['low', 'max', 'high'], defaultVariant: 'max' } },
+      'GLM-5.3-Flash',
+      undefined
+    );
+    const reversed = appServer.reasoningFacts({ m: { variants: ['max', 'high', 'low'] } }, 'm', undefined);
+    check(
+      'appserver: 档位按强度序展示（官方书写顺序不影响选择器/面板顺序；未知档位排最后）',
+      JSON.stringify(scrambled.levels) === JSON.stringify(['low', 'high', 'max']) &&
+        scrambled.defaultLevel === 'max' &&
+        JSON.stringify(reversed.levels) === JSON.stringify(['low', 'high', 'max']) &&
+        JSON.stringify(appServer.reasoningFacts({ m: { variants: ['custom', 'low'] } }, 'm', undefined).levels) ===
+          JSON.stringify(['low', 'custom']),
+      `${JSON.stringify(scrambled.levels)} / ${JSON.stringify(reversed.levels)}`
+    );
     /* ③ 官方档位读取（夹具 config.json 的 start-plan 段；family→套餐键；读不到 → {}） */
     const cfgFixture = tmpFile(
       'zcode-config-reasoning.json',
