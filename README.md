@@ -12,6 +12,9 @@
 > 它现在也支持免费额度通道（`account:<family>-start-plan`：面板有**额度条**、agent 派发前能看到剩余额度与窗口剩余时间、
 > 台账按 `billing=zcode-plan-gift` 与付费套餐分账），而且**"走 ZCode 自己的工具"在派发台是设计而非缺陷** ——
 > 那里本来就是"**独立 ZCode 进程 + 它自己的工具 + 独立会话 + 独立额度**"。
+> **已在真机验证**（2026-10-11，见派发台 `tasks/ZB-34-gift-tool-parity.md`）：Write/Edit、Bash、
+> 本地 MCP（`node_repl`）、远程 MCP（`web_reader`）**全部可用** —— 即派发台那条免费额度通道的
+> **工具执行能力与付费套餐派发实测等同**。
 > **一句话选型：纯模型对话 / 要 DSH 自己的工具链 ⇒ 本插件；要 agent 自主执行任务 ⇒ 派发台。**
 
 一个 DSH 原生 provider 插件，**两条互补通道**：
