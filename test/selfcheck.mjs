@@ -1380,6 +1380,36 @@ async function assertRejects(promise, pattern, label) {
       appServer.lastUserText([{ role: 'user', content: [{ type: 'text', text: 'A' }] }, { role: 'assistant', content: [{ type: 'text', text: 'B' }] }]) === 'A' &&
         appServer.lastUserText([{ role: 'assistant', content: [{ type: 'text', text: 'B' }] }]) === ''
     );
+    /* 2026-10-11 真机事故（keysion-dac-vue 会话）：DSH 的注入快照排在真实用户消息**之后**
+     * （context-pilot 决策卡、time-context 时间戳…），只看"最后一条 user 消息"会把注入当请求
+     * ⇒ 赠送通道第 2 轮起真实需求被丢，agent 只收到时间戳。 */
+    const injectedTail = [
+      { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '重启项目服务器并自检' }] },
+      { role: 'user', source: { kind: 'context-pilot' }, content: [{ type: 'text', text: 'Context usage before this turn (by context-pilot, estimate): used 669,571 (67.0%)' }] },
+      { role: 'user', source: { kind: 'time-context' }, content: [{ type: 'text', text: 'Time sampled while preparing turn 26, step 1: 2026-10-11T01:42:25+08:00' }] },
+    ];
+    check(
+      'appserver: lastUserText 跳过 DSH 注入快照，取真实用户消息（source.kind=user）',
+      appServer.lastUserText(injectedTail) === '重启项目服务器并自检' &&
+        appServer.isRealUserMessage(injectedTail[0]) === true &&
+        appServer.isRealUserMessage(injectedTail[1]) === false &&
+        /* 没有 source 信息的历史消息仍按用户消息处理（兼容旧宿主/其它调用方） */
+        appServer.isRealUserMessage({ role: 'user', content: [{ type: 'text', text: 'x' }] }) === true &&
+        appServer.lastUserText([{ role: 'user', content: [{ type: 'text', text: 'no-source' }] }]) === 'no-source' &&
+        /* 兜底：全是注入消息时也要发出点什么（宁可发注入，也不能空） */
+        appServer.lastUserText([injectedTail[2]]) === injectedTail[2].content[0].text
+    );
+    check(
+      'appserver: flattenConversation 过滤 context-pilot 注入（它教的是本通道不存在的 DSH 工具），其余注入保留',
+      (() => {
+        const text = appServer.flattenConversation([
+          { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '真实请求' }] },
+          { role: 'user', source: { kind: 'context-pilot' }, content: [{ type: 'text', text: '请调用 compact_context 压缩' }] },
+          { role: 'user', source: { kind: 'runtime-context' }, content: [{ type: 'text', text: '沙箱策略：danger-full-access' }] },
+        ]);
+        return text.includes('真实请求') && text.includes('沙箱策略') && !text.includes('compact_context');
+      })()
+    );
     check(
       'appserver: 历史里的伪工具调用标记被压成占位（防模型照抄）',
       appServer.sanitizeLeakedCalls('<antml:invoke name="pwsh">x</antml:invoke>ok').startsWith('（历史') &&
@@ -1913,6 +1943,25 @@ async function assertRejects(promise, pattern, label) {
       imageWarns.some((m) => m.includes('一张都没能物化成附件')) &&
         emptyImageFake.calls.find((c) => c.method === 'session/send')?.params.attachments === undefined,
       JSON.stringify(imageWarns)
+    );
+
+    /* ⑨ 续轮 prompt 必须是**真实用户消息**（2026-10-11 keysion-dac-vue 会话事故的端到端断言）：
+     * DSH 注入快照（context-pilot 决策卡 / time-context）排在真实请求之后。 */
+    const injectedFake = makeScriptClient([done('ok')]);
+    await runScript(injectedFake, cfgBlock, {
+      messages: [
+        { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '验收后台管理功能' }] },
+        { role: 'user', source: { kind: 'context-pilot' }, content: [{ type: 'text', text: 'Context usage before this turn (by context-pilot, estimate)' }] },
+        { role: 'user', source: { kind: 'time-context' }, content: [{ type: 'text', text: 'Time sampled while preparing turn 26' }] },
+      ],
+    });
+    const injectedSend = String(injectedFake.calls.find((c) => c.method === 'session/send')?.params.content ?? '');
+    check(
+      'appserver: 续轮发给 agent 的是真实用户请求而非注入快照（端到端）',
+      injectedSend.includes('验收后台管理功能') &&
+        !injectedSend.includes('Time sampled while') &&
+        !injectedSend.includes('Context usage before this turn'),
+      injectedSend.slice(0, 120)
     );
 
     /* ⑧ 卡死恢复阶梯（2026-10-11 事故：900s 超时后 DSH 重试撞上

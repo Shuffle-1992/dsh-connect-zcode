@@ -637,8 +637,16 @@ provider.models 输出）、面板行控件（锁定 disabled、1M 按官方数�
 ### app-server 通道（`zcode-appserver`，默认关）
 
 11. **DSH 的工具不会透传给 agent**：模型实际是"用 agent 自己的原生工具干完活再把结果讲给你"，
-    所以 DSH 侧的 `pwsh` / `fs-local` 等工具在这条通道上不生效；adapter 会把模型误写的
-    `<antml:…>` 伪调用文本拦下（并在聊天窗留一条拦截说明）。
+    所以 DSH 侧的 `pwsh` / `fs-local` / `browser_*` / `todo_write` / `ask_user_question` 等工具
+    在这条通道上**不会被调用**（真机实测：同一次会话里直连通道的回合共 792 次 DSH 工具调用，
+    赠送额度通道的回合 **0 次**）；adapter 会把模型误写的 `<antml:…>` 伪调用文本拦下
+    （并在聊天窗留一条拦截说明）。**后果**：agent 只能用自己的原生工具（Bash/Read/Write/Edit…），
+    DSH 侧的副作用（TODO、浏览器面板、向用户提问、子代理）在这条通道上不会发生 ——
+    需要这些能力时请用直连通道（`zcode`）或让 agent 直接跑命令。
+    同理，**context-pilot 的决策卡与"工具教学"在本通道不转发**（它教的是 `compact_context` /
+    `set_reasoning_effort` 这类 DSH 侧工具，agent 无法调用；占用数字也是 DSH 会话的，与 agent
+    自己的上下文窗口无关）。本通道的压缩仍由宿主自身的引擎/强制线驱动，不受影响。
+    见 TROUBLESHOOTING §2.17。
 12. **图片输入**：已支持 —— DSH 的图片附件经 `attachments.imageHostPath(ref)` 取**绝对宿主路径**，
     以 app-server 的 `{kind:'image', filename, mimeType, localPath}` 附件随消息转发（见「图片怎么走」）。
     仅当宿主 `attachments` 服务在位时才声明 `image`（否则一律 `text`）；服务缺席时面板会显示「图片：未启用」。

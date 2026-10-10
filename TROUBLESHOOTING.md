@@ -33,6 +33,8 @@
   - [2.14 模型档位选择器里多出一个 `Default` 项](#214-模型档位选择器里多出一个-default-项)
   - [2.15 图片静默丢失：物化函数被放错口袋](#215-图片静默丢失物化函数被放错口袋deps-顶层-vs-options)
   - [2.16 回合超时后重试撞上 `A prompt is already running`](#216-回合超时后重试撞上-a-prompt-is-already-running-for-this-session)
+  - [2.17 图片再次静默丢失：context-pilot 注入顶掉"最后一条用户消息"](#217-图片再次静默丢失context-pilot-注入把最后一条用户消息顶掉)
+  - [2.18 赠送通道第 2 轮起答非所问：`lastUserText` 也取到注入快照](#218-赠送通道第-2-轮起答非所问同源的第二处--lastusertext-也取到了注入快照)
   - [2.17 图片再次静默丢失：注入插件把"最后一条用户消息"顶掉](#217-图片再次静默丢失context-pilot-注入把最后一条用户消息顶掉)
 - [三、通用工程](#三通用工程)
   - [3.1 用 `fetch` 后调 `process.exit()` 会崩（Windows）](#31-用-fetch-后调-processexit-会崩windows)
@@ -1072,6 +1074,61 @@ rollout: 请求中 image 块 = 1     ← CLI 把 localPath 附件嵌进了模型
 > （最后一条 assistant 之后）圈范围，而不是位置（最后一条）。另外本轮排查中一度把
 > "正文含『图片附件』字样"当成"note 已在"的证据 —— 长对话历史里**字符串包含检查不可信**，
 > 必须用结构化定位（note 出现在内容**末尾**才是本轮追加的）。
+
+---
+
+### 2.18 赠送通道「第 2 轮起答非所问」：同源的第二处 —— `lastUserText` 也取到了注入快照
+
+**现象**（2026-10-11，`keysion-dac-vue` 会话切到免费额度模型后）：agent 像"没看懂需求"，
+整轮**一次 DSH 工具都没用**；用户感受是"没拿到 DSH 的工具、还在用 ZCode 的自己那套"。
+
+**取证一：工具断代**（同一会话 16 个 `request/header`，按当时生效的 provider 分组统计 `tool/call`）
+
+| 通道 | DSH 工具调用次数 |
+|---|---|
+| `deepseek-account/deepseek-flash` | **792**（read×153 / browser_eval×126 / edit×126 / pwsh×116 …） |
+| `zcode-appserver/GLM-5.3-Flash` | **0** |
+
+**取证二：消息顺序**（会话日志 seq 4420-4435 原样）
+
+```
+#4432 USER  source={"kind":"user"}            ← 真实请求：「…调用浏览器操作…完整验收测试」
+#4433 USER  source={"kind":"context-pilot"}   ← 注入：用量行 + 决策卡（排在真实请求**之后**）
+#4434 USER  source={"kind":"time-context"}    ← 注入：时间戳
+#4435 >>> request/header provider=zcode-appserver/GLM-5.3-Flash
+```
+
+**根因**：§2.17 修的是**图片入口**（`collectImageBlocks`），而**正文入口** `lastUserText()`
+还是"最后一条 `role==='user'`" ⇒ 取到 `time-context` 注入，**真实需求被丢**。首轮不受影响
+（首轮拍平整段对话），所以症状是"第一轮还行，之后答非所问"。
+
+**修法**（`lib/app-server.js`）：
+
+1. `isRealUserMessage(message)`：带 `source.kind` 时**只有 `'user'` 算真实用户输入**；
+   无 `source` 的历史消息按老行为处理（兼容旧宿主/其它调用方）。
+2. `lastUserText()` 选序：① `source.kind==='user'` 的最后一条 → ② 无 source 信息的 →
+   ③ 兜底任意非空 user 消息（宁可发注入内容，也不能什么都不发）。
+3. `flattenConversation()` **过滤 `source.kind === 'context-pilot'`**：决策卡/工具教学教的是
+   `compact_context` / `set_reasoning_effort` 这些**本通道不存在的 DSH 工具**，还会把 DSH 会话的
+   占用数字混进 agent 上下文；其余注入（工作区指令 / 运行策略 / 压缩摘要 / 时间）保留。
+
+**判据**：自检 4 条（真实用户优先 / 无 source 兜底 / 拍平过滤 / 端到端 send 内容不含注入）。
+真机复测：切到赠送模型后**连问两轮不同问题**，第二轮仍要答到点子上；CLI rollout 的 prompt 头
+应是那句需求，而不是 `Time sampled while preparing turn …`。
+
+> **通用教训**：**"最后一条 user 消息"不是"用户说的话"**。允许第三方注入的会话里，
+> 任何"取最后一条 X"都必须先问"这条 X 是谁写的"—— 用**来源标记**（`source.kind`）判，
+> 别用**位置**判。本仓库同一个坑踩了两次：图片入口（§2.17）、正文入口（本节）。
+> 修一处时**必须把同类取数点全找出来**，否则就是"修好一个、漏掉一个"。
+
+**附：本轮的工具/教学审计结论**（回答"工具教学、决策卡要不要一起改"）
+- DSH 工具**不可能**被 CLI agent 调用：agent 是独立进程，工具在它自己进程内执行；
+  适配器只给了它一段 `TOOL_RULE_HEAD`（明确告知"用你的原生工具"）。这是**设计边界**，
+  已计入 README 已知限制 11（本轮补上了实测数字：792 vs 0）。
+- 想真让 agent 用上 DSH 工具，唯一可行路线是**做一层 MCP 桥**（把 DSH 工具暴露成 MCP server
+  给 CLI 连）—— 属于新功能，不在本次修复范围。
+- context-pilot 的**客户端**功能（侧栏用量行、面板）不受影响；受影响的只是"注入给模型"的那部分，
+  已在适配器侧过滤。
 
 ---
 
