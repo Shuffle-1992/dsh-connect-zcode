@@ -4,6 +4,10 @@
 
 **✅ 支持免费额度模式**：ZCode「Start Plan」的活动赠送额度（如 Weekend Build 的免费 GLM-5.3-Flash）可以直接在 DSH 里用 —— 通过托管官方 agent 代发请求，零破解、零凭据落盘（见 [Start Plan 通道](#start-plan-通道app-server)）。
 
+> ⚠️ 免费额度通道是**模型对话通道**：DSH 的**工具层在这条通道上不参与**（agent 用自己进程内的原生工具）。
+> 上哪些能力能用、哪些完全没有（浏览器面板 / Agent Teams / 派发台 / `ask_user_question` / TODO …），
+> 以及各类替代做法，见 [**免费额度通道目前缺失的功能速查**](#-免费额度通道zcode-appserver目前缺失的功能速查)。
+
 一个 DSH 原生 provider 插件，**两条互补通道**：
 
 ```
@@ -633,6 +637,58 @@ provider.models 输出）、面板行控件（锁定 disabled、1M 按官方数�
 10. 宿主升级后 `dsh-llm-pi-ai` / `pi-ai` 的读取点若变化，会导致附件/图片/凭据能力**静默失效**。
     启动日志会输出宿主栈版本（`宿主 LLM 栈：pi-ai=… / dsh-llm-pi-ai=…`）并做 C5 形状自检
     （未通过时告警），**升级 DSH 后请先看这两行**。
+
+### ⚠️ 免费额度通道（`zcode-appserver`）**目前缺失的功能**速查
+
+> 一句话：**模型对话、思考档、图片、流式、额度进度条、费用台账都能用；但 DSH 的"工具层"
+> 在这条通道上不参与**。原因是架构边界 —— agent 是官方 CLI 的**独立进程**，工具在它自己
+> 进程内执行，DSH 只负责注入账户、转发消息、翻译事件流（这也是它零破解、零凭据落盘的原因）。
+> 下面按"有没有等价替代"分三类。实测依据见 TROUBLESHOOTING §2.18（同会话按通道统计：
+> 直连通道 DSH 工具调用 792 次，免费额度通道 **0 次**）。
+
+**A. 完全没有对应能力（在这条通道上做不到）**
+
+| 能力 | 受影响的 DSH 工具 | 影响 |
+|---|---|---|
+| 浏览器面板 / 批注 / 截图 | `browser_*`（browser-kit 全部） | 你在 DSH 里开的浏览器窗口、页面批注、截图能力都用不上 |
+| Agent Teams（多代理协作） | `spawn_teammate` / `send_message` / `wait_agent` / `list_agents` / `interrupt_agent` / `team_task_*` | 无法组队、无法共享任务板 |
+| 派发台 | `zcode_dispatch` | 无法在通道会话里再派发任务给 ZCode |
+| 工作流编排 | `workflow` | 无多子代理扇出 |
+| 后台任务 | `job_list` / `job_output` / `job_kill` | 无托管后台作业 |
+| 定时提醒 | `schedule_*` | 无定时/周期提醒 |
+| 交付物卡片 | `present` | 不能生成可点击打开的文件卡片 |
+| 中途提问 | `ask_user_question` | 模型**无法在做任务途中问你** —— 只能一次问清，或直接猜 |
+| TODO 可视化 | `todo_write` | 聊天窗里不再有 TODO 清单进度 |
+| 目标管理 | `create_goal` / `update_goal` / `get_goal` | 无目标态与自动续跑 |
+| 技能加载 | `skill` | 模型读不到 DSH 的技能目录 |
+| 依赖自检 | `load_workspace_dependencies` | 无内置的 Python/Node 依赖路径注入 |
+
+**B. 能力有等价物，但**旁路 DSH**（agent 用自己的原生工具做）**
+
+| 能力 | agent 实际用什么 | 代价（重要） |
+|---|---|---|
+| 读写改文件 | 它自己的 Read / Write / Edit | **不走 DSH 的沙箱策略与文件版本守卫**（不会有 `FS_STALE_VERSION` 保护），也不进 DSH 的工具调用记录与聊天窗展示 |
+| 跑命令 | 它自己的 Bash | 同上；**不受 DSH 的审批/拦截约束**（本通道默认 `yolo`，见「安全须知」） |
+| 找文件/搜内容 | 它自己的 Glob / Grep | 结果不回流到 DSH 的工具结果面板 |
+| 联网 | 它自己的 WebSearch / WebFetch | 与 DSH 的 `web_search` / `web_fetch` 是两套实现，结果形态不同 |
+
+**C. 宿主侧机制的差异（不是工具，但你会感觉到）**
+
+| 机制 | 现状 |
+|---|---|
+| context-pilot 的**决策卡 / 工具教学** | **不转发给模型**（它教的是 `compact_context` / `set_reasoning_effort` 等本通道不存在的 DSH 工具）。侧栏用量行、面板这些**客户端**功能照常；压缩改由**宿主引擎/强制线**驱动，模型无法主动"智能压缩" |
+| DSH 图片 | 只转发**最后一条 assistant 之后**的用户消息里的图；历史图靠 agent 自己的会话承载 |
+| 并发 | **单会话同时只允许一个在途回合**，吞吐低于直连；撞锁有自愈阶梯（含硬重启），但要等 |
+| 首轮成本 | 切换通道后的**第一轮要把整段对话拍平成文本**（实测单个会话到过 ~880 KB 文本）；之后只发当轮真实用户消息 |
+| 上下文窗口 | agent 自己的窗口约 200K，与 DSH 声明的窗口**是两套**；DSH 侧压缩不会改变 agent 侧上下文 |
+| 官方 MCP 服务器 | 桥接进程拿不到桌面端签名头（`Official MCP auth headers unavailable`），`node_repl` / `image_search` 等**连不上**；agent 可能在这些坏工具上打转，拖到本地超时（默认 15 分钟） |
+| 模型目录 | 只能在官方 start-plan 段声明过的模型里选（如 GLM-5.3-Flash / GLM-5.2 / GLM-5-Turbo）；写未声明的模型会 `setModel` 失败 |
+
+**需要 A 类能力时怎么办**：改用**直连通道**（provider `zcode`，走 Coding Plan / API Key 形态，
+DSH 工具全部可用），或者把任务拆开——需要浏览器/组队/交付卡片的步骤放在直连通道做，
+单纯"烧免费额度"的对话与代码问答放在本通道。
+
+---
 
 ### app-server 通道（`zcode-appserver`，默认关）
 
