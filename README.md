@@ -57,12 +57,14 @@ ZCode 桌面端自带一个 agent（有自己的 loop、子代理、记忆）。
 
 ## 安装
 
+**从 GitHub 仓库安装（推荐）**——本包**未发布到 npm**，请用 pnpm 的 git 规格：
+
 ```bash
-dsh plugin --profile desktop add dsh-connect-zcode
+dsh plugin --profile desktop add github:Shuffle-1992/dsh-connect-zcode
 ```
 
 > 用 `web` profile 的把 `--profile desktop` 换成 `--profile web`。
-> 指定版本：`dsh plugin --profile desktop add dsh-connect-zcode@0.4.0`。
+> 需要固定版本时用 git 标签：`add github:Shuffle-1992/dsh-connect-zcode#v0.4.0`。
 
 ### 从源码安装（开发者）
 
