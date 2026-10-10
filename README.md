@@ -2,6 +2,8 @@
 
 **把 ZCode（Z.ai / 智谱 BigModel）作为模型通道接进 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）** —— 让 DSH 直接消费你的 ZCode 套餐额度。
 
+**✅ 支持免费额度模式**：ZCode「Start Plan」的活动赠送额度（如 Weekend Build 的免费 GLM-5.3-Flash）可以直接在 DSH 里用 —— 通过托管官方 agent 代发请求，零破解、零凭据落盘（见 [Start Plan 通道](#start-plan-通道app-server)）。
+
 一个 DSH 原生 provider 插件，**两条互补通道**：
 
 ```
@@ -10,10 +12,10 @@ provider id : zcode              provider id : zcode-appserver（可选，默认
 谁发模型请求 : DSH 自己             谁发模型请求 : 官方 agent 进程（zcode.cjs）
 端点         : ~/.zcode/v2/config.json 的 baseURL
 凭据         : 零落盘、零缓存、每次调用现读
-适用         : Coding Plan（一等 API Key）   适用 : Start Plan / 活动赠送额度（账号型）
+适用         : Coding Plan（付费套餐）  适用 : Start Plan / 活动赠送额度（免费额度）
 ```
 
-> 第二条见 [Start Plan 通道（app-server）](#start-plan-通道app-server)。
+> 免费额度通道见 [Start Plan 通道（app-server）](#start-plan-通道app-server)，赠送额度用量会显示在设置面板与输入框下方的进度条里。
 
 ---
 
