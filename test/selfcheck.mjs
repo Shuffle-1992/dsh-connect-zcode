@@ -1413,9 +1413,23 @@ async function assertRejects(promise, pattern, label) {
     ];
     const blocks = appServer.collectImageBlocks(messages);
     check(
-      'appserver: 图片块只取最后一条用户消息（历史图由 agent 自己的会话历史承载）',
+      'appserver: 图片块只取「最后一轮输入段」（最后一条 assistant 之后的 user 消息；历史图由 agent 自己的会话历史承载）',
       blocks.length === 2 && blocks[0].ref.attachmentId === 'a1' && blocks[1].ref === null && blocks[1].mimeType === 'image/jpeg',
       JSON.stringify(blocks)
+    );
+    /* 2026-10-11 真机事故回归：context-pilot 等注入会在**真正的用户消息之后**追加 user 角色
+     * 消息（'Context usage before this turn …'）。旧实现只看"最后一条 user 消息"⇒ 永远扫到
+     * 注入消息 ⇒ 图片被静默丢弃（CLI attachmentCount:0 的真根因）。 */
+    const masked = [
+      { role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'sha256:' + 'a'.repeat(64), mediaType: 'image/png', bytes: 38155, name: 'image.png' } }, { type: 'text', text: '现在进行免费额度模型测试' }] },
+      { role: 'user', content: [{ type: 'text', text: 'Context usage before this turn (by context-pilot, estimate): 40%' }] },
+    ];
+    const maskedBlocks = appServer.collectImageBlocks(masked);
+    check(
+      'appserver: 注入消息不遮蔽真图（尾随 user 注入后仍能收集到用户消息里的图 + mediaType 回退）',
+      maskedBlocks.length === 1 && maskedBlocks[0].ref.attachmentId === 'sha256:' + 'a'.repeat(64) &&
+        maskedBlocks[0].mimeType === 'image/png',
+      JSON.stringify(maskedBlocks)
     );
     check(
       'appserver: 无用户消息 / 非数组输入 → 空数组（不抛）',
@@ -1428,7 +1442,7 @@ async function assertRejects(promise, pattern, label) {
         appServer.imageExtension('image/webp') === '.webp' && appServer.imageExtension('image/gif') === '.gif' &&
         appServer.imageExtension('image/avif') === '.bin'
     );
-    check('appserver: 转发图片时正文带附件说明（否则 agent 只看到路径、不知是本轮新图）', appServer.IMAGE_ATTACH_NOTE.includes('图片附件'));
+    check('appserver: 转发图片时正文带附件说明（告知模型图已随消息直达）', appServer.IMAGE_ATTACH_NOTE.includes('图片附件'));
     }
   }
 

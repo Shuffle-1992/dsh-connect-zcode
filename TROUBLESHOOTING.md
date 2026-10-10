@@ -33,6 +33,7 @@
   - [2.14 模型档位选择器里多出一个 `Default` 项](#214-模型档位选择器里多出一个-default-项)
   - [2.15 图片静默丢失：物化函数被放错口袋](#215-图片静默丢失物化函数被放错口袋deps-顶层-vs-options)
   - [2.16 回合超时后重试撞上 `A prompt is already running`](#216-回合超时后重试撞上-a-prompt-is-already-running-for-this-session)
+  - [2.17 图片再次静默丢失：注入插件把"最后一条用户消息"顶掉](#217-图片再次静默丢失context-pilot-注入把最后一条用户消息顶掉)
 - [三、通用工程](#三通用工程)
   - [3.1 用 `fetch` 后调 `process.exit()` 会崩（Windows）](#31-用-fetch-后调-processexit-会崩windows)
   - [3.2 "换个位置就红"的测试是资产](#32-换个位置就红的测试是资产)
@@ -1028,6 +1029,49 @@ DSH 自动重试（1/5）**立刻失败**：`app-server 通道失败：A prompt 
 > **官方 MCP 签名头**（CLI 日志：`Official MCP auth headers unavailable` → `MCP server connection failed`）
 > ⇒ 工具一直失败、代理一直在试。**"跑满超时"与通道本身无关**，是 MCP 能力在桥接环境不可用的代理行为；
 > 对策 = 超时 + 恢复阶梯（见上），并把这条限制写进 README 已知限制。
+
+---
+
+### 2.17 图片再次「静默丢失」：`context-pilot` 注入把"最后一条用户消息"顶掉
+
+**现象**（2026-10-11 真机，用户第二次发图实测）：`collectImageBlocks` 明明已按 §2.15 修好
+（物化函数对齐 + 告警），模型**仍然**说没收到图；CLI 日志 `session/send accepted` 的
+`attachmentCount` **依旧为 0**。
+
+**取证**（三条，零额度）：
+
+1. DSH 会话日志：用户消息带着完整的图片附件引用
+   `{type:'image', attachment:{attachmentId:'sha256:<64hex>', mediaType, width, height, bytes, name}}`；
+2. CLI rollout（模型请求记录）：适配器拍平的正文里 `[图片]` 占位符**在场**（宿主没有剥图），
+   但内容末尾**没有**附件说明 note ⇒ 适配器侧 `collectImageBlocks` 返回了空；
+3. CLI 日志：`Turn attachments resolved` 整条日志文件**一次都没出现**。
+
+**根因**：`collectImageBlocks` 只扫描"**最后一条** user 消息"。而本会话装着 context-pilot
+插件，它每轮都会在真正的用户消息**之后**追加一条 user 角色的注入消息
+（`Context usage before this turn …`）—— 于是"最后一条 user 消息"**永远是注入消息**，
+真图永远轮不到被收集。§2.15 修的是"物化函数接线"，那一层修好了；但**入口**就没人喂它。
+
+**修法**（`lib/app-server.js`）：
+
+- 扫描范围改为「**最后一条 assistant 之后的所有 user 消息**」—— 以结构边界（assistant）
+  圈定"本轮输入段"，注入消息落在段内也一起扫，真图不会被顶掉；
+- mime 取值加回退：真机形状里 mime 叫 **`mediaType`** 且在 `attachment` **里面**
+  （块本身没有 `mimeType`）⇒ `block.mimeType ?? attachment.mediaType`；
+- 物化为 0 时的告警带 ref 摘要（§2.15 已加），这次定位直接靠它省掉了解会话日志。
+
+**判据（真机，消耗一次小额模型调用，走生产模块 + 真实 CLI）**：
+
+```
+[info] 本轮随消息转发 1 张图片
+回复: "有"          ← 问"图里是否有可见的文字或界面元素？"
+rollout: 请求中 image 块 = 1     ← CLI 把 localPath 附件嵌进了模型请求
+```
+
+> **通用教训**：**"最后一条用户消息"不是稳定锚点** —— 任何注入类插件（用量行、时间上下文、
+> 桥接说明）都会在用户输入之后追加 user 角色消息。凡是要找"用户刚说的话"，用**结构边界**
+> （最后一条 assistant 之后）圈范围，而不是位置（最后一条）。另外本轮排查中一度把
+> "正文含『图片附件』字样"当成"note 已在"的证据 —— 长对话历史里**字符串包含检查不可信**，
+> 必须用结构化定位（note 出现在内容**末尾**才是本轮追加的）。
 
 ---
 
