@@ -26,6 +26,9 @@
   - [2.7 声明了图片能力却没给 resolveAttachments](#27-声明了图片能力却没给-resolveattachments--带图会话整体失败)
   - [2.8 面板报 HTTP 404：schemastery 没有 enum，静默降级致插件不激活](#28-面板报状态不可用http-404schemastery-没有-enum静默降级导致插件整体不激活)
   - [2.9 同 id 的 patch 条目：后一条整体覆盖前一条](#29-profile-里同-id-的-patch-条目后一条整体覆盖前一条注释式默认值其实是真配置)
+  - [2.10 agent 型通道的 usage 口径：回合聚合被当单次调用](#210-agent-型通道的-usage-口径把-cli-的回合聚合当单次调用上报--dsh-上下文占用虚高-n-倍)
+  - [2.11 流式正文与思考同 index 混发 → 内容互相覆盖](#211-流式正文与思考同-index-混发--面板里内容互相覆盖最后被整体替换)
+  - [2.12 pwsh 整文件编码往返写坏源码；未提交文件无法用 git 恢复](#212-用-pwsh-做整文件编码往返把源码写坏未提交的文件无法用-git-恢复)
 - [三、通用工程](#三通用工程)
   - [3.1 用 `fetch` 后调 `process.exit()` 会崩（Windows）](#31-用-fetch-后调-processexit-会崩windows)
   - [3.2 "换个位置就红"的测试是资产](#32-换个位置就红的测试是资产)
@@ -799,6 +802,84 @@ $f = Get-ChildItem "$env:USERPROFILE\.dsh\storages\session_projcache\sessions\*.
 > 两者在单调用回合**逐字相同**、在多调用回合**差 N 倍**，这才让口径结论成为事实而非猜测。
 > 另外：**同名不同义时，宿主不会报错**——它只会安静地把你给的数字当成另一个东西用
 > （这里是"上下文占用"），症状出现在离 bug 很远的地方（压缩行为、耗时、进度条）。
+
+---
+
+### 2.11 流式正文与思考**同 index 混发** → 面板里内容互相覆盖、最后被整体替换
+
+**现象**（2026-10-10 真机，用户在赠送额度通道上实测）：回答过程中聊天窗里
+**思考与输出都有，但一直互相覆盖**（刚出现的文字转眼被替换），最后整段内容又变了一次。
+
+**根因（宿主源码取证，两层都要看）**：宿主与 GUI 都以 **chunk 的 `index` 为块键** ——
+
+1. `dsh-llm/lib/types/assembler.js` 的 `BlockAssembler`：`ensure(index, blockType)`
+   **只在 index 不存在时**才定块类型，之后 `text-delta` 与 `reasoning-delta` 会**拼进同一个块**；
+   而 `block-end` 一到就 `partial.block = chunk.block`（"First close wins"）——
+   **用收尾负载整体替换**该 index 已累积的内容。
+2. `dsh-client-ui-chat/lib/client.js` 的 `updateChunk`：
+   `blocks[i] = { kind, text: (previous?.kind === <同类> ? previous.text : "") + delta }`
+   ⇒ 同一 index 上换一次类，**上一类的全部内容当场丢弃**。
+
+所以"把 reasoning-delta 与 text-delta 都发在 index 0、再用最终文本收尾"这种写法必然表现为覆盖：
+思考与正文互相清空，最后被最终答案替换。
+
+**修法**（`lib/app-server.js` 的块编排）：
+
+| 规则 | 理由 |
+|---|---|
+| **换块类型就换新 index**，并显式 `block-start {index, blockType}` | 类型与 index 一一对应，GUI 不再互相丢弃 |
+| 每块用**自己的累计文本**收尾（`block-end` 负载 == 已流出文本） | 收尾不再替换出不同内容 |
+| CLI 的最终 `response` 只在**没出现在流出内容里**时作为**新块追加** | 流恢复 / 伪调用标记拦截导致"正文没流出"时不丢答案，也不覆盖已流出内容 |
+| 两者都为空时仍产出一个空文本块 | 与旧行为一致，避免宿主拿到"零块"消息 |
+
+**判据**（真机，`scripts/verify-appserver-channel.mjs` 已内置）：
+
+```
+块序列     : #0:reasoning #1:text     ← 修复前是 reasoning 与 text 混在同一个 index
+收尾块     : #0(138字) #1(5字)
+块不变量   : PASS                     ← 每个 block-end 的负载 == 该 index 已流出文本
+CHUNKS PASS
+```
+
+自检侧用**假 transport 驱动真实 `stream()`** 断言同一组不变量（含"正文未流出时追加最终答案"），
+所以这次修复不是靠肉眼看 GUI 才算过。
+
+> **通用教训**：流式协议里 `index` 往往是**块的唯一键**，不是"顺手填个 0"。把两种语义的内容
+> 复用一个 index，等于让渲染层每帧二选一 —— 症状（闪烁 / 覆盖 / 内容变短）离根因很远。
+
+---
+
+### 2.12 用 pwsh 做「整文件编码往返」把源码写坏；未提交的文件无法用 git 恢复
+
+**现象**（2026-10-10，本仓库自身）：为改 3 处调用执行了一条
+`(Get-Content lib\app-server.js -Raw) -replace '...' | Set-Content lib\app-server.js -Encoding utf8`
+之后：**中文全变乱码**、文件从 1617 行缩到 1451 行（连**换行**与个别 ASCII 字符都被吞）、
+`node --check` 报语法错误、自检直接崩。
+
+**根因**：读的一端按**系统 ANSI(GBK)** 解码 UTF-8 文件、写的一端按 UTF-8 编码 ⇒ 双向编码往返；
+GBK 会把某些字节当双字节字符的尾字节**吃掉**（含 `\n` 与 ASCII）。更糟的是该文件当时
+**尚未纳入 git**（`git status` 里是 `??`）⇒ `git checkout` 无从恢复。
+
+**恢复方法（本例已验证，值得记住）**：DSH 会话日志完整记录了每一次 `write` / `edit` 工具调用。
+
+```powershell
+# ① 会话日志是**多帧 zstd**（zlib.zstdDecompressSync 只解第一帧；流式解码器不续帧）⇒ 扫魔数逐帧解
+node $env:TEMP\restore\extract-log.mjs "<session.v4.jsonl.zstd>" out.jsonl
+# ② 按**时间**重放 write/edit（不是 seq：编辑跨会话），callId 去重
+node $env:TEMP\restore\rebuild-merged.mjs rebuilt.js session-父.jsonl session-子.jsonl
+# ③ 交叉验证：node --check → 自检全绿 → 关键标识符计数与损坏版逐项对齐 → 乱码扫描(U+FFFD=0)
+```
+
+本例重建结果：1622 行、`node --check` 通过、**自检 281/281**、14 项标识符计数与损坏版一致。
+两个坑：日志里存在**当年就失败**的编辑尝试（old_string 必然不命中，跳过即可）；
+**最后一次 pwsh 改写不在日志里**（只有工具调用才有记录）⇒ 重建后要按已知清单手工补回。
+
+**纪律（从此照此执行）**：
+
+1. **禁止**用 pwsh / `Set-Content` 做整文件改写；要改就用 harness 的 `edit` 工具，或**显式 utf8**
+   的 node 脚本（`readFileSync(p,'utf8')` / `writeFileSync(p,s,'utf8')`）。
+2. **新建文件先做一次提交**（哪怕只本地、不推送）—— 未跟踪文件损坏 = 不可恢复。
+3. 大改动前用 `git status` 确认目标文件**已被跟踪**；`??` 就是"没有安全网"的信号。
 
 ---
 

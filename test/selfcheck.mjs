@@ -1585,6 +1585,190 @@ async function assertRejects(promise, pattern, label) {
     );
   }
 
+  /* ── 流式分块 + 思考档（2026-10-10 用户实测"面板内容一直覆盖"；赠送 5.3-Flash 补思考档）──
+   * 分块事故的机制（宿主源码取证）：`BlockAssembler` 与 GUI `updateChunk` 都以 **index 为键** ——
+   * GUI 端 `blocks[i] = { kind, text: (previous?.kind === <同类> ? previous.text : "") + delta }`
+   * ⇒ 同一 index 上 text / reasoning 交替时**每次换类都丢弃上一块**；汇编器 `ensure(index,type)`
+   * 只在 index 不存在时定类型，两类 delta 会拼进同一块，最后被 `block-end` 的负载整体替换。
+   * 故这里断言的是**块序列不变量**：换类即换 index、显式 block-start、收尾负载 == 该块累计文本。 */
+  {
+    /* ① 纯函数：官方档位 → DSH `reasoning` 元数据（契约：efforts 非空、id 唯一、defaultEffort 命中） */
+    const meta = appServer.buildReasoningMeta(['low', 'high', 'max'], 'high');
+    check(
+      'appserver: buildReasoningMeta 形状（id/name + defaultEffort 命中集合）',
+      JSON.stringify(meta) ===
+        JSON.stringify({
+          efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }, { id: 'max', name: 'Max' }],
+          defaultEffort: 'high',
+        }),
+      JSON.stringify(meta)
+    );
+    check(
+      'appserver: buildReasoningMeta 兜底（空档位→undefined；默认档不在集合→取集合内；未知 id 原样显示）',
+      appServer.buildReasoningMeta([], 'max') === undefined &&
+        appServer.buildReasoningMeta(null, undefined) === undefined &&
+        appServer.buildReasoningMeta(['weird'], 'nope').defaultEffort === 'weird' &&
+        appServer.buildReasoningMeta(['weird'], 'nope').efforts[0].name === 'weird' &&
+        appServer.buildReasoningMeta(['low', 'max'], 'high').defaultEffort === 'max'
+    );
+    /* ② 事实源（面板与适配器同一函数，防两处漂移）：官方 variants 优先、配置默认优先于官方默认 */
+    const facts = appServer.reasoningFacts({ 'glm-5.3-flash': { variants: ['low', 'max'], defaultVariant: 'max' } }, 'GLM-5.3-Flash', 'low');
+    const noOfficial = appServer.reasoningFacts({}, 'GLM-5.3-Flash', 'high');
+    const badCfg = appServer.reasoningFacts({ 'glm-5.3-flash': { variants: ['low', 'max'], defaultVariant: 'max' } }, 'GLM-5.3-Flash', 'nonsense');
+    check(
+      'appserver: reasoningFacts（官方档位 + 配置默认优先；配置非法→官方默认；无官方→回退常量档位）',
+      JSON.stringify(facts) === JSON.stringify({ levels: ['low', 'max'], defaultLevel: 'low' }) &&
+        JSON.stringify(noOfficial.levels) === JSON.stringify(appServer.START_PLAN_REASONING_LEVELS) &&
+        noOfficial.defaultLevel === 'high' &&
+        badCfg.defaultLevel === 'max',
+      `${JSON.stringify(facts)} / ${JSON.stringify(noOfficial)} / ${JSON.stringify(badCfg)}`
+    );
+    /* ③ 官方档位读取（夹具 config.json 的 start-plan 段；family→套餐键；读不到 → {}） */
+    const cfgFixture = tmpFile(
+      'zcode-config-reasoning.json',
+      JSON.stringify({
+        provider: {
+          'builtin:bigmodel-start-plan': {
+            models: {
+              'GLM-5.3-Flash': {
+                limit: { context: 1000000, output: 128000 },
+                reasoning: { enabled: true, variants: ['low', 'max', 'high'], defaultVariant: 'max' },
+                modalities: { input: ['text', 'image'] },
+              },
+            },
+          },
+        },
+      })
+    );
+    const readMeta = appServer.readStartPlanReasoningMeta('account:bigmodel-start-plan', cfgFixture);
+    check(
+      'appserver: readStartPlanReasoningMeta 读官方 variants（family→套餐键；读不到→{}）',
+      JSON.stringify(readMeta) === JSON.stringify({ 'glm-5.3-flash': { variants: ['low', 'max', 'high'], defaultVariant: 'max' } }) &&
+        JSON.stringify(appServer.readStartPlanReasoningMeta('account:bigmodel-start-plan', join(tmp, 'nope.json'))) === '{}' &&
+        appServer.startPlanConfigKey('account:zai-start-plan') === 'builtin:zai-start-plan' &&
+        appServer.startPlanConfigKey('nonsense') === '',
+      JSON.stringify(readMeta)
+    );
+
+    /* ④ 端到端（假 transport 驱动**真实 stream()**）：块序列不变量 */
+    const cfgBlock = {
+      zcodeCliPath: process.execPath, zcodeCliNode: 'node', appServerWorkspace: homedir(),
+      zcodeDataBaseDir: '', appServerCredentialStorePath: '', appServerAccountProviderId: '',
+      appServerModels: ['GLM-5.2'], appServerReasoningLevel: 'max', appServerToolPolicy: 'deny-all',
+      appServerInjectAccount: false, appServerRpcTimeoutMs: 5000, appServerTurnTimeoutMs: 20000,
+      childEnvAllow: [], contextWindow: 1000000,
+    };
+    const makeScriptClient = (script) => {
+      const listeners = new Set();
+      const calls = [];
+      return {
+        disposed: false, calls, cliPath: '', cliNode: '', cwd: '', rpcTimeoutMs: 0, env: {}, lastChannel: null, onServerRequest: null,
+        onNotification(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+        write() {}, notify() {}, dispose() {}, async ensureStarted() {},
+        async request(method, params) {
+          calls.push({ method, params });
+          if (method === 'session/create') return { session: { sessionId: 'sess-block' } };
+          if (method === 'session/read') return { projection: { contextUsed: 1234, contextWindow: 1000000 } };
+          if (method === 'session/send') {
+            queueMicrotask(() => {
+              for (const event of script) for (const listener of listeners) listener({ method: 'session/event', params: event });
+            });
+            return {};
+          }
+          return {};
+        },
+      };
+    };
+    const runScript = async (fake, cfg, opts = {}) => {
+      const adapter = appServer.createAppServerAdapter({
+        BaseAdapter: class {}, LlmError: class LlmError extends Error {}, options: () => cfg, logger: {}, gate: () => {},
+      });
+      adapter.client = fake;
+      if (opts.seed !== false) {
+        adapter.sessions.set('s1', { sessionId: 'sess-block', firstTurn: false, modelId: 'GLM-5.2', reasoningLevel: 'max', sentFingerprint: undefined });
+      }
+      const chunks = [];
+      for await (const chunk of adapter.stream({
+        provider: 'zcode-appserver', model: 'GLM-5.2', sessionId: opts.sessionId ?? 's1',
+        ...(opts.effort === undefined ? {} : { reasoningEffort: opts.effort }),
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      })) chunks.push(chunk);
+      adapter.dispose();
+      return chunks;
+    };
+
+    const done = (response) => ({ type: 'turn.completed', payload: { response, resultType: 'success', usage: { inputTokens: 100, outputTokens: 10, modelRequestCount: 1 } } });
+    const blockChunks = await runScript(
+      makeScriptClient([
+        { type: 'model.streaming', payload: { kind: 'reasoning_delta', delta: '想一下' } },
+        { type: 'model.streaming', payload: { kind: 'text_delta', delta: '先看文件' } },
+        { type: 'model.streaming', payload: { kind: 'reasoning_delta', delta: '再看看' } },
+        { type: 'model.streaming', payload: { kind: 'text_delta', delta: '结论 X' } },
+        done('结论 X'),
+      ]),
+      cfgBlock
+    );
+    const starts = blockChunks.filter((c) => c.type === 'block-start');
+    const ends = blockChunks.filter((c) => c.type === 'block-end');
+    const deltasAt = (index) =>
+      blockChunks
+        .filter((c) => (c.type === 'text-delta' || c.type === 'reasoning-delta') && c.index === index)
+        .map((c) => c.text)
+        .join('');
+    check(
+      'appserver: 推理/正文各自独立 index + 显式 block-start（同 index 混发会被宿主与 GUI 互相覆盖）',
+      JSON.stringify(starts.map((c) => [c.index, c.blockType])) ===
+        JSON.stringify([[0, 'reasoning'], [1, 'text'], [2, 'reasoning'], [3, 'text']]) &&
+        JSON.stringify(ends.map((c) => c.index)) === JSON.stringify([0, 1, 2, 3]) &&
+        ends.every((c) => c.block.text === deltasAt(c.index)),
+      JSON.stringify(starts.map((c) => [c.index, c.blockType])) + ' / ' + JSON.stringify(ends.map((c) => c.block.text))
+    );
+    check(
+      'appserver: 收尾不再用最终文本覆盖（每块收尾 == 已流出文本，块数不增不减）',
+      JSON.stringify(ends.map((c) => [c.block.type, c.block.text])) ===
+        JSON.stringify([['reasoning', '想一下'], ['text', '先看文件'], ['reasoning', '再看看'], ['text', '结论 X']]),
+      JSON.stringify(ends.map((c) => [c.block.type, c.block.text]))
+    );
+    const appendEnds = (
+      await runScript(
+        makeScriptClient([
+          { type: 'model.streaming', payload: { kind: 'reasoning_delta', delta: '只有思考' } },
+          done('最终答案'),
+        ]),
+        cfgBlock
+      )
+    ).filter((c) => c.type === 'block-end');
+    check(
+      'appserver: 正文未流出时把最终答案**追加**为块（不覆盖已流出的思考，也不丢答案）',
+      JSON.stringify(appendEnds.map((c) => [c.block.type, c.block.text])) ===
+        JSON.stringify([['reasoning', '只有思考'], ['text', '最终答案']]),
+      JSON.stringify(appendEnds.map((c) => [c.block.type, c.block.text]))
+    );
+
+    /* ⑤ 思考档真的下发给了 CLI：同一会话内换档 ⇒ 重发 session/setModel
+     *   （旧实现只在建会话时设一次 ⇒ 用户在输入框换档位完全不生效）。 */
+    {
+      const fake = makeScriptClient([done('ok')]);
+      const adapter = appServer.createAppServerAdapter({
+        BaseAdapter: class {}, LlmError: class LlmError extends Error {},
+        options: () => ({ ...cfgBlock, appServerCredentialStorePath: join(tmp, 'no-creds.json') }),
+        logger: {}, gate: () => {},
+      });
+      adapter.client = fake;
+      const consume = async (effort) => {
+        for await (const _chunk of adapter.stream({
+          provider: 'zcode-appserver', model: 'GLM-5.2', sessionId: 's2', reasoningEffort: effort,
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+        })) void _chunk;
+      };
+      await consume('low');
+      await consume('max');
+      adapter.dispose();
+      const setModels = fake.calls.filter((c) => c.method === 'session/setModel').map((c) => c.params.model.options.reasoningLevel);
+      check('appserver: 同一会话内换档 ⇒ 重发 session/setModel（low→max 各一次）', JSON.stringify(setModels) === JSON.stringify(['low', 'max']), JSON.stringify(setModels));
+    }
+  }
+
   // ── 凭据读取（只读 tmp fixture，零真实凭据）──
   {
     const secret = `zcode-credential-fallback:${process.platform}:${homedir()}:${(() => { try { return userInfo().username; } catch { return 'unknown'; } })()}`;
@@ -2005,7 +2189,17 @@ async function assertRejects(promise, pattern, label) {
         'client: 赠送额度行标注「赠送额度」徽标 + 图片能力如实反映（未接 attachments → 未启用）',
         JSON.stringify(giftPage).includes('赠送额度') &&
           JSON.stringify(giftPage).includes('图片：未启用') &&
-          JSON.stringify(giftPage).includes('推理档：max（通道配置 appServerReasoningLevel，锁定）')
+          /* 思考档由「锁定文案」升级为**官方事实 + 可切换**（2026-10-10 用户要求补思考模式）：
+           * 行内标注官方档位，切换入口是输入框的模型选择器。 */
+          JSON.stringify(giftPage).includes('思考档：low / high / max（官方；默认 max')
+      );
+      check(
+        'client: 赠送额度区块含「默认思考档」单选（data-role=gift-reasoning，档位来自状态文档）',
+        byDataRole(giftPage, 'gift-reasoning').length === 3 &&
+          JSON.stringify(byDataRole(giftPage, 'gift-reasoning').map((r) => r.props['data-level'])) ===
+            JSON.stringify(['low', 'high', 'max']) &&
+          JSON.stringify(giftPage).includes('默认思考档'),
+        `reasoningRadios=${byDataRole(giftPage, 'gift-reasoning').length}`
       );
       check(
         'client: 通道已注册时显示 CLI 与工具策略（可核对真实注册结果）',
@@ -2038,6 +2232,15 @@ async function assertRejects(promise, pattern, label) {
         JSON.stringify(failPage).includes('已启用但未注册') && JSON.stringify(failPage).includes('没探测到 ZCode CLI')
       );
       check('client: 面板保存路径包含 appServerModels（赠送额度显隐写回配置）', /writeField\(settingsScope, "appServerModels"/.test(clientSrcForPoll));
+      /* 默认思考档（2026-10-10 用户要求"给赠送的 5.3-Flash 加上思考模式"）：
+       * 面板单选写 appServerReasoningLevel，档位候选来自状态文档（官方 variants），不硬编码。 */
+      check(
+        'client: 面板写回默认思考档（appServerReasoningLevel），单选档位来自状态文档',
+        /writeField\(\s*settingsScope,\s*"appServerReasoningLevel"/.test(clientSrcForPoll) &&
+          /"data-role": "gift-reasoning"/.test(clientSrcForPoll) &&
+          /giftReasoningLevels/.test(clientSrcForPoll) &&
+          /storedGiftReasoning/.test(clientSrcForPoll)
+      );
     }
   } finally {
     if (hadWindow) globalThis.window = realWindow;
@@ -2239,13 +2442,25 @@ console.log = REAL_LOG;
         reasoningLevel: 'max',
         providerId: 'zcode-appserver',
         imagesSupported: true,
-        models: [{ id: 'GLM-5.3-Flash', name: 'GLM-5.3-Flash（赠送额度）', contextWindow: 200000 }, { bad: true }, null],
+        models: [
+          { id: 'GLM-5.3-Flash', name: 'GLM-5.3-Flash（赠送额度）', contextWindow: 200000, reasoningLevels: ['low', 'high', 'max'], defaultReasoningLevel: 'high' },
+          { bad: true },
+          null,
+        ],
       });
       check(
         'appserver: 状态摘要只出布尔/短串/模型列表（坏行被剔）',
         summary.enabled === true && summary.registered === true && summary.models.length === 1 &&
           summary.models[0].id === 'GLM-5.3-Flash' && summary.providerId === 'zcode-appserver' &&
           summary.imagesSupported === true
+      );
+      /* 面板的「默认思考档」单选只能靠这份事实渲染（不硬编码档位）⇒ 必须随模型行下发。 */
+      check(
+        'appserver: 状态摘要带每模型思考档事实（面板单选的数据源；非法项被剔）',
+        JSON.stringify(summary.models[0].reasoningLevels) === JSON.stringify(['low', 'high', 'max']) &&
+          summary.models[0].defaultReasoningLevel === 'high' &&
+          JSON.stringify(webStatus.toAppServerSummary({ models: [{ id: 'm', reasoningLevels: ['ok', 42, ''] }] }).models[0].reasoningLevels) === JSON.stringify(['ok']) &&
+          webStatus.toAppServerSummary({ models: [{ id: 'm' }] }).models[0].defaultReasoningLevel === null
       );
       check('appserver: 缺字段时安全兜底（不抛、不假报启用）', (() => {
         const s = webStatus.toAppServerSummary(undefined);

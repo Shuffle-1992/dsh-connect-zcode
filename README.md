@@ -406,11 +406,36 @@ ZCode Start Plan（赠送额度）→ GLM-5.3-Flash（赠送额度）        ←
 | 模型勾选 | `appServerModels` | 勾上的模型出现在选择器的「ZCode Start Plan（赠送额度）」分组下；全不勾 = 回默认单条 `GLM-5.3-Flash` |
 | 200K / 1M | `contextBudgets[<id>]` | 与 Coding Plan **共用同一份预算表**（模型 id 不重叠，互不影响） |
 | 图片 | — | 显示**当前能力**：接了 DSH `attachments` 服务 → `支持`；否则 `未启用`（如实反映，不写死） |
-| 推理档 | — | **锁定显示**：由 `appServerReasoningLevel` 统一决定，与既有通道的 per-model 档位机制不重复 |
+| 默认思考档 | `appServerReasoningLevel` | 全通道一个值（low / high / max，**档位候选来自官方 `reasoning.variants`**，面板不硬编码）。只在宿主未下发档位时兜底；日常在**输入框的模型选择器**里逐轮切换 |
 
-保存按钮一次写回 `enabledModelIds / contextBudgets / modelOverrides / appServerModels`，每项都做**写后回读校验**。
+保存按钮一次写回 `enabledModelIds / contextBudgets / modelOverrides / appServerModels / appServerReasoningLevel`，每项都做**写后回读校验**。
 
 > 面板写入的这些字段都是 **volatile**（DSH 面板可写的硬前提），host 半**活读**——保存后下一次会话生效。
+
+### 思考档（赠送额度的 5.3-Flash 支持思考模式）
+
+官方 `~/.zcode/v2/config.json` 的 `builtin:{bigmodel,zai}-start-plan` 段里，`GLM-5.3-Flash`
+声明了 `reasoning.variants = ["low","max","high"]`、`defaultVariant = "max"` —— 与 Coding Plan
+**同源同档**。本通道如实把它接上：
+
+| 环节 | 做法 |
+|---|---|
+| 声明给宿主 | `resolveModel` 返回 `reasoning: { efforts: [{id,name}], defaultEffort }` ⇒ 模型选择器出现思考档（`reasoningFacts` 是适配器与面板的**单一来源**，避免两处漂移） |
+| 档位落到 CLI | 宿主按声明校验后从 `request.reasoningEffort` 传回；适配器据此调 `session/setModel{options:{reasoningLevel}}`，**档位变化时复用会话重发**（不是只在建会话时设一次） |
+| 读不到官方档位 | 回退到模块常量（同样源自官方声明），**绝不发明档位**；面板的默认档单选也只在候选集合内取值 |
+| 兜底默认档 | `appServerReasoningLevel`（面板可改）：宿主没下发档位时用它 |
+
+真机实测（2026-10-10，`node scripts/verify-appserver-channel.mjs --tools allow-all`）：
+
+```
+usage 口径=context-used（CLI 回合聚合 input=36904 output=64 调用次数=2；CLI contextUsed=18910）⇒ 上报 DSH input=18910 output=0
+块序列     : #0:reasoning #1:text      ← 推理与正文各自独立 index（修复前都在 index 0，互相覆盖）
+块不变量   : PASS                     ← 每个 block-end 的负载 == 该 index 已流出文本
+模型元数据 : {"inputModalities":["text"],"contextWindow":200000,
+              "reasoning":{"efforts":[{"id":"low","name":"Low"},{"id":"max","name":"Max"},{"id":"high","name":"High"}],"defaultEffort":"max"}}
+CHUNKS PASS
+VERIFY PASS
+```
 
 ### 图片怎么走（Start Plan 通道）
 
@@ -621,6 +646,13 @@ provider.models 输出）、面板行控件（锁定 disabled、1M 按官方数�
     （按次上下文读数），读不到则按次数取均值。**若不折算，1M 窗口会被算成 708%**，
     表现为弹窗顶部 100%/~7.1M 与同弹窗的启发式明细（~24.9K）自相矛盾，并连续触发压缩
     —— 完整取证与三条判据见 TROUBLESHOOTING §2.10。
+18. **思考档已接上并真机验证**（见上文「思考档」）：`resolveModel` 按官方 `reasoning.variants`
+    声明 `reasoning.efforts`，档位变化时重发 `session/setModel`。面板的「默认思考档」只在
+    宿主未下发档位时兜底；**日常切换用输入框的模型选择器**（宿主的档位选择器）。
+19. **流式块按类型拆分**（修「内容被覆盖」）：推理与正文各自独立 index + 显式 `block-start`，
+    每块用自己的累计文本收尾；CLI 的最终答案**只在没出现在流出内容里时**作为新块追加
+    （流恢复 / 伪调用标记拦截等场景），不再整体替换已流出内容。判据：验证脚本的
+    `CHUNKS PASS`（见「真机验证」）。机制与坑位见 TROUBLESHOOTING §2.11。
 
 ---
 

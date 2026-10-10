@@ -91,6 +91,7 @@ if (cliPath === '') {
 
   let text = '';
   const kinds = {};
+  const chunks = [];
   let finish;
   let usage;
   const t0 = Date.now();
@@ -102,6 +103,7 @@ if (cliPath === '') {
       sessionId: `verify-${Date.now()}`,
     })) {
       kinds[chunk.type] = (kinds[chunk.type] ?? 0) + 1;
+      chunks.push(chunk);
       if (chunk.type === 'text-delta') {
         text += chunk.text;
         process.stdout.write(chunk.text);
@@ -116,14 +118,55 @@ if (cliPath === '') {
     adapter.dispose();
   }
 
+  /* ── 块序列不变量（2026-10-10「面板内容被覆盖」事故的回归判据）──────────────────
+   * 宿主 `BlockAssembler` 与 GUI `updateChunk` 都以 **index 为键**：同一 index 上
+   * text / reasoning 混发会被互相丢弃，收尾 `block-end` 的负载又会整体替换该块。
+   * 判据：① 每个 delta 都有**同类型**的 block-start；② index 不复用；
+   *       ③ 每个 block-end 的负载 == 该 index 上已流出文本的拼接（不等就是"被覆盖"）。 */
+  const DELTA_KIND = { 'text-delta': 'text', 'reasoning-delta': 'reasoning' };
+  const starts = chunks.filter((c) => c.type === 'block-start');
+  const ends = chunks.filter((c) => c.type === 'block-end');
+  const textAt = (index) =>
+    chunks.filter((c) => DELTA_KIND[c.type] !== undefined && c.index === index).map((c) => c.text).join('');
+  const typeOf = new Map();
+  const problems = [];
+  for (const c of chunks) {
+    if (c.type === 'block-start') {
+      if (typeOf.has(c.index)) problems.push(`index ${c.index} 重复 block-start`);
+      typeOf.set(c.index, c.blockType);
+    } else if (DELTA_KIND[c.type] !== undefined) {
+      if (typeOf.get(c.index) !== DELTA_KIND[c.type]) {
+        problems.push(`${c.type} index ${c.index} 无匹配 block-start（类型=${typeOf.get(c.index) ?? '无'}）`);
+      }
+    } else if (c.type === 'block-end') {
+      const streamed = textAt(c.index);
+      if (c.block?.text !== streamed) {
+        problems.push(`index ${c.index} 收尾文本(${String(c.block?.text ?? '').length}字) != 流出文本(${streamed.length}字)`);
+      }
+    }
+  }
+
   console.log('\n\n================ 结果 ================');
   console.log('chunk 统计 :', JSON.stringify(kinds));
+  console.log('块序列     :', starts.map((c) => `#${c.index}:${c.blockType}`).join(' ') || '(无块)');
+  console.log('收尾块     :', ends.map((c) => `#${c.index}(${String(c.block?.text ?? '').length}字)`).join(' ') || '(无)');
+  console.log('块不变量   :', problems.length === 0 ? 'PASS' : `FAIL — ${problems.join('; ')}`);
   console.log('回复正文   :', JSON.stringify(text.slice(0, 200)));
   console.log('usage      :', JSON.stringify(usage ?? null));
   console.log('finish     :', JSON.stringify(finish ?? null));
   const channelLine = seen.find((m) => m.includes('本轮执行渠道'));
   console.log('执行渠道   :', channelLine ?? '(未观测到 —— 回合未走到模型请求)');
   console.log('耗时       :', `${Date.now() - t0}ms`);
+  /* 声明给宿主的思考档事实（组装器据此出档位选择器；请求侧由 reasoningEffort 回来）。 */
+  try {
+    const meta = await adapter.resolveModel('zcode-appserver', MODEL);
+    console.log(
+      '模型元数据 :',
+      JSON.stringify({ inputModalities: meta.inputModalities, contextWindow: meta.context?.contextWindow, reasoning: meta.reasoning ?? null })
+    );
+  } catch (error) {
+    console.log('模型元数据 : 读取失败', error?.message ?? error);
+  }
 
   const onPlanChannel = /zcode-plan/.test(channelLine ?? '');
   const ok = finish?.kind === 'stop';
@@ -132,6 +175,7 @@ if (cliPath === '') {
     console.log('\n⚠ 通道打通但回合未成功（已确证打到 Start Plan 端点）。');
     console.log('   若 failure.code=1005 / message 含 quota → 权益**窗口未生效**（已领取 ≠ 已生效），不是通道故障。');
   } else console.log('\n✗ 未确证打到 Start Plan 端点，请检查上面的 [warn]/[error] 行');
+  console.log(`\nCHUNKS ${problems.length === 0 ? 'PASS' : 'FAIL'}`);
   console.log(`\nVERIFY ${ok ? 'PASS' : 'FAIL'}`);
-  process.exitCode = ok ? 0 : 1;
+  process.exitCode = ok && problems.length === 0 ? 0 : 1;
 }

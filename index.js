@@ -38,6 +38,9 @@ import {
   START_PLAN_REASONING_LEVELS,
   DEFAULT_REASONING_LEVEL,
   createAppServerAdapter,
+  resolveAccountProviderId,
+  readStartPlanReasoningMeta,
+  reasoningFacts,
   resolveZcodeCliPath,
   imageExtension,
 } from './lib/app-server.js';
@@ -883,26 +886,36 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
         planQuota: () => readPlanQuota({ dataBaseDir: cfg.zcodeDataBaseDir }),
         /* 赠送额度通道（app-server）的注册状态 + 面板可配的模型清单。
          * 面板据此渲染「赠送额度通道」区块；未启用/未注册时给出**可操作原因**。 */
-        appServer: () => ({
-          ...appServerState,
-          toolPolicy: cfg.appServerToolPolicy,
-          reasoningLevel: cfg.appServerReasoningLevel,
-          imagesSupported: canImages(),
-          models: appServerState.enabled
-            ? readGiftModels().map((id) => {
-                const entry = START_PLAN_CATALOG.find((m) => m.id === id) ?? { id, name: id, contextWindow: 200000 };
-                const override = readBudgets()[id];
-                return {
-                  id: entry.id,
-                  name: entry.name ?? entry.id,
-                  contextWindow:
-                    Number.isFinite(override) && override > 0
-                      ? Math.min(Math.trunc(override), 1000000)
-                      : entry.contextWindow,
-                };
-              })
-            : [],
-        }),
+        appServer: () => {
+          /* 推理档事实（官方 variants）：与适配器 `_catalog()` 同源（`reasoningFacts`），
+           * 面板据此渲染"默认思考档"单选；每次现读 config.json，不缓存（跟随官方配置变化）。 */
+          const reasoningMeta = appServerState.enabled
+            ? readStartPlanReasoningMeta(resolveAccountProviderId(cfg))
+            : {};
+          return {
+            ...appServerState,
+            toolPolicy: cfg.appServerToolPolicy,
+            reasoningLevel: cfg.appServerReasoningLevel,
+            imagesSupported: canImages(),
+            models: appServerState.enabled
+              ? readGiftModels().map((id) => {
+                  const entry = START_PLAN_CATALOG.find((m) => m.id === id) ?? { id, name: id, contextWindow: 200000 };
+                  const override = readBudgets()[id];
+                  const facts = reasoningFacts(reasoningMeta, id, cfg.appServerReasoningLevel);
+                  return {
+                    id: entry.id,
+                    name: entry.name ?? entry.id,
+                    contextWindow:
+                      Number.isFinite(override) && override > 0
+                        ? Math.min(Math.trunc(override), 1000000)
+                        : entry.contextWindow,
+                    reasoningLevels: facts.levels,
+                    defaultReasoningLevel: facts.defaultLevel,
+                  };
+                })
+              : [],
+          };
+        },
       })
     );
   } catch {
