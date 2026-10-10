@@ -7,6 +7,12 @@
 > ⚠️ 免费额度通道是**模型对话通道**：DSH 的**工具层在这条通道上不参与**（agent 用自己进程内的原生工具）。
 > 上哪些能力能用、哪些完全没有（浏览器面板 / Agent Teams / 派发台 / `ask_user_question` / TODO …），
 > 以及各类替代做法，见 [**免费额度通道目前缺失的功能速查**](#-免费额度通道zcode-appserver目前缺失的功能速查)。
+>
+> ✅ **要让 agent 自主用工具干活、又要烧免费额度 ⇒ 用姊妹项目 [派发台（zcode-dispatch）](https://github.com/Shuffle-1992/zcode-dispatch)。**
+> 它现在也支持免费额度通道（`account:<family>-start-plan`：面板有**额度条**、agent 派发前能看到剩余额度与窗口剩余时间、
+> 台账按 `billing=zcode-plan-gift` 与付费套餐分账），而且**"走 ZCode 自己的工具"在派发台是设计而非缺陷** ——
+> 那里本来就是"**独立 ZCode 进程 + 它自己的工具 + 独立会话 + 独立额度**"。
+> **一句话选型：纯模型对话 / 要 DSH 自己的工具链 ⇒ 本插件；要 agent 自主执行任务 ⇒ 派发台。**
 
 一个 DSH 原生 provider 插件，**两条互补通道**：
 
@@ -318,6 +324,15 @@ ZCode 有两条消费路径，**互补而非替代**：
 
 > ⚠️ 两者**共享同一份额度**。注意套餐有**滚动窗口上限**：撞顶时所有经该套餐的调用一律
 > `HTTP 429`（`[1308] 已达到 5 小时的使用上限`），直到窗口重置。
+
+> **落地形态（推荐）**：上表的"派发模式"现在有现成实现 —— 姊妹项目
+> [**派发台（zcode-dispatch）**](https://github.com/Shuffle-1992/zcode-dispatch)：DSH 插件 + 悬浮面板 +
+> agent 工具 `zcode_dispatch`，把任务派给**独立 ZCode 进程**（它用自己的原生工具、独立会话），
+> 并带单写者文件锁、用量台账、暂停分类（额度耗尽/未开通/需签名）、自动降级链、任务落地自动唤醒。
+> **它同样支持免费额度通道**（`--provider start-plan` / 通道 `account:<family>-start-plan`，
+> 台账 `billing=zcode-plan-gift` 与付费套餐分账；面板有额度条，agent 派发前能看到剩余额度）。
+> 所以"**要工具 + 要免费额度**"的组合，答案是派发台而不是本插件的 provider 通道 —— 见文末
+> [需要 A 类能力时怎么办](#-免费额度通道zcode-appserver目前缺失的功能速查)。
 
 ---
 
@@ -652,7 +667,7 @@ provider.models 输出）、面板行控件（锁定 disabled、1M 按官方数�
 |---|---|---|
 | 浏览器面板 / 批注 / 截图 | `browser_*`（browser-kit 全部） | 你在 DSH 里开的浏览器窗口、页面批注、截图能力都用不上 |
 | Agent Teams（多代理协作） | `spawn_teammate` / `send_message` / `wait_agent` / `list_agents` / `interrupt_agent` / `team_task_*` | 无法组队、无法共享任务板 |
-| 派发台 | `zcode_dispatch` | 无法在通道会话里再派发任务给 ZCode |
+| 派发台 | `zcode_dispatch` | 无法在**通道会话里**再派发任务给 ZCode —— 但"**用派发台消费免费额度**"完全可行：派发台自己也支持该通道（见下方「需要 A 类能力时怎么办」第 1 条） |
 | 工作流编排 | `workflow` | 无多子代理扇出 |
 | 后台任务 | `job_list` / `job_output` / `job_kill` | 无托管后台作业 |
 | 定时提醒 | `schedule_*` | 无定时/周期提醒 |
@@ -684,7 +699,10 @@ provider.models 输出）、面板行控件（锁定 disabled、1M 按官方数�
 | 官方 MCP 服务器 | 桥接进程拿不到桌面端签名头（`Official MCP auth headers unavailable`），`node_repl` / `image_search` 等**连不上**；agent 可能在这些坏工具上打转，拖到本地超时（默认 15 分钟） |
 | 模型目录 | 只能在官方 start-plan 段声明过的模型里选（如 GLM-5.3-Flash / GLM-5.2 / GLM-5-Turbo）；写未声明的模型会 `setModel` 失败 |
 
-**需要 A 类能力时怎么办**：改用**直连通道**（provider `zcode`，走 Coding Plan / API Key 形态，
+**需要 A 类能力时怎么办**（按推荐顺序）：
+
+1. **要「agent 自主用工具干活」、又想烧免费额度 ⇒ 用姊妹项目 [派发台（zcode-dispatch）](https://github.com/Shuffle-1992/zcode-dispatch)**：它**也支持免费额度通道**（与本通道同源的「托管官方 agent」方案，通道 id `account:<family>-start-plan`；面板有**额度条**、agent 派发前能读到剩余额度与窗口剩余时间、台账按 `billing=zcode-plan-gift` 与付费套餐分账）。而且那里的语义**本来就是对的** —— 派发 = **独立 ZCode 进程做它自己的事**（用它自己的原生工具、独立会话、独立额度），所以「工具是 ZCode 自己的」**不是缺陷而是设计**，本节说的「DSH 工具层不参与」在派发台上根本不存在。**这是把免费额度用在「真干活」上的正确姿势**（配套：单写者文件锁 / 用量台账 / 暂停分类 / 自动降级链 / 任务落地自动唤醒）。
+2. 需要 **DSH 自己的工具链**（浏览器面板 / 批注 / 截图 / Agent Teams / 交付卡片 / `ask_user_question` …）⇒ **改用直连通道**（provider `zcode`，走 Coding Plan / API Key 形态，
 DSH 工具全部可用），或者把任务拆开——需要浏览器/组队/交付卡片的步骤放在直连通道做，
 单纯"烧免费额度"的对话与代码问答放在本通道。
 
