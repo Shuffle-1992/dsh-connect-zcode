@@ -1,0 +1,29 @@
+name: selfcheck
+
+# 本插件 2160 行 JS + 9 条外部耦合，唯一防线是 test/selfcheck.mjs（纯静态：零网络、
+# 零凭据、无宿主也能跑）。此前它只在 Lead 机器上人手执行 —— R-01（selfcheck 读取真实
+# 凭据库）这类"测试自身纪律"问题长期无人发现，根因就是没有第二双眼睛。
+# 形态刻意保持最小：不加 lint、不加构建（尊重项目"无构建链"的形态）。
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selfcheck:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # engines: "^22.19.0 || >=24.0.0" → 取两端各一个，覆盖 AbortSignal.any 等运行时能力下限
+        node: ['22.19.0', '24.x']
+        os: [ubuntu-latest, windows-latest]
+    name: node ${{ matrix.node }} / ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: selfcheck（零网络零凭据；退出码 0=全绿）
+        run: node test/selfcheck.mjs

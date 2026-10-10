@@ -1,10 +1,25 @@
 {
-  "name": "@local/dsh-connect-zcode",
+  "name": "dsh-connect-zcode",
   "displayName": "DSH Connect ZCode",
   "description": "把 ZCode（Z.ai / 智谱 BigModel Coding Plan）接入 DeepSeek Harness：复用本机已登录的套餐凭据，提供模型显隐、200K/1M 上下文预算与推理档/图片能力面板。",
-  "version": "0.3.1",
-  "private": true,
+  "version": "0.4.0",
+  "license": "MIT",
   "type": "module",
+  "icon": "./icon.svg",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Shuffle-1992/dsh-connect-zcode.git"
+  },
+  "homepage": "https://github.com/Shuffle-1992/dsh-connect-zcode#readme",
+  "bugs": "https://github.com/Shuffle-1992/dsh-connect-zcode/issues",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "zcode",
+    "bigmodel",
+    "llm-provider"
+  ],
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
   },
@@ -47,6 +62,7 @@
     "index.js",
     "lib",
     "cordis.patch.yml",
+    "icon.svg",
     "README.md",
     "test",
     "scripts",

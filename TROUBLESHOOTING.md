@@ -413,7 +413,7 @@ const header = JSON.parse(buf.subarray(16, 16 + headerSize).toString('utf8'));
 
 ```jsonc
 {
-  "name": "@local/dsh-connect-zcode",
+  "name": "dsh-connect-zcode",
   "displayName": "DSH Connect ZCode",        // ← 顶层
   "description": "把 ZCode … 接入 DeepSeek Harness…",  // ← 顶层（DSH 读这里）
   "meta": { "title": "…", "description": "…" }          // ← 这个 DSH 不读
@@ -619,7 +619,7 @@ cmd > log 2>&1; echo "GATE:$?"   # ✅
 ## 附：本插件自检覆盖了哪些坑
 
 ```bash
-node test/selfcheck.mjs     # 140 断言，纯静态零网络
+node test/selfcheck.mjs     # 纯静态零网络；断言数见输出末行（勿在文档里写死）
 ```
 
 | 坑 | 对应断言 |

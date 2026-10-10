@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- dsh-connect-zcode 插件图标
+       语义：闪电 = ZCode 套餐向 DSH 供给推理能力；
+             底部三点 = ZCode 生态家族视觉记忆（与 @local/zcode-dispatch 同构）。
+       约定：64x64 / rx14 深底 / 扁平无渐变，与宿主插件卡一致。
+       小尺寸可读性：单一主形状，16px 下仍可辨认（design/preview 有 64/32/24/16 实测）。 -->
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="#1e293b"/>
+  <path d="M36 8 L18 34 L29 34 L25 48 L44 24 L33 24 L38 8 Z" fill="#7cc4ff"/>
+  <circle cx="20" cy="50" r="3" fill="#7cc4ff"/>
+  <circle cx="31" cy="50" r="3" fill="#58c98f"/>
+  <circle cx="42" cy="50" r="3" fill="#e8b64c"/>
+</svg>

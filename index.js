@@ -1,5 +1,5 @@
 /**
- * @local/dsh-connect-zcode —— Host 半边：把 ZCode Coding Plan 注册为 DSH 的 LLM provider。
+ * dsh-connect-zcode —— Host 半边：把 ZCode Coding Plan 注册为 DSH 的 LLM provider。
  *
  * 形状完全对齐本机 dsh-connect-trae@2.4.0 的注册三部曲（T18 §3.1 / T19 §5 实证，不发明 API）：
  *   :4016  const inject = ["llm"]
@@ -31,6 +31,7 @@ import { resolveHostLlmModules, resolveSchemastery } from './lib/host-modules.js
 import { staticCatalog, discoverModels, filterByEnabledModels } from './lib/discovery.js';
 import {
   BASE_CONTEXT_WINDOW,
+  FALLBACK_MAX_TOKENS,
   readOfficialMeta,
   applyImageSelection,
   applyReasoningSelection,
@@ -43,7 +44,7 @@ const NS = 'zcode';
 const PROVIDER_ID = 'zcode';
 const DISPLAY_NAME = 'ZCode Coding Plan';
 const STREAM_IDLE_TIMEOUT_MS = 300000;
-const FALLBACK_MAX_TOKENS = 128000;
+/* FALLBACK_MAX_TOKENS 由 lib/model-meta.js 统一导出（S-03：消除三处同值字面量），见上方 import。 */
 
 /** 依赖的宿主服务：llm（注册三部曲的落点；trae :4016 同款）。 */
 export const inject = ['llm'];
@@ -136,8 +137,16 @@ function modelOverridesOf(rawConfig) {
 
 /** config 归一（schemastery 主路径与手写降级共用一份逻辑，Z10-3：区分主/降级但不重复规则）。 */
 function normalizeConfig(config) {
-  const clampInt = (v, lo, hi, dflt) =>
-    typeof v === 'number' && Number.isFinite(v) ? Math.min(hi, Math.max(lo, Math.trunc(v))) : dflt;
+  /* R-11：非法值（非有限数 / ≤0）必须回 dflt，只有**合法范围内的越界**才钳制。
+   * 原实现 `Math.min(hi, Math.max(lo, trunc(v)))` 把 contextWindow:-5 归成 1 ——
+   * 与 schemastery 主路径 `z.number().min(1)`（对 -5 校验失败）行为不一致，
+   * 且后果是"全部模型声明 contextWindow=1"，DSH 上下文管理立即异常。 */
+  const clampInt = (v, lo, hi, dflt) => {
+    if (typeof v !== 'number' || !Number.isFinite(v)) return dflt;
+    const n = Math.trunc(v);
+    if (n < lo) return dflt;
+    return Math.min(hi, n);
+  };
   const nonEmptyStr = (v, dflt) => (typeof v === 'string' && v !== '' ? v : dflt);
   const v = config ?? {};
   return {
@@ -175,12 +184,13 @@ function fallbackConfigSchema() {
  *  ⚠️ schemastery 必须经 host-modules 候选链解析，**不能裸 import**：本包是 link 插件，
  *  裸说明符在 DSH 进程内解析不到（它在 app.asar 内嵌 node_modules，profile 树里没有）。
  *  解析失败会降级手写 schema → enabledModelIds 无法打 volatile → 面板每次保存被 DSH
- *  写入门禁静默拒绝（`has no volatile fields`，且 set() 照样 resolve）。 */
+ *  写入门禁静默拒绝（`has no volatile fields`，且 set() 照样 resolve）。
+ *  ⚠️ resolveSchemastery 现按 **抛错** 语义（R-08：失败时带出 tried 候选点列表）；
+ *  旧版返回 null 会把诊断线索整个丢弃。此处 catch 文案已拼接 err.message。 */
 async function loadConfig() {
   try {
     const z = await resolveSchemastery();
-    if (!z) throw new Error('宿主内未解析到 @deepseek-ai/schemastery');
-    return z.object({
+    if (!z) throw new Error('宿主内未解析到 @deepseek-ai/schemastery');    return z.object({
       planKey: z.string().default(DEFAULT_PLAN_KEY).description('只接的套餐条目（api-key 形态；start-plan 的 JWT 形态显式拒绝）'),
       contextWindow: z
         .number()
@@ -367,8 +377,11 @@ function registerStatusRoute(webCtx, deps) {
         }),
       'dsh-connect-zcode: panel status route'
     );
-  } catch {
-    /* 路由注册失败不影响 provider 三部曲 */
+  } catch (err) {
+    /* R-07：此处原先空 catch，把两种成因混为一谈 —— webServer 服务缺席（已知降级）
+     * 与 webServer.register 契约变化（需要修的兼容问题）在用户侧都是"面板状态不可用 404"，
+     * 而后者完全不可诊断。与 TROUBLESHOOTING §2.8 同构的静默失效。 */
+    console.warn(`[dsh-connect-zcode] 状态路由注册失败（面板将显示状态不可用）：${err?.message ?? err}`);
   }
 }
 
@@ -511,6 +524,37 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
 
   const offs = [];
   offs.push(ctx.llm.registerAdapter([PROVIDER_ID], adapter));
+
+  /* DE-04：C5（dsh-llm-pi-ai 的 options/profile 形状）启动期形状自检。
+   * 为什么必须做：本耦合**已两次真机翻车**，且两次都是"挂错位置/缺字段 = 静默无效"
+   * （resolveAttachments 挂 createProvider 静默失效；profile 缺图片预算 → 一发图就抛）。
+   * 现有唯一校验是"PiAiAdapter 是函数"——上游重命名读取点完全不设防。
+   * 策略：**只告警不阻断**（与项目"降级必须可见"纪律一致）——插件仍注册，
+   * 但把"某个字段没被认出来"从"特定场景才炸"提前到启动日志。 */
+  {
+    const missing = [];
+    if (adapter?.options?.resolveAttachments === undefined) missing.push('adapter.options.resolveAttachments');
+    if (adapter?.options?.auth !== INERT_AUTH) missing.push('adapter.options.auth');
+    if (adapter?.options?.profiles === undefined) missing.push('adapter.options.profiles');
+    if (adapter?.options?.resolveApiKey === undefined) missing.push('adapter.options.resolveApiKey');
+    for (const key of Object.keys(REQUEST_IMAGE_BUDGETS)) {
+      if (!Number.isInteger(profile[key]) || profile[key] <= 0) missing.push(`profile.${key}`);
+    }
+    if (missing.length > 0) {
+      console.warn(
+        `[dsh-connect-zcode] ⚠️ C5 形状自检未通过，以下字段未被宿主适配器认领：${missing.join(', ')}。` +
+          '这通常意味着 dsh-llm-pi-ai 升级后改了读取点 —— 相关能力（附件/图片/凭据/重试）将静默失效，' +
+          '请对照 TROUBLESHOOTING §2.7 与宿主包版本排查。'
+      );
+    }
+    /* 正向证据：自检**确实跑到了**（否则"没有告警"既可能是健康、也可能是这段根本没执行——
+     * 那正是本项目最怕的假绿）。selfcheck 断言本行在场 + 无 C5 告警 = 双重确认。 */
+    console.log(`[dsh-connect-zcode] C5 形状自检通过（检查 ${4 + Object.keys(REQUEST_IMAGE_BUDGETS).length} 项宿主契约字段）`);
+    const v = mods.versions ?? {};
+    console.log(
+      `[dsh-connect-zcode] 宿主 LLM 栈：pi-ai=${v.piAi ?? '未知'} / dsh-llm-pi-ai=${v.piAiAdapter ?? '未知'}；来源=${mods.source}`
+    );
+  }
   offs.push(
     ctx.llm.registerModelDiscovery(settingsNs, async (request, signal) => {
       const cancellation = signal ?? request?.signal;
@@ -527,10 +571,30 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
           officialMeta: readMeta(),
           baseContextWindow: cfg.contextWindow,
           ...(cancellation === undefined ? {} : { signal: cancellation }),
+          /* H-02：上游模型增删必须至少留一条线索。5.3 系显式集合过滤是**有意的防误放行取舍**，
+           * 但被滤掉的模型连 state.lastCatalog 都进不去 ⇒ 上游新增变体时面板总数不变、
+           * 无新模型、无日志，用户与维护者都无从得知"网关已经有新模型了"。 */
+          onDiagnostic: (msg) => {
+            try {
+              console.warn(`[dsh-connect-zcode] ${msg}`);
+            } catch {
+              /* 日志失败不影响目录发现 */
+            }
+          },
         });
         state.lastCatalog = rows; // 状态路由展示过滤前的全量（面板要能看到被隐藏的模型才能重新勾上）
         return discoveredFor(rows);
-      } catch {
+      } catch (err) {
+        /* R-06：目录发现双层静默是本项目最典型的"失败无诊断线索"。
+         * 调用门有完整 onDiagnostic 通道，发现路径此前一条都没有 ——
+         * 用户只看到"模型列表没更新/少了模型"，主进程日志零线索，
+         * 无法区分"网关挂了"与"响应形态变了"。错误消息来自 fetch/JSON.parse/凭据解析，
+         * 不含 key 原文（凭据错误文案本身有零明文红线保障）。 */
+        try {
+          console.warn(`[dsh-connect-zcode] 目录发现失败，回退上次目录：${err?.message ?? err}`);
+        } catch {
+          /* 日志失败不影响回退 */
+        }
         return discoveredFor(state.lastCatalog);
       }
     })

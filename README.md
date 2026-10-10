@@ -57,38 +57,43 @@ ZCode 桌面端自带一个 agent（有自己的 loop、子代理、记忆）。
 
 ## 安装
 
-> ⚠️ 这是一个 **link 式本地插件**（尚未发布到 npm）。安装会改动 DSH profile 配置，请自行确认。
+```bash
+dsh plugin --profile desktop add dsh-connect-zcode
+```
 
-**1. 克隆到稳定位置**
+> 用 `web` profile 的把 `--profile desktop` 换成 `--profile web`。
+> 指定版本：`dsh plugin --profile desktop add dsh-connect-zcode@0.4.0`。
+
+### 从源码安装（开发者）
 
 ```bash
 git clone https://github.com/Shuffle-1992/dsh-connect-zcode.git
-cd dsh-connect-zcode
+dsh plugin --profile desktop add /absolute/path/to/dsh-connect-zcode
 ```
 
-**2. 编辑 profile 的 `package.json`**（如 `~/.dsh/profiles/desktop/package.json`）
+手动 link 式安装（不用 dsh CLI 时）：编辑 profile 的 `package.json`
+（如 `~/.dsh/profiles/desktop/package.json`）：
 
 ```jsonc
 {
   "dependencies": {
-    "@local/dsh-connect-zcode": "link:/absolute/path/to/dsh-connect-zcode"
+    "dsh-connect-zcode": "link:/absolute/path/to/dsh-connect-zcode"
   },
   "dsh": {
     "profile": {
-      "bundles": [ /* … */ "@local/dsh-connect-zcode" ]
+      "bundles": [ /* … */ "dsh-connect-zcode" ]
     }
   }
 }
 ```
 
-**3. 在 profile 目录执行 `pnpm install`**（link 依赖只建符号链接）
+然后在 profile 目录执行 `pnpm install`（link 依赖只建符号链接），重启 DSH ——
+模型选择器应出现 `zcode` 分组。
 
-**4. 重启 DSH** —— 模型选择器应出现 `zcode` 分组。
-
-**5. 验证**
+### 验证
 
 ```bash
-node test/selfcheck.mjs     # 应输出 SELFCHECK PASS：113/113，exit 0
+node test/selfcheck.mjs     # 应输出 SELFCHECK PASS：N/N，exit 0（N 随断言增加而变，不写死）
 ```
 
 ---
@@ -296,7 +301,7 @@ ZCode 有两条消费路径，**互补而非替代**：
 ## 自检
 
 ```bash
-node test/selfcheck.mjs      # 113 断言，exit 0 = 全绿
+node test/selfcheck.mjs      # 全绿=exit 0（断言数见输出末行，勿在文档里写死）
 ```
 
 纯静态 / 单元测试：**不产生任何网络请求**（`fetch` 全程投毒）、**不读真实凭据内容**
@@ -328,6 +333,17 @@ provider.models 输出）、面板行控件（锁定 disabled、1M 按官方数�
 7. 面板文案中文常量，无 i18n。
 8. 网关未来新增的 5.3 系模型（如 `glm-5.3-pro`）不在显式集合内，**不会**自动暴露；
    需更新 `GLM53_FAMILY`（lib/model-meta.js）——这是防误放行的刻意取舍。
+   网关返回数量与保留数量的差异会打进日志（`目录发现` 前缀），便于发现上游已新增模型。
+9. **每次推理调用都会先做一次凭据验活**（零落盘零缓存红线的直接推论）：正常路径
+   额外 1 次轻量 `GET /v1/models` 往返（约 100–500ms，相对流式推理总时长占比很小）；
+   若 `config.json` 里的 Key 已失效且凭据库回退开启，最坏为 **1+N 次串行验活
+   （每次超时 8s）** 后才沿用原值——失效期的表现是"每次对话先卡若干秒"。这是红线的
+   既定代价（不缓存 Key 本身），**不建议用缓存修**：缓存会引入"Key 被吊销后仍可用 N 秒"
+   的新窗口。可用 `credentialFallback: false` 关掉回退以缩短最坏路径（代价是不再自动跟随
+   凭据库）。
+10. 宿主升级后 `dsh-llm-pi-ai` / `pi-ai` 的读取点若变化，会导致附件/图片/凭据能力**静默失效**。
+    启动日志会输出宿主栈版本（`宿主 LLM 栈：pi-ai=… / dsh-llm-pi-ai=…`）并做 C5 形状自检
+    （未通过时告警），**升级 DSH 后请先看这两行**。
 
 ---
 

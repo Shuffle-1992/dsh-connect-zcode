@@ -33,9 +33,17 @@
  * 退出码：0 = config.json 已是有效 key（无需改动）或已完成修复；1 = 无可用的有效 key（未改动）。
  */
 import { readFileSync, writeFileSync, renameSync, copyFileSync, existsSync } from 'node:fs';
-import { createDecipheriv, createHash } from 'node:crypto';
-import { homedir, platform, userInfo } from 'node:os';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
+/* ⚠️ S-01（2026-10-06 复核）：解密 / secret 推导 / key 形态 / 验活**一律复用 lib 单实现**。
+ * 原先本脚本把 credential-store.js 的 ENC_PREFIX/resolveSecret/decrypt/API_KEY_RE 与
+ * credential.js 的验体逻辑整段复制了一份（约 40 行），构成 C2（逆向契约）的**两份手工同步副本**：
+ * 任何一侧因 ZCode 加密格式变化而修改而另一侧遗漏 → 方案 A（修 config.json）与方案 B
+ * （插件内建回退）行为分叉，用户按 README 跑完恢复工具"修好了"，插件回退却仍失败。
+ * lib/credential-store.js 与 lib/credential.js 均为纯 ESM 且无宿主依赖，可安全相对 import
+ * （注意：**不可** import 本包 index.js —— 它有顶层 await 与宿主模块解析）。 */
+import { decryptCredentialValue, readStoredApiKeys } from '../lib/credential-store.js';
+import { validateApiKey } from '../lib/credential.js';
 
 const ARGS = process.argv.slice(2);
 const DRY_RUN = ARGS.includes('--dry-run');
@@ -47,61 +55,14 @@ const PLAN_KEY = (() => {
 const V2 = join(homedir(), '.zcode', 'v2');
 const CONFIG_PATH = join(V2, 'config.json');
 const STORE_PATH = join(V2, 'credentials.json');
-const ENC_PREFIX = 'enc:v1:';
-const API_KEY_RE = /^[0-9a-f]{32}\.[A-Za-z0-9]{16}$/;
 const DEFAULT_BASE = 'https://open.bigmodel.cn/api/anthropic';
 
 const fp = (k) => (typeof k === 'string' && k.length >= 12 ? `head=${k.slice(0, 8)}*** tail=***${k.slice(-4)}` : '(invalid)');
 
-/* ---------- 解密（与 zcode.cjs 同式；见 lib/credential-store.js 注释） ---------- */
-function resolveSecret() {
-  const fromEnv = process.env.ZCODE_CREDENTIAL_SECRET?.trim();
-  if (fromEnv) return fromEnv;
-  let user = 'unknown';
-  try {
-    user = userInfo().username;
-  } catch {
-    /* 与 zcode.cjs 同式 */
-  }
-  return `zcode-credential-fallback:${platform()}:${homedir()}:${user}`;
-}
-function decrypt(value) {
-  try {
-    if (typeof value !== 'string' || !value.startsWith(ENC_PREFIX)) return null;
-    const parts = value.slice(ENC_PREFIX.length).split('.');
-    if (parts.length !== 3) return null;
-    const [iv, tag, data] = parts.map((p) => Buffer.from(p, 'base64url'));
-    if (iv.length !== 12 || tag.length !== 16 || data.length === 0) return null;
-    const key = createHash('sha256').update(resolveSecret()).digest();
-    const d = createDecipheriv('aes-256-gcm', key, iv);
-    d.setAuthTag(tag);
-    return Buffer.concat([d.update(data), d.final()]).toString('utf8');
-  } catch {
-    return null;
-  }
-}
-
-/* ---------- 验活（关键：200 也可能是认证失败） ---------- */
+/* ---------- 验活（复用 lib/credential.js 的 validateApiKey：含"HTTP 200 也可能是认证失败"的验体逻辑） ---------- */
 async function validate(apiKey, baseURL, timeoutMs = 8000) {
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), timeoutMs);
-  try {
-    const res = await fetch(`${String(baseURL).replace(/\/+$/, '')}/v1/models`, {
-      method: 'GET',
-      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-      signal: ac.signal,
-    });
-    if (!res.ok) return { ok: false, why: `HTTP ${res.status}` };
-    const body = await res.json();
-    if (body?.success === false) return { ok: false, why: `HTTP 200 但 body: code=${body?.code ?? '-'} ${body?.msg ?? ''}` };
-    if (body?.code !== undefined && body.code !== 200) return { ok: false, why: `body.code=${body.code}` };
-    if (!Array.isArray(body?.data) || body.data.length === 0) return { ok: false, why: 'body.data 为空' };
-    return { ok: true, why: `${body.data.length} 个模型` };
-  } catch (e) {
-    return { ok: false, why: String(e?.message ?? e).slice(0, 60) };
-  } finally {
-    clearTimeout(timer);
-  }
+  const ok = await validateApiKey(apiKey, baseURL, { timeoutMs });
+  return { ok, why: ok ? '验活通过（/v1/models 返回非空 data）' : `验活失败（详见 lib/credential.js：非 2xx / body.success=false / body.code≠200 / data 空）` };
 }
 
 /* ---------- 主流程 ---------- */
@@ -135,45 +96,23 @@ async function main() {
     console.log('[sync-key] 现状：config.json 无 apiKey');
   }
 
-  // 2) 收集凭据库候选
+  // 2) 收集凭据库候选（解密/形态过滤/诊断一律走 lib 单实现，S-01）
   if (!existsSync(STORE_PATH)) {
     console.error('[sync-key] ❌ 找不到凭据库，且现状 key 无效；无法自动恢复。请打开 ZCode 桌面端重新登录。');
     return 1;
   }
-  const store = JSON.parse(readFileSync(STORE_PATH, 'utf8'));
-  const candidates = [];
-  let matched = 0;
-  let decryptFailed = 0;
-  let shapeRejected = 0;
-  for (const [k, v] of Object.entries(store)) {
-    if (!k.startsWith('account-provider:coding-plan:') || !k.endsWith(':api-key')) continue;
-    matched += 1;
-    const plain = decrypt(v);
-    if (typeof plain !== 'string') {
-      decryptFailed += 1;
-      console.warn(`[sync-key]   ⚠️ 解密失败：${k.split(':')[3] ?? 'unknown'}（secret 不匹配或 ZCode 更换了加密格式）`);
-      continue;
-    }
-    if (!API_KEY_RE.test(plain)) {
-      shapeRejected += 1;
-      console.warn(
-        `[sync-key]   ⚠️ 形态校验未通过：${k.split(':')[3] ?? 'unknown'} 长度=${plain.length}（期望 49，形态 32hex.16alnum）` +
-          ' —— 若 ZCode 更换了 key 形态，需更新脚本里的 API_KEY_RE，否则候选会被静默过滤'
-      );
-      continue;
-    }
-    candidates.push({ id: k.split(':')[3] ?? 'unknown', apiKey: plain });
-  }
-  console.log(`[sync-key] 凭据库候选 ${candidates.length} 把（命中 ${matched} 条）`);
+  /* readStoredApiKeys 已是"只认 coding-plan + 只认 api-key 形态 + 解密失败/形态不符带诊断"的单实现，
+   * 且诊断文案与插件方案 B 完全一致（同一函数），方案 A/B 行为不会再分叉。 */
+  const candidates = readStoredApiKeys(STORE_PATH, {
+    onDiagnostic: (msg) => console.warn(`[sync-key]   ⚠️ ${msg}`),
+  });
+  console.log(`[sync-key] 凭据库候选 ${candidates.length} 把`);
   if (candidates.length === 0) {
-    if (matched > 0) {
-      console.error(
-        `[sync-key] ❌ 命中的 ${matched} 条全部被过滤（解密失败 ${decryptFailed} / 形态不符 ${shapeRejected}）。` +
-          '请检查上面的 ⚠️ 诊断；若 ZCode 更换了 key 形态，需更新本脚本的 API_KEY_RE。'
-      );
-    } else {
-      console.error('[sync-key] ❌ 凭据库中没有 coding-plan 的 api-key 条目。请打开 ZCode 桌面端重新登录。');
-    }
+    console.error(
+      '[sync-key] ❌ 凭据库中没有可用的 coding-plan api-key 候选（原因见上面的 ⚠️ 诊断：' +
+        '条目缺失 / 解密失败（secret 不匹配或 ZCode 更换了加密格式）/ 形态不符）。' +
+        '请打开 ZCode 桌面端重新登录。'
+    );
     return 1;
   }
 

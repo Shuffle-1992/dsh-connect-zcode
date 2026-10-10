@@ -27,6 +27,22 @@ async function waitFor(cond, ms = 4000) {
   return cond();
 }
 
+/* ⚠️ 网络投毒必须在**任何被测模块导入之前**（R-01，2026-10-06 复核修复）。
+ * 原实现把投毒放在全链路注册段（旧 :865），晚于 :858 的 `await opts.resolveApiKey(...)`；
+ * 那一行会走凭据门 → `resolvePlanCredential` 回退路径 → 按 **默认路径** 读取并解密
+ * 真实 `~/.zcode/v2/credentials.json`（实测基线日志："凭据库中 2 个候选均验活失败"，
+ * 而 fixture 只埋了 1 把 key —— 多出来的只能是真实用户凭据库）。
+ * 后果三层：① 自述的"零网络零凭据"纪律被确定性打破；② 真实 key 解密进内存后被当
+ * x-api-key 发出（当前被 .test 不可解析兜住，DNS 环境异常时是真外发）；
+ * ③ DNS 慢的环境额外 3×8s 串行等待。
+ * 故：投毒提前到模块导入前，全模块加载期与全部 gate 路径零真实 fetch。 */
+const REAL_FETCH = globalThis.fetch;
+globalThis.fetch = () => {
+  throw new Error('NETWORK FORBIDDEN BY SELFCHECK');
+};
+/** 真实 console 方法的模块级备份（段 7 会临时替换以捕获插件日志）。 */
+const REAL_WARN = console.warn;
+const REAL_LOG = console.log;
 // ─── 模块导入（被测物） ───────────────────────────────────────────────────────
 const credential = await import('../lib/credential.js');
 const credStore = await import('../lib/credential-store.js');
@@ -530,8 +546,11 @@ async function assertRejects(promise, pattern, label) {
     '发现: extractModels 提取 display_name（三种形态兼容；缺失回退 id）',
     JSON.stringify(discovery.extractModels({ data: [{ id: 'a', display_name: 'A' }, { id: 'b' }] })) === '[{"id":"a","name":"A"},{"id":"b","name":"b"}]' &&
       JSON.stringify(discovery.extractModels(['c'])) === '[{"id":"c","name":"c"}]' &&
-      JSON.stringify(discovery.extractModelIds({ models: ['d'] })) === '["d"]'
+      JSON.stringify(discovery.extractModels({ models: ['d'] })) === '[{"id":"d","name":"d"}]'
   );
+  /* S-05：extractModelIds 已作为死代码删除（生产零调用方），此处断言它确实不再导出 ——
+   * 防止将来有人"顺手加回来"又变成没人用的 API。 */
+  check('发现: 死代码 extractModelIds 已移除（S-05）', discovery.extractModelIds === undefined);
   const cred = { apiKey: fakeKey, baseURL: 'https://example.test/api/anthropic' };
   const rows2 = await discovery.discoverModels(cred, { officialMeta, baseContextWindow: 200000, fetchFn: async () => ({ ok: false }) });
   check('发现: HTTP 非 200 回退静态表（3 行 5.3 系）', rows2.length === 3 && rows2[0].contextWindow === 200000, `rows=${rows2.length}`);
@@ -604,12 +623,72 @@ async function assertRejects(promise, pattern, label) {
   await it.next();
   await it.return();
   check('拦截: 提前 return 也记账（aborted）', taps.length === 1 && String(taps[0].exit).includes('aborted'), JSON.stringify(taps[0]));
+
+  /* R-03：中止必须**向内层传播 return()**（迭代协议义务）。
+   * 原实现只 finish() 不关内层 ⇒ 上游继续生成、额度继续消耗而台账只记 aborted(usage=null)。 */
+  {
+    let innerClosed = false;
+    const innerStream = () => (async function* () {
+      try {
+        yield { type: 'text' };
+        yield { type: 'text' };
+      } finally {
+        innerClosed = true;
+      }
+    })();
+    const taps3 = [];
+    const w3 = instrumentApi({ stream: () => innerStream(), streamSimple: () => innerStream() },
+      { semaphore: new Semaphore(2), record: (r) => taps3.push(r) });
+    for await (const _ of w3.stream({ id: 'glm-5.3', baseUrl: 'https://example.test/api/anthropic' })) {
+      break; // 消费者提前退出
+    }
+    await new Promise((r) => setTimeout(r, 30));
+    check('拦截: 消费者中止时内层流被关闭（R-03，防额度空烧）', innerClosed === true && taps3.length === 1 && String(taps3[0].exit).includes('aborted'), `innerClosed=${innerClosed} taps=${JSON.stringify(taps3.map((t) => t.exit))}`);
+  }
+
+  /* R-04：手动迭代（.next()）必须与 for await 同受预算与记账监管。
+   * 原 Proxy 只拦 Symbol.asyncIterator ⇒ 直接 .next() 完全绕过（实测 records=0、active=0）。 */
+  {
+    const innerStream = () => (async function* () { yield { type: 'text' }; yield { type: 'text' }; })();
+    const taps4 = [];
+    const sem4 = new Semaphore(2);
+    const w4 = instrumentApi({ stream: () => innerStream(), streamSimple: () => innerStream() },
+      { semaphore: sem4, record: (r) => taps4.push(r) });
+    const manual = w4.stream({ id: 'glm-5.3', baseUrl: 'https://example.test/api/anthropic' });
+    let n = 0;
+    while (true) {
+      const { done } = await manual.next();
+      if (done) break;
+      n += 1;
+    }
+    check('拦截: 手动 .next() 迭代也纳入预算与记账（R-04）', n === 2 && taps4.length === 1 && taps4[0].exit === 0 && sem4.active === 0, `n=${n} taps=${taps4.length} active=${sem4.active}`);
+  }
+
+  /* R-10：Promise 防御分支显式断言（原为零测试的"防御分支"）。
+   * 若 pi-ai 真形态从"同步返回流"变成"返回 Promise<流>"，此分支就是主路径 —— 必须有契约。 */
+  {
+    const innerStream = () => (async function* () { yield { type: 'usage', input_tokens: 3, output_tokens: 4 }; })();
+    const taps5 = [];
+    const sem5 = new Semaphore(2);
+    const w5 = instrumentApi({ stream: () => Promise.resolve(innerStream()), streamSimple: () => Promise.resolve(innerStream()) },
+      { semaphore: sem5, record: (r) => taps5.push(r) });
+    const resolved = await w5.stream({ id: 'glm-5.3', baseUrl: 'https://example.test/api/anthropic' });
+    check('拦截: promise 形态分支记账一次且预算归还（R-10 契约化）', taps5.length === 1 && sem5.active === 0 && typeof resolved?.[Symbol.asyncIterator] === 'function', `taps=${taps5.length} active=${sem5.active}`);
+  }
 }
 
 // ─── 6. manifest / patch / 纪律（§6 验收） ───────────────────────────────────
 {
   const pkg = JSON.parse(readFileSync(join(PLUGIN_ROOT, 'package.json'), 'utf8'));
-  check('manifest: 名字正确', pkg.name === '@local/dsh-connect-zcode');
+  check('manifest: 名字正确', pkg.name === 'dsh-connect-zcode');
+  /* 市场合规（2026-10-10）：发布要求 manifest 自描述 —— name 不带本地私有 scope、
+   * version/license/repository 在场、keywords 含 dsh-plugin（生态识别 topic）。 */
+  check(
+    'manifest: 市场合规字段（name 无 @local 前缀 + license/repository/keywords 标识）',
+    !pkg.name.startsWith('@local/') && pkg.license === 'MIT' && typeof pkg.repository?.url === 'string' &&
+      (pkg.keywords ?? []).includes('dsh-plugin') && (pkg.keywords ?? []).includes('deepseek-harness'),
+    `name=${pkg.name} license=${pkg.license} keywords=${(pkg.keywords ?? []).join(',')}`
+  );
   /* T21 防拒启核心断言：dsh.client 与 exports["./client"] 必须同时存在，且入口文件真实存在。
    * 声明了 dsh.client 却缺 lib/client.js（或加载失败）= DSH 拒绝启动（ClientPackageCompositionError，
    * 启动后几秒自行退出）——这对断言是本插件的生命线，任何一侧缺失即 FAIL。 */
@@ -620,7 +699,7 @@ async function assertRejects(promise, pattern, label) {
   check('manifest: client 声明形状（platform web + 非空 inject 列表）', pkg.dsh?.client?.platform === 'web' && Array.isArray(pkg.dsh?.client?.inject) && pkg.dsh.client.inject.length > 0, JSON.stringify(pkg.dsh?.client?.inject ?? null));
   check('manifest: peerDependencies 声明宿主栈', !!pkg.peerDependencies?.['@earendil-works/pi-ai'] && !!pkg.peerDependencies?.['@deepseek-ai/dsh-llm-pi-ai']);
   const patch = readFileSync(join(PLUGIN_ROOT, 'cordis.patch.yml'), 'utf8');
-  check('patch: 含 zcode-connect 与 @local/dsh-connect-zcode', patch.includes('id: zcode-connect') && patch.includes("'@local/dsh-connect-zcode'"));
+  check('patch: 含 zcode-connect 与 dsh-connect-zcode', patch.includes('id: zcode-connect') && patch.includes("'dsh-connect-zcode'"));
   /* volatile 标记 tripwire：0.1.7 设置写入门禁要求条目含 volatile 字段，缺了它面板每次写入都被
    * 静默拒绝（trae lib/index.js :4086-4094 实证注释）。schemastery 在开发目录解析不到、无法运行时
    * 断言主路径，故以源码级 tripwire 兜底（防该标记被无意删除）。T22：三个面板写入字段全部要有。 */
@@ -716,7 +795,12 @@ async function assertRejects(promise, pattern, label) {
   );
   tmpFile(
     join('stub-modules', '@earendil-works', 'pi-ai', 'dist', 'api', 'anthropic-messages.lazy.js'),
-    'export const anthropicMessagesApi = () => ({ async stream(model) { return (async function* () { yield { type: "usage", input_tokens: 1, output_tokens: 1 }; })(); }, async streamSimple() {} });\n'
+    /* R-10：stub 形态必须与 **T20 实测的真实形态**一致 —— 同步函数返回事件流对象。
+     * 原 stub 写成 `async stream(...)` ⇒ 返回 Promise<AsyncIterable> ⇒ 命中 instrumentApi 的
+     * isPromise 防御分支，而注释声称"绝不能返回 Promise"。两种说法并存且 promise 分支零断言，
+     * 若真形态随 pi-ai 升级变成 Promise，并发预算与记账会整体静默失效而无测试报警。
+     * 现改为同步方法（与注释真实形态一致），promise 分支另由下面的显式断言覆盖。 */
+    'export const anthropicMessagesApi = () => ({ stream() { return (async function* () { yield { type: "usage", input_tokens: 1, output_tokens: 1 }; })(); }, streamSimple() { return { type: "usage", input_tokens: 2, output_tokens: 2 }; } });\n'
   );
   tmpFile(join('stub-modules', '@deepseek-ai', 'dsh-llm-pi-ai', 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-llm-pi-ai', type: 'module', version: '0.0.0-stub' }));
   tmpFile(
@@ -779,6 +863,21 @@ async function assertRejects(promise, pattern, label) {
   const registrations = { adapters: [], discoveries: [], directories: [], createProviderInputs: (globalThis.__zcodeCreateProviderInputs = []) };
   const errors = [];
   const effects = [];
+  /* 捕获插件全部 console.warn（DE-04 形状自检 / 各处诊断日志的断言依据）。
+   * 常驻到本段结束——比逐点打桩更省，且不会漏掉异步激活期的日志。 */
+  const warns = [];
+  console.warn = (...args) => {
+    warns.push(args.map(String).join(' '));
+    REAL_WARN(...args); // 透传：诊断日志仍应可见（自检输出即证据）
+  };
+  /* 同时捕获 console.log（DE-04 的宿主栈版本行走 log，非 warn）。
+   * ⚠️ 必须**透传**给真实 console.log：check() 自身就是用 console.log 打印 PASS/FAIL 的，
+   * 若只入队不转发，本段约 47 条断言的结果行会整体消失（测试看似全绿但输出缺行）。 */
+  const logs = [];
+  console.log = (...args) => {
+    logs.push(args.map(String).join(' '));
+    REAL_LOG(...args);
+  };
   const fakeCtx = () => ({
     fiber: { entry: { options: { id: 'zcode-connect-selfcheck' } } },
     llm: {
@@ -807,13 +906,30 @@ async function assertRejects(promise, pattern, label) {
   const ctx1 = fakeCtx();
   let applyThrew = false;
   try {
-    index.apply(ctx1, { switchPath, credentialPath: credPath, ledgerPath });
+    /* credentialFallback: false —— 自检红线（R-01）：关掉凭据库回退，门禁验活失败后沿用
+   * fixture 原值（lib/credential.js 的逃生口），**绝不按默认路径读真实 ~/.zcode/v2/credentials.json**。
+   * 这不是可选项：默认 true 时 fixture key 验活失败（投毒 fetch 恒抛）会触发回退，
+   * 逐把解密并验活真实用户凭据。 */
+  index.apply(ctx1, { switchPath, credentialPath: credPath, ledgerPath, credentialFallback: false });
   } catch {
     applyThrew = true;
   }
   check('apply: 同步不抛（激活安全第一）', applyThrew === false);
   const registered = await waitFor(() => registrations.adapters.length === 1 && registrations.discoveries.length === 1 && registrations.directories.length === 1);
   check('注册: 三部曲齐（adapter+discovery+directory）', registered, `errors=${JSON.stringify(errors)}`);
+  /* DE-04：C5 形状自检 + 宿主版本日志。
+   * ⚠️ 断言必须**双向**：① 无 C5 告警（不误报）；② "自检通过"行在场（自检确实执行了）。
+   * 只断言"没有告警"是假绿——那段代码没跑到时同样没有告警（本项目的头号失败模式）。 */
+  check(
+    'DE-04: C5 形状自检确实执行且健康态零告警（双向断言，防假绿）',
+    logs.join(' ').includes('C5 形状自检通过') && !warns.join(' ').includes('C5 形状自检未通过'),
+    `logs=${logs.join(' | ').slice(0, 200)}`
+  );
+  check(
+    'DE-04: 启动日志输出宿主栈版本与来源',
+    logs.join(' ').includes('宿主 LLM 栈：') && logs.join(' ').includes('pi-ai='),
+    logs.join(' ').match(/宿主 LLM 栈：[^\n]{0,120}/)?.[0] ?? '(未见)'
+  );
   check('注册: adapter 绑定 provider id zcode', registrations.adapters[0]?.ids?.join(',') === 'zcode');
   /* 附件解析（图片输入必需）：**必须挂在 adapter options 上**。
    * dsh-llm-pi-ai :1857 读 `this.config.resolveAttachments`，而 this.config = PiAiAdapter 的 options。
@@ -862,15 +978,17 @@ async function assertRejects(promise, pattern, label) {
   check('调用门: 开关关 → resolveApiKey 抛规定文案（§7.1）', frozenRejected === true);
   check('调用门: key 不出现在任何错误消息', !errors.join(' ').includes(fakeKey));
 
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = () => {
-    throw new Error('NETWORK FORBIDDEN BY SELFCHECK');
-  };
+  /* 网络投毒已在文件顶部（模块导入前）生效；此处只做**绊线断言**，证明投毒确实活着——
+   * 否则将来有人误把投毒移除，本节会静默退回"打真实网络"，且测试照样全绿。 */
+  check(
+    '纪律: 全程 fetch 投毒有效（零真实网络；R-01 破口已封）',
+    globalThis.fetch !== REAL_FETCH && (() => { try { globalThis.fetch('https://example.test'); return false; } catch { return true; } })()
+  );
   let discoveryRows = null;
   try {
     discoveryRows = await registrations.discoveries[0].fn({}, undefined);
   } finally {
-    globalThis.fetch = realFetch;
+    /* 投毒常驻：不恢复 realFetch（本自检全程禁止真实网络）。 */
   }
   check('发现: 冻结期零网络直接回静态表', Array.isArray(discoveryRows) && discoveryRows.length === 3 && discoveryRows[0].contextWindow === 200000, `rows=${discoveryRows?.length}`);
 
@@ -882,6 +1000,7 @@ async function assertRejects(promise, pattern, label) {
     switchPath,
     credentialPath: credPath,
     ledgerPath,
+    credentialFallback: false, // R-01 红线：不回退真实凭据库
     contextBudgets: { 'glm-5.3': 1000000, 'glm-5.3-flashx': 1000000 },
     modelOverrides: { 'glm-5.3-flashx': { reasoning: true, image: true }, 'glm-5.3': { image: true } },
     enabledModelIds: [],
@@ -910,12 +1029,16 @@ async function assertRejects(promise, pattern, label) {
    * 同时守卫必须 warn 出"不支持该档"的模型（fixture 下 glm-5.3-flash / flashx 无推理元数据 → 受害者）。 */
   {
     const warnings = [];
-    const origWarn = console.warn;
-    console.warn = (msg) => warnings.push(String(msg));
+    const origWarn = console.warn; // = 本段的 warns 收集器，finally 里必须还给它
+    console.warn = (msg) => {
+      warnings.push(String(msg));
+      warns.push(String(msg)); // 同时并入全局收集，DE-04 等断言不受此临时替换影响
+      REAL_WARN(msg); // 透传
+    };
     try {
       /* 激活是异步的（waitFor 才见注册），桩必须活到 waitFor 之后 —— 守卫在插件激活期运行。 */
       const ctx1c = fakeCtx();
-      index.apply(ctx1c, { switchPath, credentialPath: credPath, ledgerPath, defaultReasoningEffort: 'max' });
+      index.apply(ctx1c, { switchPath, credentialPath: credPath, ledgerPath, credentialFallback: false, defaultReasoningEffort: 'max' });
       const registered1c = await waitFor(() => registrations.adapters.length === 3);
       const prof1c = registered1c ? registrations.adapters[2]?.adapter?.options?.profiles().get('zcode') : null;
       const warnText = warnings.join(' ');
@@ -936,14 +1059,14 @@ async function assertRejects(promise, pattern, label) {
 
   writeFileSync(switchPath, JSON.stringify({ enabled: true }), 'utf8');
   const ctx2 = fakeCtx();
-  index.apply(ctx2, { switchPath, credentialPath: join(tmp, 'no-such-cred.json'), ledgerPath });
+  index.apply(ctx2, { switchPath, credentialPath: join(tmp, 'no-such-cred.json'), ledgerPath, credentialFallback: false });
   const failed = await waitFor(() => errors.length >= 1 && registrations.adapters.length === 0);
   const credFailureLogged = errors.some((e) => String(e).includes('provider 注册失败'));
   check('失败面: 凭据缺失 → 只报错不注册不炸', failed === true && credFailureLogged, errors[errors.length - 1]?.slice(0, 80));
 
   delete process.env.ZCODE_CONNECT_MODULES_ROOT;
   const ctx3 = fakeCtx();
-  index.apply(ctx3, { switchPath, credentialPath: credPath, ledgerPath });
+  index.apply(ctx3, { switchPath, credentialPath: credPath, ledgerPath, credentialFallback: false });
   const noModules = await waitFor(() => errors.some((e) => e.includes('宿主 LLM 栈不可用')));
   check('失败面: 宿主栈不可解析 → 可操作错误且不注册', noModules === true, errors.find((e) => e.includes('宿主 LLM 栈不可用'))?.slice(0, 80));
 }
@@ -980,7 +1103,7 @@ async function assertRejects(promise, pattern, label) {
   const byDataRole = (root, role) => findAllEls(root, (n) => n.type === 'input' && n.props?.['data-role'] === role);
   try {
     new Function(clientSource)(); // 执行信封 → load 被捕获（factory 不在此刻求值）
-    check('client: ModuleLoader 信封执行即交付 factory（id=包名）', !!loaded && typeof loaded.factory === 'function' && loaded.id === '@local/dsh-connect-zcode', `id=${loaded?.id ?? 'null'}`);
+    check('client: ModuleLoader 信封执行即交付 factory（id=包名）', !!loaded && typeof loaded.factory === 'function' && loaded.id === 'dsh-connect-zcode', `id=${loaded?.id ?? 'null'}`);
     const reactStub = {
       createElement: (type, props, ...children) => ({ type, props, children: children.flat(Infinity) }),
       useState: (init) => [typeof init === 'function' ? init() : init, () => {}],
@@ -1036,7 +1159,7 @@ async function assertRejects(promise, pattern, label) {
     check('client: apply 在服务缺失 stub ctx 下不抛且注册 bundle.config 卡（§0.3）', applyThrew === null && slotInjects.length === 1 && slotInjects[0].slotName === 'plugins.bundle.config', applyThrew?.message);
     slotInjects[0]?.registrar?.();
     const card = slotRegisters[0];
-    check('client: 卡 key = bundle 包名 + priority 30（slot 契约）', card?.desc?.key === '@local/dsh-connect-zcode' && card?.desc?.priority === 30 && card?.desc?.name === 'plugins.bundle.config', JSON.stringify(card?.desc ?? null));
+    check('client: 卡 key = bundle 包名 + priority 30（slot 契约）', card?.desc?.key === 'dsh-connect-zcode' && card?.desc?.priority === 30 && card?.desc?.name === 'plugins.bundle.config', JSON.stringify(card?.desc ?? null));
     check('client: 卡组件为函数（React 函数组件，无构建链）', typeof card?.component === 'function');
 
     const scope = { getSnapshot: () => ({ status: 'unavailable', value: void 0, writable: false }), subscribe: () => () => {}, set: async () => false };
@@ -1107,6 +1230,63 @@ async function assertRejects(promise, pattern, label) {
   }
 }
 
+/* 归还 console（本段开头替换过；DE-04 断言已在上面消费完 warns/logs）。 */
+console.warn = REAL_WARN;
+console.log = REAL_LOG;
+
+/* client 半是 ModuleLoader 信封 bundle，**零静态 import** 是防拒启红线（T21），
+ * 因此 STATUS_PATH / STATIC_MODEL_IDS / CONTEXT_1M 只能以字面量副本存在。
+ * 但"不能共享"不等于"不能守卫"：在此之前三个副本**没有任何一致性断言**，
+ * 漂移即静默失效，且三种后果都不报错：
+ *   - STATUS_PATH 改一边 → 面板 fetch 404（有降级提示，尚可排查）；
+ *   - STATIC_MODEL_IDS 改一边 → 降级视图与实际目录不一致；
+ *   - CONTEXT_1M 最危险 → 面板写入值 ≠ host 比对的官方 maxContextWindow
+ *     ⇒ 用户勾了 1M 但 contextWindow 仍是 200000，**无任何提示**。
+ * 故此处用源码级字符串断言把三处钉死（client.js 无法 import，只能读源码比对）。 */
+{
+  const clientSrc = readFileSync(join(PLUGIN_ROOT, 'lib', 'client.js'), 'utf8');
+  const norm = (s) => s.replace(/["'\s]/g, '');
+
+  // ① STATUS_PATH 与 host 半 ZCODE_STATUS_PATH 一致
+  const hostStatusPath = webStatus.ZCODE_STATUS_PATH;
+  check(
+    'DE-10 守卫: client STATUS_PATH 与 host ZCODE_STATUS_PATH 同值',
+    norm(clientSrc).includes(`STATUS_PATH=${hostStatusPath}`),
+    `host=${hostStatusPath}`
+  );
+
+  // ② client 的 STATIC_MODEL_IDS 与 host GLM53_FAMILY 深比对（逐项 + 顺序）
+  const m = clientSrc.match(/STATIC_MODEL_IDS\s*=\s*(\[[^\]]*\])/);
+  let clientIds = null;
+  try {
+    clientIds = m ? JSON.parse(m[1]) : null;
+  } catch {
+    clientIds = null;
+  }
+  check(
+    'DE-10 守卫: client STATIC_MODEL_IDS 与 host GLM53_FAMILY 逐项同值同序',
+    Array.isArray(clientIds) && JSON.stringify(clientIds) === JSON.stringify(modelMeta.GLM53_FAMILY),
+    `client=${JSON.stringify(clientIds)} host=${JSON.stringify(modelMeta.GLM53_FAMILY)}`
+  );
+
+  // ③ CONTEXT_1M 与官方 meta 声明的 Max 档一致（官方值一变，面板写入就静默失效）
+  const officialContext = fixtureModels()['GLM-5.3']?.limit?.context;
+  check(
+    'DE-10 守卫: client CONTEXT_1M 等于官方 limit.context（否则 1M 勾选静默失效）',
+    norm(clientSrc).includes(`CONTEXT_1M=${officialContext}`) && officialContext === 1000000,
+    `client 声明 1000000 / 官方 fixture ${officialContext}`
+  );
+
+  // ④ 跨半命名空间常量：client 的精确分支必须等于 patch 里的 entry id（R-17）
+  const patchSrc = readFileSync(join(PLUGIN_ROOT, 'cordis.patch.yml'), 'utf8');
+  const patchId = patchSrc.match(/^\s*-?\s*id:\s*(\S+)/m)?.[1];
+  check(
+    'DE-10 守卫: client NS_EXACT 等于 cordis.patch.yml 的 entry id（R-17 精确命中）',
+    typeof patchId === 'string' && norm(clientSrc).includes(`NS_EXACT=${patchId}`),
+    `patch id=${patchId}`
+  );
+}
+
 // ─── 8. 零明文终扫（§3.5-4） ─────────────────────────────────────────────────
 {
   const zhipuKey = /[0-9a-f]{32}\.[A-Za-z0-9]{16}/;
@@ -1122,6 +1302,22 @@ async function assertRejects(promise, pattern, label) {
     }
   })(PLUGIN_ROOT);
   check('零明文: 产物全目录 zhipu key 正则 0 命中', offenders.length === 0, offenders.join(';'));
+
+  /* 文档断言数漂移守卫（2026-10-06）：README 曾写 113/113、TROUBLESHOOTING 曾写 140 断言，
+   * 而实际是 146 —— 三处三个值且无人发现。现在文档改为"不要写死"，本条守卫**禁止**再出现
+   * 写死的 `SELFCHECK PASS：N/N` 字样（除非与当前断言数一致）。 */
+  {
+    const docHardcoded = [];
+    for (const rel of ['README.md', 'TROUBLESHOOTING.md']) {
+      const text = readFileSync(join(PLUGIN_ROOT, rel), 'utf8');
+      for (const m of text.matchAll(/SELFCHECK PASS[：:]\s*(\d+)\/(\d+)/g)) {
+        if (m[1] !== m[2] || Number(m[1]) !== results.length) docHardcoded.push(`${rel}: ${m[0]}`);
+      }
+      // 形如 "N 断言" / "N/M，exit 0" 的写死计数
+      for (const m of text.matchAll(/(\d{2,4})\s*断言/g)) docHardcoded.push(`${rel}: ${m[0]}`);
+    }
+    check('文档: 不写死自检断言数（防与实现漂移）', docHardcoded.length === 0, docHardcoded.join('; '));
+  }
 
   /* 主题安全（2026-10-01 真机实证修复，pitfalls §10.8）：
    * 深色主题下曾出现"白底卡片 + 低对比正文"——根因是 CSS 用了**不存在的 token 名**
