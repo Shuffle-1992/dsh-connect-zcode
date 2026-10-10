@@ -867,6 +867,14 @@ async function assertRejects(promise, pattern, label) {
       bogus.length === 0,
       bogus.length ? `不存在的方法: ${bogus.join(', ')}（会导致静默降级→DSH status=unsupported）` : `used=${[...used].join(',')}`
     );
+    /* 默认推理档的**自动判定**必须真的接在 profile 构造与目录重导两处
+     * （只写函数不接线 = 选择器里的 "Default" 项照旧）。 */
+    check(
+      '默认推理档: 自动判定接在 profile 构造 + 目录重导两处（panel 保存后即时重算）',
+      (src.match(/resolveDefaultReasoningEffort\(cfg\.defaultReasoningEffort, models\)/g) ?? []).length === 2 &&
+        /applyDefaultReasoningEffort\(profile,/.test(src) &&
+        /delete profile\.reasoning/.test(src)
+    );
   }
 
   const registrations = { adapters: [], discoveries: [], directories: [], createProviderInputs: (globalThis.__zcodeCreateProviderInputs = []) };
@@ -1057,6 +1065,33 @@ async function assertRejects(promise, pattern, label) {
           warnText.includes("defaultReasoningEffort='max'") &&
           warnText.includes('glm-5.3-flash'),
         `reasoning=${prof1c?.reasoning} warn=${warnText.slice(0, 120)}`
+      );
+      /* 自动判定（配置 'none' = 自动）：目标是不让选择器再补 "Default" 项，同时不让不支持该档
+       * 的模型请求硬失败 ⇒ **只在"当前暴露模型全都支持"时才设**（从强到弱取第一个）。 */
+      const effortModel = (reasoning, map) => ({ reasoning, thinkingLevelMap: map });
+      const supportAll = [
+        effortModel(true, { low: 'light', high: 'high', max: 'high' }),
+        effortModel(true, { low: 'light', high: 'high', max: 'high' }),
+      ];
+      const withNonReasoning = [...supportAll, effortModel(false, {})];
+      const highCeiling = [effortModel(true, { low: 'light', high: 'high', max: null })];
+      check(
+        '推理档: 自动档判定（全支持→最强；混入非推理/该档为空→不设；显式配置优先；空目录→不设）',
+        JSON.stringify(index.resolveDefaultReasoningEffort('none', supportAll)) ===
+          JSON.stringify({ level: 'max', reason: 'auto-all-support' }) &&
+          JSON.stringify(index.resolveDefaultReasoningEffort('none', withNonReasoning)) ===
+            JSON.stringify({ level: 'none', reason: 'auto-unsafe' }) &&
+          JSON.stringify(index.resolveDefaultReasoningEffort('none', highCeiling)) ===
+            JSON.stringify({ level: 'high', reason: 'auto-all-support' }) &&
+          JSON.stringify(index.resolveDefaultReasoningEffort('none', [])) ===
+            JSON.stringify({ level: 'none', reason: 'auto-no-models' }) &&
+          JSON.stringify(index.resolveDefaultReasoningEffort('low', withNonReasoning)) ===
+            JSON.stringify({ level: 'low', reason: 'configured' }),
+        JSON.stringify([
+          index.resolveDefaultReasoningEffort('none', supportAll),
+          index.resolveDefaultReasoningEffort('none', withNonReasoning),
+          index.resolveDefaultReasoningEffort('none', highCeiling),
+        ])
       );
     } finally {
       console.warn = origWarn;
@@ -1676,7 +1711,7 @@ async function assertRejects(promise, pattern, label) {
       appServerInjectAccount: false, appServerRpcTimeoutMs: 5000, appServerTurnTimeoutMs: 20000,
       childEnvAllow: [], contextWindow: 1000000,
     };
-    const makeScriptClient = (script) => {
+    const makeScriptClient = (script, { contextUsed = 1234, readFails = false } = {}) => {
       const listeners = new Set();
       const calls = [];
       return {
@@ -1686,7 +1721,10 @@ async function assertRejects(promise, pattern, label) {
         async request(method, params) {
           calls.push({ method, params });
           if (method === 'session/create') return { session: { sessionId: 'sess-block' } };
-          if (method === 'session/read') return { projection: { contextUsed: 1234, contextWindow: 1000000 } };
+          if (method === 'session/read') {
+            if (readFails) throw new Error('session/read 故意失败');
+            return { projection: { contextUsed, contextWindow: 1000000 } };
+          }
           if (method === 'session/send') {
             queueMicrotask(() => {
               for (const event of script) for (const listener of listeners) listener({ method: 'session/event', params: event });
@@ -1709,6 +1747,7 @@ async function assertRejects(promise, pattern, label) {
       for await (const chunk of adapter.stream({
         provider: 'zcode-appserver', model: 'GLM-5.2', sessionId: opts.sessionId ?? 's1',
         ...(opts.effort === undefined ? {} : { reasoningEffort: opts.effort }),
+        ...(opts.purpose === undefined ? {} : { purpose: opts.purpose }),
         messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
       })) chunks.push(chunk);
       adapter.dispose();
@@ -1761,6 +1800,58 @@ async function assertRejects(promise, pattern, label) {
       JSON.stringify(appendEnds.map((c) => [c.block.type, c.block.text])) ===
         JSON.stringify([['reasoning', '只有思考'], ['text', '最终答案']]),
       JSON.stringify(appendEnds.map((c) => [c.block.type, c.block.text]))
+    );
+
+    /* ⑥ usage 只在**可信**时下发（2026-10-11 真机事故：一次 561 秒未落定的回合让弹窗从 40%
+     *   掉到 0% —— 宿主 tokenMeter 把 usage 当 contextPressure 锚点，报 0 等于清零占用）。
+     *   中止回合的正确做法：改用 CLI 的**按次上下文**当锚点（真实读数，能自愈）；读不到则不发。 */
+    const cancelledChunks = await runScript(
+      makeScriptClient([
+        { type: 'model.streaming', payload: { kind: 'text_delta', delta: '半截' } },
+        { type: 'turn.completed', payload: { response: '半截', resultType: 'cancelled', usage: { inputTokens: 700, outputTokens: 3, modelRequestCount: 2 } } },
+      ]),
+      cfgBlock
+    );
+    const cancelledUsage = cancelledChunks.find((c) => c.type === 'usage')?.usage;
+    check(
+      'appserver: 回合未落定 ⇒ 用 CLI 按次上下文当锚点（不报 0；能把被清零的占用自愈回来）',
+      JSON.stringify(cancelledUsage) === JSON.stringify({ inputTokens: 1234, outputTokens: 0 }) &&
+        cancelledChunks.some((c) => c.type === 'finish'),
+      JSON.stringify(cancelledUsage)
+    );
+    const cancelledNoProbe = await runScript(
+      makeScriptClient(
+        [{ type: 'turn.completed', payload: { response: '', resultType: 'failed' } }],
+        { readFails: true }
+      ),
+      cfgBlock
+    );
+    check(
+      'appserver: 回合未落定且读不到按次上下文 ⇒ 一个 usage 块都不发（宁缺勿错）',
+      !cancelledNoProbe.some((c) => c.type === 'usage'),
+      JSON.stringify(cancelledNoProbe.filter((c) => c.type === 'usage'))
+    );
+    const zeroChunks = await runScript(
+      makeScriptClient([
+        { type: 'model.streaming', payload: { kind: 'text_delta', delta: 'ok' } },
+        { type: 'turn.completed', payload: { response: 'ok', resultType: 'success', usage: { inputTokens: 0, outputTokens: 0, modelRequestCount: 1 } } },
+      ]),
+      cfgBlock
+    );
+    check(
+      'appserver: 全零 usage ⇒ 不发 usage 块（零值会把上下文压力锚点清零）',
+      !zeroChunks.some((c) => c.type === 'usage'),
+      JSON.stringify(zeroChunks.filter((c) => c.type === 'usage'))
+    );
+    const titleChunks = await runScript(
+      makeScriptClient([done('unused')]),
+      cfgBlock,
+      { purpose: 'session-title' }
+    );
+    check(
+      'appserver: 本地生成的会话标题不发 usage 块（无真实上游用量，报 0 会清零锚点）',
+      !titleChunks.some((c) => c.type === 'usage') && titleChunks.some((c) => c.type === 'finish'),
+      JSON.stringify(titleChunks.filter((c) => c.type === 'usage'))
     );
 
     /* ⑤ 思考档真的下发给了 CLI：同一会话内换档 ⇒ 重发 session/setModel

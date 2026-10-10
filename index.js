@@ -261,9 +261,10 @@ async function loadConfig() {
          * （provider 消失、状态路由 404）。见 TROUBLESHOOTING §2.8。 */
         .union(['none', 'low', 'high', 'max'])
         .default('none')
-        .description('默认推理档（profile.reasoning）：设为 low/high/max 后，模型切换后选择器初始显示该档、未手动选档时按该档发送。' +
-          '⚠️ 只在"本 provider 全部启用模型都支持该档"时才能开：不支持该档的模型（如未开推理开关的 FlashX）会直接请求失败' +
-          '（dsh-llm-pi-ai :1848 无条件校验、:1705 throw，且无档位控件可救）。none = 不设（现状，最安全）。手动选档始终优先。'),
+        .description('默认推理档（profile.reasoning）。none = **自动**（2026-10-11 起）：当前暴露的模型全都支持同一档时自动取最强档（优先 max→high→low），' +
+          '从而去掉选择器里那个多余的 "Default" 项；只要有任一暴露模型不支持，就退回不设（安全）。' +
+          '显式设 low/high/max = 强制该档（知情选择；不支持该档的模型如未开推理开关的 FlashX 会直接请求失败' +
+          '（dsh-llm-pi-ai :1848 无条件校验），启动期守卫会列出受影响模型）。手动选档始终优先。'),
       // 面板写入目标字段，必须 volatile（见 asVolatile 注释）；空 = 全部显示。
       enabledModelIds: asVolatile(
         z.array(z.string()).default([]).description('模型显隐勾选（设置面板写入）；空 = 全部显示')
@@ -355,6 +356,68 @@ const INERT_AUTH = {
     },
   },
 };
+
+/**
+ * 自动默认推理档的候选（从强到弱）：只挑**当前暴露模型全都支持**的那一档。
+ */
+const AUTO_DEFAULT_REASONING_CANDIDATES = ['max', 'high', 'low'];
+
+/**
+ * 计算 Coding Plan 通道的**生效默认推理档**（`profile.reasoning`）。
+ *
+ * ## 为什么需要它（用户实测：选择器里多一个 `Default` 项）
+ * 宿主源码取证：
+ * - `dsh-llm-pi-ai` 的 `reasoningInfo(model, defaultLevel)` 在 `defaultLevel === undefined` 时
+ *   **省略** `defaultEffort`；前端（`dsh-acp`：`info.reasoning.defaultEffort === void 0`）
+ *   于是补一个 "Provider default" 项 —— 就是用户看到的那个多余的 `Default`。
+ * - 而 `defaultLevel` **只能来自 provider profile**（没有 per-model 口子）；一旦设了它，
+ *   不支持该档的模型（非推理模型 / 该档 `thinkingLevelMap` 为空）会在**请求期硬失败**
+ *   （`dsh-llm-pi-ai` :1848 无条件校验）。
+ *
+ * ⇒ 策略：用户显式配置优先（知情选择，启动期守卫会列出受害者）；否则**只在当前暴露的
+ * 每个模型都支持同一档时**自动设（从强到弱取第一个），否则保持不设（`none` = 安全）。
+ * 「当前暴露」= 已勾选进目录的模型（与选择器里能选到的集合一致）。
+ *
+ * @param {'none'|'low'|'high'|'max'} configured 配置项 defaultReasoningEffort
+ * @param {readonly object[]} models 当前暴露的 pi 模型条目（含 `reasoning` / `thinkingLevelMap`）
+ * @returns {{level: string, reason: string}} `level==='none'` 表示不设
+ */
+export function resolveDefaultReasoningEffort(configured, models) {
+  if (typeof configured === 'string' && configured !== '' && configured !== 'none') {
+    return { level: configured, reason: 'configured' };
+  }
+  const list = (Array.isArray(models) ? models : []).filter((m) => m !== null && typeof m === 'object');
+  if (list.length === 0) return { level: 'none', reason: 'auto-no-models' };
+  for (const level of AUTO_DEFAULT_REASONING_CANDIDATES) {
+    const everyModelSupports = list.every((model) => {
+      if (model.reasoning !== true) return false;
+      const mapped = model.thinkingLevelMap?.[level];
+      return mapped !== null && mapped !== undefined;
+    });
+    if (everyModelSupports) return { level, reason: 'auto-all-support' };
+  }
+  return { level: 'none', reason: 'auto-unsafe' };
+}
+
+/** 把生效默认档写进 profile（`none` = **删掉字段**：pi-ai 靠"字段在场"判定 defaultLevel）。 */
+function applyDefaultReasoningEffort(profile, decision) {
+  if (decision.level === 'none') delete profile.reasoning;
+  else profile.reasoning = decision.level;
+}
+
+/** 决策留痕：只有"自动"路径出声（显式配置由启动期守卫负责告警）。 */
+function logDefaultReasoningEffort(decision) {
+  if (decision.reason === 'auto-all-support') {
+    console.info(
+      `[dsh-connect-zcode] 默认推理档自动设为 '${decision.level}'（当前暴露模型全部支持）⇒ 选择器不再显示 "Default" 项`
+    );
+  } else if (decision.reason === 'auto-unsafe') {
+    console.info(
+      '[dsh-connect-zcode] 默认推理档未自动设置：当前暴露模型并非全部支持同一档 ⇒ 选择器会保留 "Default" 项' +
+        '（不设 = 安全：设了会让不支持该档的模型请求失败）。'
+    );
+  }
+}
 
 /**
  * 目录事实行 → pi-ai 模型条目（形状对齐 trae toPiModel :380-396）：
@@ -599,20 +662,21 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
     getModels: () => models, // trae :421 同款覆写：目录以闭包内静态表为准（勾选变化时整体换数组）
   };
 
+  const defaultEffortDecision = resolveDefaultReasoningEffort(cfg.defaultReasoningEffort, models);
+  logDefaultReasoningEffort(defaultEffortDecision);
   const profile = {
     provider: PROVIDER_ID,
     displayName: DISPLAY_NAME,
     streamIdleTimeoutMs: STREAM_IDLE_TIMEOUT_MS,
     ...(mods.resolveRetryPolicy ? { retryPolicy: mods.resolveRetryPolicy(undefined, 'dsh-connect-zcode retryPolicy') } : {}),
     /* 默认推理档（dsh-llm-pi-ai :1820/:1852）：
-     * - catalog 的 defaultEffort = profile.reasoning（模型支持时）→ 选择器切换模型后显示此档而非 "default"；
+     * - catalog 的 defaultEffort = profile.reasoning（模型支持时）→ 选择器不再补 "Default" 项；
      * - 实际请求 effort = 用户手动选择 ?? profile.reasoning → 未手动选档时按此档发送。
      * ⚠️ provider 级静态档在"混合推理/非推理模型"的 provider 上不安全：不支持该档的模型
      *   在 :1848 被无条件校验、:1705 throw，且选择器对无推理元数据的模型不给档位控件（无法自救）。
-     *   因此默认 'none'（不设，零回归）；显式配置 = 用户知情接受该代价（description 已警示）。
-     * deepseek 系"记住档位"的机制就是它配了 profile.reasoning —— 并非按模型记忆，
-     * DSH 选择器只有单一 current，本就不存 per-model 选择（2026-10-01 反编译实证）。 */
-    ...(cfg.defaultReasoningEffort === 'none' ? {} : { reasoning: cfg.defaultReasoningEffort }),
+     *   ⇒ 默认走 `resolveDefaultReasoningEffort` 的**自动**判定：只有当前暴露模型全都支持
+     *   同一档时才设，否则不设（'none'，零回归）。用户显式配置优先。 */
+    ...(defaultEffortDecision.level === 'none' ? {} : { reasoning: defaultEffortDecision.level }),
     /* 图片请求预算（必需，见 REQUEST_IMAGE_BUDGETS 注释）：缺了它带图请求会抛
      * 「Image request width must be a positive integer.」——trae :428 同款展开。 */
     ...REQUEST_IMAGE_BUDGETS,
@@ -848,6 +912,15 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
           // 目录整体重建（官方元数据现读 + 用户预算/开关/勾选活读）。
           state.lastCatalog = baseCatalog();
           models = buildModelEntries(boot.baseURL, state.lastCatalog, readUserCfg());
+          /* 目录变了 ⇒ **必须同步重算** provider 默认档：面板里新勾上的模型若不支持当前档位，
+           * 要当场退回不设（否则它的请求会硬失败，且非重启不可救）。 */
+          const nextEffort = resolveDefaultReasoningEffort(cfg.defaultReasoningEffort, models);
+          if (nextEffort.level !== defaultEffortDecision.level) {
+            applyDefaultReasoningEffort(profile, nextEffort);
+            defaultEffortDecision.level = nextEffort.level;
+            defaultEffortDecision.reason = nextEffort.reason;
+            logDefaultReasoningEffort(nextEffort);
+          }
           try {
             provider.models = models; // 双保险：宿主若读属性而非 getModels 也拿到新目录
           } catch {

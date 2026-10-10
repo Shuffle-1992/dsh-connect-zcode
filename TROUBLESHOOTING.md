@@ -29,6 +29,8 @@
   - [2.10 agent 型通道的 usage 口径：回合聚合被当单次调用](#210-agent-型通道的-usage-口径把-cli-的回合聚合当单次调用上报--dsh-上下文占用虚高-n-倍)
   - [2.11 流式正文与思考同 index 混发 → 内容互相覆盖](#211-流式正文与思考同-index-混发--面板里内容互相覆盖最后被整体替换)
   - [2.12 pwsh 整文件编码往返写坏源码；未提交文件无法用 git 恢复](#212-用-pwsh-做整文件编码往返把源码写坏未提交的文件无法用-git-恢复)
+  - [2.13 provider 报「零 usage」会把上下文占用清零](#213-provider-报零-usage-会把上下文占用清零弹窗-0明细却有几万)
+  - [2.14 模型档位选择器里多出一个 `Default` 项](#214-模型档位选择器里多出一个-default-项)
 - [三、通用工程](#三通用工程)
   - [3.1 用 `fetch` 后调 `process.exit()` 会崩（Windows）](#31-用-fetch-后调-processexit-会崩windows)
   - [3.2 "换个位置就红"的测试是资产](#32-换个位置就红的测试是资产)
@@ -880,6 +882,78 @@ node $env:TEMP\restore\rebuild-merged.mjs rebuilt.js session-父.jsonl session-�
    的 node 脚本（`readFileSync(p,'utf8')` / `writeFileSync(p,s,'utf8')`）。
 2. **新建文件先做一次提交**（哪怕只本地、不推送）—— 未跟踪文件损坏 = 不可恢复。
 3. 大改动前用 `git status` 确认目标文件**已被跟踪**；`??` 就是"没有安全网"的信号。
+
+---
+
+### 2.13 provider 报「零 usage」会把上下文占用**清零**（弹窗 0%，明细却有几万）
+
+**现象**（2026-10-11 真机，用户在赠送额度通道上实测）：弹窗顶部「上下文已用 **0%** ~0 / 1M」，
+而**同一个弹窗**的启发式明细还有「对话消息 ~383K」；侧栏用量行仍报 40%。两者自相矛盾。
+
+**取证**（零额度，三个文件交叉）：
+
+```powershell
+# ① 插件账本：出现一行"未落定"的回合，input/output 都是 0
+Get-Content "$env:USERPROFILE\.dsh\zcode-runs.jsonl" | Select-Object -Last 3
+#   → {"…","input":0,"output":0,"exit":"app-server turn not settled","elapsedMs":561368}
+# ② DSH 自己的投影缓存：压力锚点被写成 0
+#   → contextPressure.val = {surfaceTokens:…, contextWindow:1000000, pressureTokens:0, …}
+```
+
+**根因**：宿主的 `dsh-token-meter` 把每次 assistant 消息的 usage 当
+`contextPressure` 的锚点（`pressureFrom(usage) = inputTokens + cacheReadTokens + cacheWriteTokens`）。
+适配器在"回合未落定"时**照样发了一个零值 usage 块** ⇒ 锚点被写成 0 ⇒ 占用显示 0%。
+（对照：不发 usage 时宿主退回自己的启发式估值，明细那 383K 就是它算出来的。）
+
+**修法**（`lib/app-server.js`）：
+
+| 场景 | 上报 |
+|---|---|
+| 回合落定且有真实读数 | 按 `deriveReportedUsage` 折算后上报（§2.10） |
+| 回合落定但全零 / CLI 没给 usage | **不发 usage 块**（宿主退回启发式估值） |
+| 回合**未落定**（中止 / 超时） | 读 CLI 的**按次上下文**（`session/read → projection.contextUsed`）当锚点 —— 它描述"最后一次完成的模型调用"，中止时仍是真实读数；**既能避免清零，也能把已被清零的锚点自愈** |
+| 未落定且读不到 | 不发 usage 块（宁缺勿错） |
+| 本地生成的会话标题（`purpose=session-title`） | 不发 usage 块（无真实上游用量） |
+
+自检侧用**假 transport 驱动真实 `stream()`**覆盖了这五种情形（usage 相关的 4 条断言：
+未落定→用按次上下文、未落定+读不到→不发、全零→不发、本地标题→不发）。
+
+> **通用教训**：**零不是"没有数据"**。任何会被下游当作"测量值"的字段，
+> "拿不到"必须表达成**缺席**（不产生该事件/字段），而不是 0 —— 0 是一个具体结论，
+> 下游会照它做决策（这里是"上下文占用 = 0"）。本仓库前后踩过两次同一个坑：
+> §2.10 是"虚高"（把 N 次调用的和当一次），本次是"归零"（把未知当 0）。
+
+---
+
+### 2.14 模型档位选择器里多出一个 `Default` 项
+
+**现象**（2026-10-11 真机）：选中 Coding Plan 的模型后，思考档下拉里第一项是 `Default`
+（勾选态），下面才是 Low / High / Max；用户要求去掉。
+
+**根因**（宿主源码取证，两层）：
+- `dsh-llm-pi-ai` 的 `reasoningInfo(model, defaultLevel)`：`defaultLevel === undefined` 时
+  **省略** `defaultEffort`；
+- 前端（`dsh-acp`）见 `info.reasoning.defaultEffort === void 0` 就补一项
+  `{ value: PROVIDER_DEFAULT_REASONING_VALUE, name: "Provider default" }` —— 就是那个 `Default`。
+- 而 `defaultLevel` **只能来自 provider profile**（`profile.reasoning`），**没有 per-model 口子**。
+
+**修法**（`index.js`）：让 `profile.reasoning` 由**自动判定**给出 —— `resolveDefaultReasoningEffort(configured, models)`：
+用户显式配置优先；否则**只在当前暴露（已勾选）的每个模型都支持同一档时**取最强档
+（`max → high → low` 依次试），否则不设（`none`）。这样：
+
+- 常见情况（只勾官方 5.3 模型，档位表里 low/high/max 都在）⇒ 自动设 `max` ⇒ **`Default` 项消失**，
+  且与 ZCode 官方 `defaultVariant=max` 一致；
+- 勾了非推理模型（如未开推理开关的 GLM-5.3-FlashX）⇒ 自动退回不设（否则它**请求期硬失败**，
+  见 `dsh-llm-pi-ai` 的无条件校验）；
+- 面板保存后 `loader/volatile-update` 里**同步重算**并改写 profile（不必重启才生效）。
+
+判据（两条都免重启）：启动日志里会打
+`默认推理档自动设为 'max'（当前暴露模型全部支持）⇒ 选择器不再显示 "Default" 项`；
+或 `默认推理档未自动设置：当前暴露模型并非全部支持同一档 ⇒ 选择器会保留 "Default" 项`。
+
+> **通用教训**：UI 上"多出来的一项"往往来自**某个字段缺席**（这里是 `defaultEffort`），
+> 而不是前端写死。定位路径 = 先在宿主包里搜该文案/常量，再顺藤摸到提供该字段的**唯一入口**
+> （provider profile），最后确认这个入口有没有 per-model 变体（本例没有 ⇒ 只能在 provider 级做取舍）。
 
 ---
 
