@@ -13,7 +13,7 @@
  * 纪律红线（T20 任务包）：
  * - 凭据零落盘、零缓存、每次调用现读 ~/.zcode/v2/config.json（lib/credential.js）；
  * - PROTOCOL §7.1：resolveApiKey 前先查派发总开关，关闭即抛可操作错误（套餐整体冻结）；
- * - PROTOCOL §5.2：每次请求（含失败）向 collab/logs/zcode-runs.jsonl 追加 channel=provider 行；
+ * - PROTOCOL §5.2：每次请求（含失败）向 collab/logs/dispatch-runs.jsonl 追加 channel=provider 行；
  * - 并发预算 N=2（config.maxConcurrent 上限 2，不自动升限）；
  * - 静态 import 只用 node: 内建与 ./lib/*（宿主包一律动态解析，Z13-1/ZB-01 坑）；
  * - client 半（T21）：面板勾选 enabledModelIds 控制模型显隐（空 = 全部显示），
@@ -248,7 +248,7 @@ async function loadConfig() {
         .description('并发预算上界（PROTOCOL §5.2 N=2）；升限须 Lead 批准并同步协议，本插件不自动升限'),
       credentialPath: z.string().default('').description('ZCode config.json 路径；留空 = ~/.zcode/v2/config.json'),
       switchPath: z.string().default(DEFAULT_SWITCH_PATH).description('派发总开关真值文件（PROTOCOL §7.1）；缺文件/损坏视为开启'),
-      ledgerPath: z.string().default(DEFAULT_LEDGER_PATH).description('额度台账 zcode-runs.jsonl（PROTOCOL §5.2，channel=provider 追加行）'),
+      ledgerPath: z.string().default(DEFAULT_LEDGER_PATH).description('额度台账 dispatch-runs.jsonl（PROTOCOL §5.2，channel=provider 追加行）'),
       credentialFallback: z
         .boolean()
         .default(true)

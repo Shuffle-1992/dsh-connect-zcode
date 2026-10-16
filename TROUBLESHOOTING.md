@@ -705,7 +705,7 @@ Select-String -Path "$env:USERPROFILE\.dsh\profiles\desktop\cordis.patch.yml" -P
 ```
 
 本例实证：status 报 `frozen=False`，而①指定的 switch 文件写着 `enabled:false`；
-台账写在 `~/.dsh/zcode-runs.jsonl` 而非①指定的项目路径 ⇒ **①整条是死的**。
+台账写在 `~/.dsh/dispatch-runs.jsonl` 而非①指定的项目路径 ⇒ **①整条是死的**。
 
 **修法**：
 1. 生效值写进**末尾**那条（谁在最后谁生效）；
@@ -744,7 +744,7 @@ Select-String -Path "$env:USERPROFILE\.dsh\profiles\desktop\cordis.patch.yml" -P
 
 ```powershell
 # ① 插件账本：单调用回合 vs 多调用回合的 input 差一个数量级
-Get-Content "$env:USERPROFILE\.dsh\zcode-runs.jsonl" | Select-String 'appserver' | Select-Object -Last 6
+Get-Content "$env:USERPROFILE\.dsh\dispatch-runs.jsonl" | Select-String 'appserver' | Select-Object -Last 6
 #    实测：117207 / 220089（与 rollout 里那一笔逐字相同）  vs  3871622（10 分钟长回合）
 
 # ② CLI 自己的**按次**记录（每次模型调用一条，含 provider usage）
@@ -761,7 +761,7 @@ Get-ChildItem "$env:USERPROFILE\.zcode\cli\rollout\model-io-*.jsonl" | Sort-Obje
 | 多调用 + 读不到 `contextUsed` | 各桶按 `modelRequestCount` 取**均值** | 轮内上下文单调增长 ⇒ 均值 ≤ 末次值：**宁可偏小，绝不虚高** |
 | `contextUsed > 回合聚合总量` | 不采信，退回均值 | 口径漂移护栏（防某版把 `contextUsed` 换成会话累计值） |
 
-账本 `~/.dsh/zcode-runs.jsonl` **仍记回合聚合**（真实消耗，多调用回合 = N 次之和），
+账本 `~/.dsh/dispatch-runs.jsonl` **仍记回合聚合**（真实消耗，多调用回合 = N 次之和），
 两者不混用；每轮日志会打一行 `usage 口径=<basis> … ⇒ 上报 DSH input=…` 供取证。
 
 **零额度验证 `session/read` 形状**（不发消息 ⇒ 不消耗额度）：
@@ -899,7 +899,7 @@ node $env:TEMP\restore\rebuild-merged.mjs rebuilt.js session-父.jsonl session-�
 
 ```powershell
 # ① 插件账本：出现一行"未落定"的回合，input/output 都是 0
-Get-Content "$env:USERPROFILE\.dsh\zcode-runs.jsonl" | Select-Object -Last 3
+Get-Content "$env:USERPROFILE\.dsh\dispatch-runs.jsonl" | Select-Object -Last 3
 #   → {"…","input":0,"output":0,"exit":"app-server turn not settled","elapsedMs":561368}
 # ② DSH 自己的投影缓存：压力锚点被写成 0
 #   → contextPressure.val = {surfaceTokens:…, contextWindow:1000000, pressureTokens:0, …}

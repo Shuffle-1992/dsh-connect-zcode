@@ -1,0 +1,13 @@
+﻿chore(ZB-41): 同步共享契约改名（派发台去品牌化）
+
+派发台（dsh-dispatch）本轮去品牌化改名，其中**开关真值文件与额度台账由本插件的
+provider 通道与派发台共用**（宿主 collab/PROTOCOL.md §7.1：关了开关两者一起冻结），
+故必须同步，否则两侧默认路径不一致会分裂成两份台账（额度统计静默出错）。
+
+- 默认 switchPath：~/.dsh/zcode-dispatch.switch.json → ~/.dsh/dispatch.switch.json
+- 默认 ledgerPath：~/.dsh/zcode-runs.jsonl → ~/.dsh/dispatch-runs.jsonl
+- README / TROUBLESHOOTING 引用同步
+
+本插件自身命名（dsh-connect-zcode / ZCODE_CONNECT_* 环境变量）保持不变 —— 它确实是 ZCode 的 provider 通道。
+部署路径由 profile patch 提供，已同步改为宿主 collab/dispatch.switch.json 与 collab/logs/dispatch-runs.jsonl。
+自检：SELFCHECK PASS 295/295。

@@ -140,8 +140,8 @@ node test/selfcheck.mjs     # 应输出 SELFCHECK PASS：N/N，exit 0（N 随断
 | `contextWindow` | `200000` | 基础上下文窗口（CLI 实测有效 200k；config 名义 1M 不默认采信，仅作官方 Max 档可选） |
 | `maxConcurrent` | `2` | 并发推理上界（1..2） |
 | `credentialPath` | 空 = `~/.zcode/v2/config.json` | ZCode 配置路径 |
-| `switchPath` | `~/.dsh/zcode-dispatch.switch.json` | 冻结开关真值文件（缺文件/损坏 = 开启） |
-| `ledgerPath` | `~/.dsh/zcode-runs.jsonl` | 额度台账（追加写） |
+| `switchPath` | `~/.dsh/dispatch.switch.json` | 冻结开关真值文件（缺文件/损坏 = 开启） |
+| `ledgerPath` | `~/.dsh/dispatch-runs.jsonl` | 额度台账（追加写） |
 | `enabledModelIds` | `[]` | **模型显隐勾选（设置面板写入）；空 = 全部显示**，非空 = 只显示列出的 id |
 | `contextBudgets` | `{}` | **上下文预算（T22，面板写入）**：模型 id → 官方 Max 档值（1000000）；缺省 = 200K |
 | `modelOverrides` | `{}` | **无官方数据模型的开关（T22，面板写入）**：`{reasoning?, image?}`；官方数据锁定的模型忽略此项 |

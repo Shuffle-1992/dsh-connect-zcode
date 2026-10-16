@@ -359,7 +359,7 @@ async function assertRejects(promise, pattern, label) {
 
 // ─── 3. 台账（§3.3） ─────────────────────────────────────────────────────────
 {
-  const ledgerPath = join(tmp, 'zcode-runs.jsonl');
+  const ledgerPath = join(tmp, 'dispatch-runs.jsonl');
   writeFileSync(ledgerPath, '{"ts":"2026-10-01T00:00:00.000Z","tag":"T0","billing":"zcode-plan","channel":"dispatch"}\n', 'utf8');
   cleanupFiles.push(ledgerPath);
   ledger.appendProviderRun({ model: 'glm-5.3', endpoint: 'https://example.test/api/anthropic', input: 10, output: 3, exit: 0, elapsedMs: 5 }, ledgerPath);
