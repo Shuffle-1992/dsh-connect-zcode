@@ -1754,12 +1754,74 @@ async function assertRejects(promise, pattern, label) {
     /* 服务可达性是本改动**收益的唯一前提**：插件 inject 只有 ['llm']，故必须用仓库既有
      * 软取惯例 ctx.get(name)（:713 attachments 同款），不能假设 ctx.<service> 可达。 */
     const indexSrcForWs = readFileSync(join(PLUGIN_ROOT, 'index.js'), 'utf8');
+    const appServerSrcForWs = readFileSync(join(PLUGIN_ROOT, 'lib', 'app-server.js'), 'utf8');
+    const wsSource = readFileSync(join(PLUGIN_ROOT, 'lib', 'session-workspace.js'), 'utf8');
     check(
-      'ZB-42: 会话目录服务用 ctx.get 软取（不硬 inject、不依赖 ctx.<service>）',
-      /ctx\.get\('workingDirectory'\)/.test(indexSrcForWs) &&
-        /ctx\.get\('agents'\)/.test(indexSrcForWs) &&
-        /wsResolveLogged/.test(indexSrcForWs),
-      'index.js 需同时出现 ctx.get(\'workingDirectory\')、ctx.get(\'agents\') 与 wsResolveLogged'
+      'ZB-42: 宿主侧只接线（createWorkspaceResolver/Tracker + ctx.get 软取），不硬 inject',
+      /createWorkspaceResolver\(/.test(indexSrcForWs) &&
+        /createWorkspaceTracker\(/.test(indexSrcForWs) &&
+        /getService: \(name\) => \(typeof ctx\.get === 'function'/.test(indexSrcForWs) &&
+        !/workingDirectory\.ensure/.test(indexSrcForWs),
+      '宿主不应自己调 workingDirectory 方法（那是 lib/session-workspace.js 的事）'
+    );
+    check(
+      'ZB-42 解耦: 优先级只在 session-workspace.js 实现（app-server.js 仅消费 pickWorkspace）',
+      /export function pickWorkspace/.test(wsSource) &&
+        /import \{ pickWorkspace \} from '\.\/session-workspace\.js'/.test(appServerSrcForWs) &&
+        !/appServerWorkspaceFollow === false/.test(appServerSrcForWs) &&
+        !/configured !== '' \? configured : homedir\(\)/.test(appServerSrcForWs),
+      'app-server.js 不应再自己判 follow/config 回退'
+    );
+
+    /* ── 纯函数表：pickWorkspace 优先级（离线可测，不碰宿主服务）────────────── */
+    const wsMod = await import('../lib/session-workspace.js');
+    const picked = [
+      ['follow=false ⇒ 配置钉死', wsMod.pickWorkspace({ follow: false, configured: 'C:\\pin', resolved: 'C:\\sess' }), 'C:\\pin', 'config-pinned'],
+      ['follow=true + 解析值 ⇒ 会话目录', wsMod.pickWorkspace({ follow: true, configured: 'C:\\cfg', resolved: 'C:\\sess' }), 'C:\\sess', 'session'],
+      ['解析值空白 ⇒ 回落配置', wsMod.pickWorkspace({ follow: true, configured: 'C:\\cfg', resolved: '   ' }), 'C:\\cfg', 'fallback'],
+      ['两者都无 ⇒ 用户主目录', wsMod.pickWorkspace({ follow: true }), homedir(), 'fallback'],
+    ];
+    for (const [label, got, wantPath, wantSource] of picked) {
+      check(`ZB-42 纯函数: ${label}`, got.path === wantPath && got.source === wantSource, `${got.path} / ${got.source}`);
+    }
+    const tracker = wsMod.createWorkspaceTracker();
+    tracker.update({ sessionId: 's1', path: 'C:\\a', source: 'session' });
+    tracker.update({ sessionId: 's1', path: 'C:\\b', source: 'fallback', reason: 'no-service' });
+    const snapWs = tracker.snapshot();
+    check(
+      'ZB-42 tracker: 记录最近一次决策与累计计数（状态文档/真机判据都靠它）',
+      snapWs.lastPath === 'C:\\b' &&
+        snapWs.lastSource === 'fallback' &&
+        snapWs.lastReason === 'no-service' &&
+        snapWs.sessionResolutions === 1 &&
+        snapWs.fallbacks === 1,
+      j(snapWs)
+    );
+    check(
+      'ZB-42: 状态文档暴露 workspace 留痕（真机判据的观测点）',
+      /deps\.workspace/.test(readFileSync(join(PLUGIN_ROOT, 'lib', 'web-status.js'), 'utf8')) &&
+        /workspace: \(\) => workspaceTracker\.snapshot\(\)/.test(indexSrcForWs)
+    );
+
+    /* ── 压缩交互（/compact）语义：指纹变化 ⇒ 重建（纯函数层离线断言）────────── */
+    const fpBase = [{ role: 'user', content: [{ type: 'text', text: 'a' }] }];
+    check(
+      '压缩交互: 追加消息 ⇒ 指纹变化（应触发重建 + 首轮重放）',
+      appServer.conversationFingerprint(fpBase, 'sys') !==
+        appServer.conversationFingerprint([...fpBase, { role: 'assistant', content: [{ type: 'text', text: 'b' }] }], 'sys')
+    );
+    check(
+      '压缩交互: 同输入 ⇒ 指纹稳定（不该误重建）',
+      appServer.conversationFingerprint(fpBase, 'sys') === appServer.conversationFingerprint(fpBase, 'sys')
+    );
+    check(
+      '压缩交互: 前缀/系统提示被改写（压缩、编辑历史）⇒ 指纹变化',
+      appServer.conversationFingerprint(fpBase, 'sys') !== appServer.conversationFingerprint(fpBase, 'sys-compacted') &&
+        appServer.conversationFingerprint(fpBase, 'sys') !== appServer.conversationFingerprint([], 'sys')
+    );
+    check(
+      '压缩交互: 重建日志点明常见诱因与一次性成本（可诊断）',
+      /\/compact 压缩/.test(appServerSrcForWs) && /全量重放/.test(appServerSrcForWs)
     );
   }
 

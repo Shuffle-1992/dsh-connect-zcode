@@ -164,7 +164,9 @@ node scripts/compat-check.mjs --self-test          # 只跑内置 semver 自测
 
 | 优化 | 用的新能力 | 行为变化与验证 |
 |---|---|---|
-| **app-server 会话工作目录跟随** | `working_directory` 服务（0.2.1 新增工具 + SDK 会话目录接口） | 旧行为恒用 `homedir()`（ZCode agent 在用户主目录跑、启动扫目录树，与 DSH 会话看到的目录不是同一个）；现在**默认跟随当前会话目录**，模型用 `working_directory` 工具中途改目录也跟随（此时重建 app-server 会话）。落地日志：`新建 app-server 会话 <id>（工作目录 <路径>）`、`[dsh-connect-zcode] 会话工作目录解析：session=… → …`；若后者打印 `(服务不可达/未取到 ⇒ 回落配置目录)` 说明宿主没暴露该服务。可用 `appServerWorkspaceFollow: false` 钉回固定目录。 |
+| **app-server 会话工作目录跟随** | `working_directory` 服务（0.2.1 新增工具 + SDK 会话目录接口） | 旧行为恒用 `homedir()`（ZCode agent 在用户主目录跑、启动扫目录树，与 DSH 会话看到的目录不是同一个）；现在**默认跟随当前会话目录**，模型用 `working_directory` 工具中途改目录也跟随（此时重建 app-server 会话）。落地日志：`新建 app-server 会话 <id>（工作目录 <路径>，来源 session/config-pinned/fallback）`；状态文档新增 `workspace` 字段（最近一次决策 + 计数，**不含凭据**）—— 这是判断"服务是否真的可达"的运行时观测点。可用 `appServerWorkspaceFollow: false` 钉回固定目录。 |
+| **压缩/历史改写的成本可见** | —— | app-server 通道下，任何改变会话历史的操作（手动 **`/compact`**、编辑或回退历史、恢复草稿）都会让**下一轮重建会话并按首轮全量拍平重放**（实测单会话可达 ~880KB 文本）——**一次性尖峰，不是故障**。日志已点明诱因与条数：`检测到会话历史变化（常见于 /compact 压缩…）⇒ 重建 app-server 会话并按首轮全量重放（本轮 messages=N 条…）`。 |
+| **热重载（迭代提速）** | `hmr` 服务（`include:hmr` 已激活，含 `hmr/reload`/`hmr/change` 事件与 `getLinked`/`reconcileProfile`） | 本插件是 **junction 链接**的本地插件，属其 "linked" 范畴 ⇒ host 半边改动**理论上免重启**；**实证未做**（本会话无法驱动 GUI：插件状态路由只在内嵌端口且需 DSH 连接鉴权）——请在 GUI 里验证一次：改一行 host 日志 → 看面板「状态」区是否立即刷新（client 半边是手写预构建 bundle，需 `pnpm run dev:web` 才会自动重建）。**不改代码也有保证**：`test/selfcheck.mjs` 离线覆盖逻辑、`scripts/compat-check.mjs` 覆盖声明兼容性。 |
 
 > 逐条候选评估（含**明确不做**的项：Session 状态记录、密钥脱敏、pi-ai 工具动态增删…）见 [`DSH-0.2.1-COMPAT-REVIEW.md`](./DSH-0.2.1-COMPAT-REVIEW.md) §G。
 

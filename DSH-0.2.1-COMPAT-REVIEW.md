@@ -120,6 +120,15 @@ entryId: include:zcode-connect  moduleName: dsh-connect-zcode  enabled: true  fi
 | 真机验证（待做） | 新会话启动日志应出现 `新建 app-server 会话 <id>（工作目录 <路径>）`；首轮解析留痕 `[dsh-connect-zcode] 会话工作目录解析：session=… → …`。若打印 `(服务不可达/未取到 ⇒ 回落配置目录)` ⇒ 宿主未暴露该服务，需查 `ctx.get('workingDirectory')` 可达性 |
 | 未验证 | ①`ctx.get('agents')`/`ctx.get('workingDirectory')` 在本插件（`inject=['llm']`）下的**真实可达性**（自检用 stub 证明逻辑正确，但证明不了可达性）；②目录变化即重建会话会丢 agent 侧上下文（设计取舍，已在日志明示） |
 
+**第二批（同日）：解耦 / 简化 / 压缩交互可诊断 / 热重载核查**
+
+| 项 | 内容 | 验证 |
+|---|---|---|
+| **解耦：抽出 `lib/session-workspace.js`** | 原先"优先级"有两份实现（`index.js` 闭包判 `follow`+回落、`lib/app-server.js` 的 `_resolveSessionWorkspace` 又抄一份）。现在：**优先级只有一份纯函数**（`pickWorkspace`）、**宿主服务访问只有一份**（`createWorkspaceResolver`，软取 + 可注入 `getService`）、**留痕只有一份**（`createWorkspaceTracker`）；适配器只消费注入的 resolver 与纯函数，不认识 Cordis。 | 结构核对：模块仅 `import node:os`，无 `ctx.`/Cordis；`index.js` 不再直接调 `workingDirectory.*`；`selfcheck` 增加"优先级只在模块实现""宿主只接线"两条静态断言 |
+| **可观测：状态文档新增 `workspace`** | 把工作目录的**最终决策**（路径 / 来源 `session`\|`config-pinned`\|`fallback` / 计数 / 时刻）回报宿主并进入状态文档 —— 这是运行时判断"`ctx.get('workingDirectory')` 到底可不可达"的**唯一**观测点。不含凭据、不缓存目录内容 | `selfcheck`：tracker 计数/最近决策断言 + 状态文档字段断言 |
+| **压缩交互（0 风险版）** | app-server 通道下，任何改变历史的操作（**`/compact`**、编辑/回退、恢复草稿）都会让下一轮**重建会话 + 首轮全量拍平重放**（实测单会话 ~880KB）。原先日志只说"历史变化"；现在**点明常见诱因 + 本轮条数 + 属一次性成本尖峰** | `selfcheck`：`conversationFingerprint` 三态语义断言（追加/同输入/前缀或系统提示被改写）+ 日志文案断言 |
+| **热重载核查** | 事实：0.2.1-rc.2 激活了 `@deepseek-ai/dsh-hmr`（`include:hmr` active），其服务面含 `watchConfig`/`getLinked`/`reconcileProfile`，事件含 `hmr/reload`/`hmr/change`；本插件为 junction 链接（`ReparsePoint`）⇒ 属 linked 范畴。**实证未完成**：插件状态路由只挂内嵌端口（50818/50819）且需 DSH 连接鉴权（外部请求 401），GUI 本会话无法驱动、desktop 无可读插件日志 | 标为**未验证**；给出 GUI 复跑步骤（改一行 host 日志 → 看面板状态区是否即时刷新；client 半边需 `pnpm run dev:web`） |
+
 **独立复核结论（另一只读分析，2026-10-17）——候选逐条：**
 
 | 候选 | 结论 | 理由 |

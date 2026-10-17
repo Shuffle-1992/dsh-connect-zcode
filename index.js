@@ -54,6 +54,8 @@ import {
   applyContextBudgets,
 } from './lib/model-meta.js';
 import { ZCODE_STATUS_PATH, originIsLoopback, hostIsLoopback, readLastLedgerRow, buildStatusDocument, writeJson } from './lib/web-status.js';
+/* ZB-42：会话工作目录解析（宿主服务软取）与留痕 —— 逻辑在模块里，宿主只负责接线。 */
+import { createWorkspaceResolver, createWorkspaceTracker } from './lib/session-workspace.js';
 import { Semaphore, instrumentApi } from './lib/api-instrument.js';
 
 const NS = 'zcode';
@@ -591,6 +593,8 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
   const baseCatalog = () => staticCatalog(readMeta(), cfg.contextWindow);
   // 目录快照（过滤前全量，供面板重勾）；发现失败/冻结期回静态表。
   const state = { registered: false, lastCatalog: baseCatalog() };
+  /* ZB-42：app-server 会话工作目录的解析留痕（状态文档/日志可读；不含凭据、不缓存目录内容）。 */
+  const workspaceTracker = createWorkspaceTracker();
   // 发现回调 / 冻结期回退的输出：目录事实行 + 用户配置 → 发现行形状（trae :4436-4441 同款）。
   const discoveredFor = (catalog) => applyUserConfig(catalog, readUserCfg()).map(toDiscoveredRow);
   /* 赠送额度通道的目录行：与 Coding Plan 行**并列**返回（模型 id 不重叠）。
@@ -861,8 +865,6 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
           }
           return out;
         };
-        /* 一次性留痕开关：真机排查"到底有没有跟随会话目录"看这一行（见 resolveWorkspace）。 */
-        let wsResolveLogged = false;
         const appServerAdapter = createAppServerAdapter({
           BaseAdapter: mods.LlmAdapter,
           LlmError: mods.LlmError,
@@ -886,31 +888,14 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
            * `working_directory` 服务。**软取**（与 :713 的 attachments 同款 `ctx.get`）：
            * 服务缺席时返回 undefined，由适配器回落配置目录，不扩大启动失败面。
            * 收益：ZCode agent 与 DSH 会话在同一个目录里工作，并跟随模型用内置
-           * `working_directory` 工具中途改目录（旧行为恒用 homedir()）。 */
-          resolveWorkspace: async (sessionId) => {
-            try {
-              const agents = typeof ctx.get === 'function' ? ctx.get('agents') : ctx.agents;
-              const workingDirectory = typeof ctx.get === 'function' ? ctx.get('workingDirectory') : ctx.workingDirectory;
-              const agent = agents?.get?.(sessionId);
-              if (agent === undefined) return undefined;
-              const resolved =
-                typeof workingDirectory?.ensure === 'function'
-                  ? await workingDirectory.ensure(agent)
-                  : typeof workingDirectory?.get === 'function' && agent.session !== undefined
-                    ? workingDirectory.get(agent.session)
-                    : undefined;
-              if (!wsResolveLogged) {
-                wsResolveLogged = true;
-                console.log(
-                  `[dsh-connect-zcode] 会话工作目录解析：session=${sessionId} → ${resolved ?? '(服务不可达/未取到 ⇒ 回落配置目录)'}`
-                );
-              }
-              return resolved;
-            } catch (error) {
-              ctx.logger?.warn?.(`[dsh-connect-zcode] 读取会话工作目录失败（回落配置目录）：${error?.message ?? error}`);
-            }
-            return undefined;
-          },
+           * `working_directory` 工具中途改目录（旧行为恒用 homedir()）。
+           * 逻辑本体在 `lib/session-workspace.js`（宿主服务访问与优先级各只此一份）。 */
+          resolveWorkspace: createWorkspaceResolver({
+            getService: (name) => (typeof ctx.get === 'function' ? ctx.get(name) : ctx[name]),
+            logger: ctx.logger ?? console,
+          }),
+          /* 最终决策回报（含来源）—— 状态文档据此显示"到底有没有跟随"。 */
+          onWorkspaceDecision: (info) => workspaceTracker.update(info),
           // 同一把冻结开关（PROTOCOL §7.1）：关闭时连 agent 进程都不起。
           gate: () => {
             assertSwitchEnabled(cfg.switchPath);
@@ -999,6 +984,9 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
         catalog: () => state.lastCatalog,
         enabledModelIds: readEnabled,
         lastLedger: () => readLastLedgerRow(cfg.ledgerPath),
+        /* ZB-42：app-server 会话工作目录的解析留痕（跟随是否真的生效、用的是哪个目录）。
+         * 这是**唯一**能证明 `ctx.get('workingDirectory')` 可达性是否生效的运行时观测点。 */
+        workspace: () => workspaceTracker.snapshot(),
         /* 赠送额度剩余：**只读 ZCode 自己写的日志**（`~/.zcode/v2/logs/*.log` 里它自己的
          * `billing/balance` 响应）。为什么不自己调上游：该端点属 Plan 通道，外部直连实测会被
          * 风控拦（3012），而客户端本来就在调、结果就在日志里 —— 零新请求、零风控面。 */
