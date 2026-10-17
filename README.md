@@ -178,6 +178,27 @@ node scripts/compat-check.mjs --self-test          # 只跑内置 semver 自测
 
 ---
 
+#### 上下文窗口到底是谁声明的（200K vs 1M）
+
+这三个数字来源不同，**不要混为一谈**（2026-10-17 实测核对）：
+
+| 数字 | 谁说的 | 怎么来的 |
+|---|---|---|
+| **1M**（`limit.context=1000000`） | **ZCode 自己** | `~/.zcode/v2/config.json` 的 `provider[planKey].models` 段（ZCode 客户端维护）；网关 API **不声明**上下文长度 |
+| **200K**（插件默认） | **本插件** | `contextWindow` 配置默认值（保守）；依据是项目早期实测「CLI 会话在 200k 附近开始压缩」。**CLI 里并没有 `200000` 这个常量** |
+| 实际可用上限 | **上游** | 只能靠真实长上下文请求探测：`GET /v1/models` 不返回 context 字段（已实测），报错时才可能带上限 |
+
+**谁在执行这个限制**：Coding Plan 通道是 `插件 → pi-ai → 网关 HTTP`，**CLI 完全不参与**。插件只是把
+`contextWindow`（默认 200K；面板勾 1M 时为官方声明值）**声明给 DSH**，DSH 据此决定何时压缩/拒绝请求。所以：
+
+- 选 **200K**：DSH 接近 200K 就压缩 —— 保守，不会撞上游；
+- 选 **1M**：DSH 按 1M 管理、不会提前压缩 —— 若上游实际只有 200K，表现为「接近 200K 后上游报错/截断」，DSH 侧不会预警。
+
+> 零成本复核：`node scripts/probe-context-declared.mjs`（只发 `GET /v1/models`，不推理、不耗额度）——
+> 打印网关响应里所有与 context/window/token 相关的字段（实测：**一个都没有**）。
+
+---
+
 ## 设置面板（T21 显隐 + T22 能力行控件）
 
 DSH 插件设置页的本 bundle 卡片（slot `plugins.bundle.config`，key = 包名）提供**最小可用面板**：
