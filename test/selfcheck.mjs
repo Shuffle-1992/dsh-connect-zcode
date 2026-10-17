@@ -427,23 +427,24 @@ async function assertRejects(promise, pattern, label) {
   check('官方: 缺正整数 context 的条目不收编（宁按无官方数据处理，不虚构数字）', JSON.stringify(modelMeta.readOfficialMeta(noCtx)) === '{}');
 
   check(
-    '过滤: 5.3 系显式集合判定（大小写不敏感；不含 glm-5.2 / glm-5.3-pro / 非字符串）',
-    modelMeta.isGlm53Family('GLM-5.3-FLASHX') === true && modelMeta.isGlm53Family('glm-5.2') === false &&
-      modelMeta.isGlm53Family('glm-5.3-pro') === false && modelMeta.isGlm53Family(42) === false && modelMeta.isGlm53Family(undefined) === false
+    '过滤: 5.3 系显式集合判定（大小写不敏感；不含 glm-5.2 / glm-5.3-pro / glm-5.3-flashx / 非字符串）',
+    modelMeta.isGlm53Family('GLM-5.3-FLASH') === true && modelMeta.isGlm53Family('glm-5.2') === false &&
+      modelMeta.isGlm53Family('glm-5.3-pro') === false && modelMeta.isGlm53Family('glm-5.3-flashx') === false &&
+      modelMeta.isGlm53Family(42) === false && modelMeta.isGlm53Family(undefined) === false
   );
   const gateway11 = ['glm-5.3', 'glm-5.3-flash', 'glm-5.3-flashx', 'glm-5.2', 'glm-5.1', 'glm-5', 'glm-5-turbo', 'glm-4.7', 'glm-4.6', 'glm-4.5', 'glm-4.5-air'].map((id) => ({ id }));
   check(
-    '过滤: 网关 11 → 5.3 系 3（显式集合；大小写不敏感放行 GLM-5.3-FlashX）',
-    modelMeta.filterGlm53Family(gateway11).length === 3 &&
-      modelMeta.filterGlm53Family([{ id: 'GLM-5.3-FlashX' }, { id: 'glm-5.2' }]).map((r) => r.id).join(',') === 'GLM-5.3-FlashX'
+    '过滤: 网关 11 → 5.3 系 2（显式集合；大小写不敏感放行 GLM-5.3-FLASH；FlashX 已移除）',
+    modelMeta.filterGlm53Family(gateway11).length === 2 &&
+      modelMeta.filterGlm53Family([{ id: 'GLM-5.3-FLASH' }, { id: 'glm-5.2' }, { id: 'glm-5.3-flashx' }]).map((r) => r.id).join(',') === 'GLM-5.3-FLASH'
   );
   check('过滤: 非数组输入 → 空数组（防御）', modelMeta.filterGlm53Family(null).length === 0 && modelMeta.filterGlm53Family('glm-5.3').length === 0);
 
-  check('目录: 静态表裁剪为 5.3 系 3 项（与 model-meta GLM53_FAMILY 同序）', discovery.STATIC_MODEL_IDS.length === 3 && JSON.stringify(discovery.STATIC_MODEL_IDS) === JSON.stringify(modelMeta.GLM53_FAMILY), discovery.STATIC_MODEL_IDS.join(','));
+  check('目录: 静态表裁剪为 5.3 系 2 项（与 model-meta GLM53_FAMILY 同序；FlashX 已移除）', discovery.STATIC_MODEL_IDS.length === 2 && JSON.stringify(discovery.STATIC_MODEL_IDS) === JSON.stringify(modelMeta.GLM53_FAMILY), discovery.STATIC_MODEL_IDS.join(','));
   const rows = discovery.staticCatalog(officialMeta, 200000);
   check(
     '目录: 静态事实行每行正整数 contextWindow/maxTokens + 官方徽标 2 枚',
-    rows.length === 3 && rows.every((r) => Number.isInteger(r.contextWindow) && r.contextWindow > 0 && Number.isInteger(r.maxTokens) && r.maxTokens > 0 && r.id && r.name) &&
+    rows.length === 2 && rows.every((r) => Number.isInteger(r.contextWindow) && r.contextWindow > 0 && Number.isInteger(r.maxTokens) && r.maxTokens > 0 && r.id && r.name) &&
       rows.filter((r) => r.official === true).length === 2
   );
   /* 静态表必须带展示名（= 网关 display_name 实测值）：state.lastCatalog 初始化为静态表，
@@ -453,7 +454,7 @@ async function assertRejects(promise, pattern, label) {
     rows.every((r) => typeof r.name === 'string' && r.name !== r.id) &&
       rows.find((r) => r.id === 'glm-5.3')?.name === 'GLM-5.3' &&
       rows.find((r) => r.id === 'glm-5.3-flash')?.name === 'GLM-5.3-Flash' &&
-      rows.find((r) => r.id === 'glm-5.3-flashx')?.name === 'GLM-5.3-FlashX',
+      rows.find((r) => r.id === 'glm-5.3-flashx') === undefined,
     rows.map((r) => `${r.id}=${r.name}`).join(', ')
   );
 
@@ -488,16 +489,16 @@ async function assertRejects(promise, pattern, label) {
    * 静态表 STATIC_MODEL_IDS = GLM53_FAMILY），buildCatalog 是纯合并（假定已过滤输入）。
    * 故此处断言过滤函数本身 + 经 discoverModels 的端到端行为，而非要求 buildCatalog 过滤。 */
   check(
-    '过滤: filterGlm53Family 剔除非 5.3 系（glm-5.2 不出现），恰 3 行',
+    '过滤: filterGlm53Family 剔除非 5.3 系（glm-5.2 不出现；FlashX 已移除），恰 2 行',
     (() => {
       const filtered = modelMeta.filterGlm53Family([
         { id: 'glm-5.3' },
         { id: 'GLM-5.3-Flash' }, // 大小写不敏感
-        { id: 'glm-5.3-flashx' },
+        { id: 'glm-5.3-flashx' }, // 已从显式集合移除 ⇒ 应被剔除
         { id: 'glm-5.2' },
         { id: 'glm-5.1' },
       ]);
-      return filtered.length === 3 && filtered.some((r) => r.id === 'glm-5.2') === false;
+      return filtered.length === 2 && filtered.some((r) => r.id === 'glm-5.2') === false && filtered.some((r) => r.id === 'glm-5.3-flashx') === false;
     })()
   );
   check(
@@ -518,7 +519,7 @@ async function assertRejects(promise, pattern, label) {
           fetchFn: async () => ({ ok: true, json: async () => gwBody }),
         }
       );
-      return rows.length === 3 && rows.some((r) => r.id === 'glm-5.2') === false && rows.every((r) => Number.isInteger(r.contextWindow));
+      return rows.length === 2 && rows.some((r) => r.id === 'glm-5.2') === false && rows.every((r) => Number.isInteger(r.contextWindow));
     })()
   );
   check('红线: buildCatalog 每行必有正整数 contextWindow（INVALID_MODEL_CONTEXT）', catalog.every((r) => Number.isInteger(r.contextWindow) && r.contextWindow > 0));
@@ -556,9 +557,9 @@ async function assertRejects(promise, pattern, label) {
   check('发现: 死代码 extractModelIds 已移除（S-05）', discovery.extractModelIds === undefined);
   const cred = { apiKey: fakeKey, baseURL: 'https://example.test/api/anthropic' };
   const rows2 = await discovery.discoverModels(cred, { officialMeta, baseContextWindow: 200000, fetchFn: async () => ({ ok: false }) });
-  check('发现: HTTP 非 200 回退静态表（3 行 5.3 系）', rows2.length === 3 && rows2[0].contextWindow === 200000, `rows=${rows2.length}`);
+  check('发现: HTTP 非 200 回退静态表（2 行 5.3 系）', rows2.length === 2 && rows2[0].contextWindow === 200000, `rows=${rows2.length}`);
   const rows3 = await discovery.discoverModels(cred, { officialMeta, fetchFn: async () => { throw new Error('NETWORK FORBIDDEN'); } });
-  check('发现: 网络异常回退静态表', rows3.length === 3);
+  check('发现: 网络异常回退静态表', rows3.length === 2);
   const rows4 = await discovery.discoverModels(cred, {
     officialMeta,
     fetchFn: async (url, init) => {
@@ -571,11 +572,11 @@ async function assertRejects(promise, pattern, label) {
   });
   check(
     '发现: 200 时 5.3 系过滤（大小写不敏感合并官方）+ display_name',
-    rows4.length === 2 && rows4[0].id === 'GLM-5.3-Flash' && rows4[0].name === 'GLM-5.3-Flash' && rows4[0].official === true && rows4[0].maxContextWindow === 1000000 && rows4[1].id === 'glm-5.3-flashx',
+    rows4.length === 1 && rows4[0].id === 'GLM-5.3-Flash' && rows4[0].name === 'GLM-5.3-Flash' && rows4[0].official === true && rows4[0].maxContextWindow === 1000000,
     JSON.stringify(rows4)
   );
   const rows5 = await discovery.discoverModels(cred, { officialMeta, fetchFn: async () => ({ ok: true, json: async () => ({ data: [{ id: 'glm-9.9' }] }) }) });
-  check('发现: 目录无 5.3 系（过滤后为空）→ 回退静态表', rows5.length === 3);
+  check('发现: 目录无 5.3 系（过滤后为空）→ 回退静态表', rows5.length === 2);
 }
 
 // ─── 5. 并发预算与流拦截记账（§3.4 N=2） ─────────────────────────────────────
@@ -740,12 +741,12 @@ async function assertRejects(promise, pattern, label) {
 // ─── 6.5 过滤语义 + 面板状态文档（T21/T22，纯静态零网络） ────────────────────
 {
   const all = discovery.STATIC_MODEL_IDS.map((id) => ({ id }));
-  check('过滤: 空集/未配置 = 全量显示（T21 §3.1 关键语义）', discovery.filterByEnabledModels(all, []).length === 3 && discovery.filterByEnabledModels(all, undefined).length === 3);
+  check('过滤: 空集/未配置 = 全量显示（T21 §3.1 关键语义）', discovery.filterByEnabledModels(all, []).length === 2 && discovery.filterByEnabledModels(all, undefined).length === 2);
   const one = discovery.filterByEnabledModels(all, ['glm-5.3']);
   check('过滤: 单选只留 1 项', one.length === 1 && one[0].id === 'glm-5.3', JSON.stringify(one));
   const mixed = discovery.filterByEnabledModels(all, ['no-such-model', 'glm-5.3-flash']);
   check('过滤: 未知 id 静默忽略', mixed.length === 1 && mixed[0].id === 'glm-5.3-flash', JSON.stringify(mixed));
-  check('过滤: 非数组输入 = 不过滤（防御）', discovery.filterByEnabledModels(all, 'glm-5.3').length === 3 && discovery.filterByEnabledModels(all, null).length === 3);
+  check('过滤: 非数组输入 = 不过滤（防御）', discovery.filterByEnabledModels(all, 'glm-5.3').length === 2 && discovery.filterByEnabledModels(all, null).length === 2);
 
   check('回环: Origin 判定（空放行/localhost·127.0.0.1 放行/外域与垃圾拒）', webStatus.originIsLoopback(undefined) === true && webStatus.originIsLoopback('') === true && webStatus.originIsLoopback('http://localhost:5173') === true && webStatus.originIsLoopback('http://127.0.0.1') === true && webStatus.originIsLoopback('http://[::1]:8080') === true && webStatus.originIsLoopback('https://evil.example') === false && webStatus.originIsLoopback('not a url') === false);
   check('回环: Host 判定（含端口剥离）', webStatus.hostIsLoopback('localhost:5173') === true && webStatus.hostIsLoopback('127.0.0.1:3210') === true && webStatus.hostIsLoopback('[::1]:8080') === true && webStatus.hostIsLoopback('evil.example') === false && webStatus.hostIsLoopback(undefined) === false && webStatus.hostIsLoopback('') === false);
@@ -777,7 +778,7 @@ async function assertRejects(promise, pattern, label) {
     JSON.stringify(doc.models)
   );
   const docAll = webStatus.buildStatusDocument({ registered: () => false, readSwitch: () => ({ enabled: true }), endpointHost: () => null, catalog: () => all, enabledModelIds: () => [] });
-  check('状态: 空勾选 = enabledCount 等于总数；开关未冻结', docAll.enabledCount === 3 && docAll.modelsTotal === 3 && docAll.frozen === false && docAll.providerRegistered === false && docAll.endpointHost === null);
+  check('状态: 空勾选 = enabledCount 等于总数；开关未冻结', docAll.enabledCount === 2 && docAll.modelsTotal === 2 && docAll.frozen === false && docAll.providerRegistered === false && docAll.endpointHost === null);
 
   const statusLedgerPath = tmpFile(
     'status-ledger.jsonl',
@@ -988,7 +989,7 @@ async function assertRejects(promise, pattern, label) {
    * profile.reasoning → dsh-llm-pi-ai :1820 catalog defaultEffort + :1852 实际请求兜底档；
    * 但 provider 级静态档对"不支持该档的模型"会在 :1848 无条件校验、:1705 throw ——
    * 因此默认必须不设（FlashX 等非推理模型无档位控件，无法自救）。 */
-  check('注册: 默认不设 profile.reasoning（none，零回归）', opts?.profiles()?.get('zcode')?.reasoning === undefined, `reasoning=${opts?.profiles()?.get('zcode')?.reasoning}`);
+  check('注册: 默认推理档自动到 max（剩余两个模型都支持 max；FlashX 移除后不再是 none）', opts?.profiles()?.get('zcode')?.reasoning === 'max', `reasoning=${opts?.profiles()?.get('zcode')?.reasoning}`);
   const resolvedKey = await opts.resolveApiKey('zcode', opts.profiles().get('zcode'));
   check('调用门: 开关开+凭据有效 → 返回 key', resolvedKey === fakeKey);
   writeFileSync(switchPath, JSON.stringify({ enabled: false }), 'utf8');
@@ -1008,7 +1009,7 @@ async function assertRejects(promise, pattern, label) {
   } finally {
     /* 投毒常驻：不恢复 realFetch（本自检全程禁止真实网络）。 */
   }
-  check('发现: 冻结期零网络直接回静态表', Array.isArray(discoveryRows) && discoveryRows.length === 3 && discoveryRows[0].contextWindow === 200000, `rows=${discoveryRows?.length}`);
+  check('发现: 冻结期零网络直接回静态表', Array.isArray(discoveryRows) && discoveryRows.length === 2 && discoveryRows[0].contextWindow === 200000, `rows=${discoveryRows?.length}`);
 
   /* T22 host 管线：带预算/开关/勾选的第二次注册——校验 provider.models 的 trae 形状输出。
    * 凭据 fixture 无 models 段 → officialMeta = {} → 三行全按「无官方数据」处理，
@@ -1028,7 +1029,7 @@ async function assertRejects(promise, pattern, label) {
   const m53 = piModels?.find((m) => m.id === 'glm-5.3');
   const mFlash = piModels?.find((m) => m.id === 'glm-5.3-flash');
   const mFlashX = piModels?.find((m) => m.id === 'glm-5.3-flashx');
-  check('T22 管线: 三行 5.3 系模型注册', Array.isArray(piModels) && piModels.length === 3, `models=${piModels?.length}`);
+  check('T22 管线: 两行 5.3 系模型注册（FlashX 已移除）', Array.isArray(piModels) && piModels.length === 2, `models=${piModels?.length}`);
   /* GLM-5.3 有官方数据（fixture models 段）：官方锁定优先——用户 override 强塞 image
    * 必须被忽略（官方 modalities 声明 text-only），且 1M 预算合法生效（官方 Max 档）。
    * 注意：这与「无官方数据」的 FlashX 形成对照（见下一条断言）。 */
@@ -1040,7 +1041,7 @@ async function assertRejects(promise, pattern, label) {
       m53?.compat?.supportsReasoningEffort === true,
     JSON.stringify(m53)
   );
-  check('T22 管线: FlashX 用户开关开（推理 + 图片）+ 预算无效 + thinkingLevelMap 仅 high 档', mFlashX?.reasoning === true && mFlashX?.compat?.supportsReasoningEffort === true && JSON.stringify(mFlashX?.input) === '["text","image"]' && mFlashX?.contextWindow === 200000 && JSON.stringify(mFlashX?.thinkingLevelMap) === '{"off":null,"minimal":null,"low":null,"medium":null,"high":"high","xhigh":null,"max":null}', JSON.stringify(mFlashX));
+  check('T22 管线: 未注册模型（FlashX）的 override 不产生任何行', mFlashX === undefined, JSON.stringify(mFlashX));
   check('T22 管线: 每行正整数 contextWindow + api/provider/baseUrl（红线 + trae 形状）', (piModels ?? []).every((m) => Number.isInteger(m?.contextWindow) && m.contextWindow > 0 && m.api === 'anthropic-messages' && m.provider === 'zcode' && typeof m.baseUrl === 'string' && m.baseUrl !== ''));
 
   /* 默认推理档显式配置场景：defaultReasoningEffort='max' → profile.reasoning='max' 生效；
@@ -1061,10 +1062,8 @@ async function assertRejects(promise, pattern, label) {
       const prof1c = registered1c ? registrations.adapters[2]?.adapter?.options?.profiles().get('zcode') : null;
       const warnText = warnings.join(' ');
       check(
-        '推理档: 显式 max → profile.reasoning=max + 守卫 warn 列出不支持模型',
-        prof1c?.reasoning === 'max' &&
-          warnText.includes("defaultReasoningEffort='max'") &&
-          warnText.includes('glm-5.3-flash'),
+        '推理档: 显式 max → profile.reasoning=max（FlashX 移除后无"不支持该档"的模型 ⇒ 守卫不再 warn）',
+        prof1c?.reasoning === 'max' && !warnText.includes("defaultReasoningEffort='max'"),
         `reasoning=${prof1c?.reasoning} warn=${warnText.slice(0, 120)}`
       );
       /* 自动判定（配置 'none' = 自动）：目标是不让选择器再补 "Default" 项，同时不让不支持该档
@@ -1179,7 +1178,7 @@ async function assertRejects(promise, pattern, label) {
       check(
         'appserver: 目录发现含赠送额度行（图片策略能力源；attachments 缺席 → 如实 text-only）',
         giftRow !== undefined && giftRow.inputModalities?.join(',') === 'text' &&
-          rows.some((row) => row?.id === 'glm-5.3-flash') && rows.length === 4,
+          rows.some((row) => row?.id === 'glm-5.3-flash') && rows.length === 3,
         `rows=${rows.length} gift=${JSON.stringify(giftRow ?? null)}`
       );
       writeFileSync(switchPath, JSON.stringify({ enabled: true }), 'utf8');
@@ -2025,6 +2024,113 @@ async function assertRejects(promise, pattern, label) {
       String(queueError?.message ?? 'no-error').slice(0, 90)
     );
     queueAdapter.dispose();
+
+    /* ── 审查 5.4 / 5.5：错误路径与账号家族的边界断言 ───────────────────────────
+     * 5.4-a `turn.failed`：**必须立刻收尾**（ZB-40 事故类：只认 `turn.completed` 会死等
+     *       整个回合超时），且上游错误文本要过脱敏（可能回显请求头）。
+     * 5.4-b `session/create` 不返回 sessionId：明确报错，不挂死。
+     * 5.4-c 硬重启路径：`try/finally` 复位 suppressDeath + 清空其它会话缓存（静态防回归）。
+     * 5.5   账号家族：显式配置**优先**（不读凭据库），未配置时返回 `account:*` 形态或不抛。 */
+    const failedTurnFake = (() => {
+      const calls = [];
+      const listeners = new Set();
+      return {
+        calls, disposed: false, cliPath: '', cliNode: '', cwd: '', rpcTimeoutMs: 0, env: {}, lastChannel: null, onServerRequest: null,
+        onNotification(l) { listeners.add(l); return () => listeners.delete(l); },
+        write() {}, notify() {}, dispose() {}, async ensureStarted() {}, restart() {},
+        async request(method) {
+          calls.push({ method });
+          if (method === 'session/create') return { sessionId: 'sess-fail' };
+          if (method === 'session/send') {
+            queueMicrotask(() => {
+              for (const l of listeners) {
+                l({
+                  method: 'session/event',
+                  params: {
+                    type: 'turn.failed',
+                    payload: {
+                      error: {
+                        message: 'boom sk-abcdefghijklmnop0123456789',
+                        attribution: { providerId: 'account:bigmodel-start-plan', modelId: 'GLM-5.3', providerErrorCode: 1005 },
+                      },
+                    },
+                  },
+                });
+              }
+            });
+          }
+          return {};
+        },
+      };
+    })();
+    const turnFailAdapter = mkWsAdapter({ ...cfgLike, appServerInjectAccount: false, appServerTurnTimeoutMs: 5000 }, async () => undefined);
+    turnFailAdapter.client = failedTurnFake;
+    const turnFailChunks = [];
+    let turnFailThrew = null;
+    const turnFailStartedAt = Date.now();
+    try {
+      for await (const chunk of turnFailAdapter.stream({
+        provider: 'zcode-appserver',
+        model: 'GLM-5.3',
+        sessionId: 's-fail',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      })) {
+        turnFailChunks.push(chunk);
+      }
+    } catch (error) {
+      turnFailThrew = error;
+    }
+    const turnFailElapsedMs = Date.now() - turnFailStartedAt;
+    check(
+      '5.4-a: turn.failed ⇒ 立刻收尾（不死等回合超时）+ 上游错误文本已脱敏',
+      turnFailElapsedMs < 4000 &&
+        (turnFailThrew !== null || JSON.stringify(turnFailChunks).includes('"kind":"error"')) &&
+        !JSON.stringify(turnFailChunks).includes('sk-abcdefghijklmnop'),
+      `elapsed=${turnFailElapsedMs}ms threw=${turnFailThrew !== null} chunks=${JSON.stringify(turnFailChunks).slice(0, 100)}`
+    );
+    turnFailAdapter.dispose();
+
+    const noIdAdapter = mkWsAdapter({ ...cfgLike, appServerInjectAccount: false }, async () => undefined);
+    noIdAdapter.client = { ...makeWsFake(), request: async () => ({}) }; // create 返回空 ⇒ 无 sessionId
+    let noIdError = null;
+    const noIdChunks = [];
+    try {
+      for await (const chunk of noIdAdapter.stream({
+        provider: 'zcode-appserver',
+        model: 'GLM-5.3',
+        sessionId: 's-noid',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      })) {
+        noIdChunks.push(chunk);
+      }
+    } catch (error) {
+      noIdError = error;
+    }
+    const noIdFailure = noIdError !== null ? String(noIdError?.message ?? '') : JSON.stringify(noIdChunks);
+    check('5.4-b: session/create 未返回 sessionId ⇒ 明确报错（不挂死）', /没有返回 sessionId/.test(noIdFailure), noIdFailure.slice(0, 120));
+    noIdAdapter.dispose();
+
+    check(
+      '5.4-c 静态: 硬重启路径 try/finally 复位 suppressDeath 且清空其它会话缓存',
+      (() => {
+        const at = appServerSrcForWs.indexOf('suppressDeath = true;');
+        const fin = appServerSrcForWs.indexOf('finally {', at);
+        const off = appServerSrcForWs.indexOf('suppressDeath = false;', fin);
+        return at >= 0 && fin > at && off > fin && /this\.sessions\.clear\(\);/.test(appServerSrcForWs);
+      })()
+    );
+
+    check(
+      '5.5: 显式 appServerAccountProviderId 优先（不读凭据库）',
+      appServer.resolveAccountProviderId({ appServerAccountProviderId: 'account:zai-start-plan' }) === 'account:zai-start-plan'
+    );
+    let autoAccount = null;
+    try {
+      autoAccount = appServer.resolveAccountProviderId({ appServerAccountProviderId: '' });
+    } catch {
+      autoAccount = null;
+    }
+    check('5.5: 未显式配置时返回 account:* 形态或 null（读取失败不抛）', autoAccount === null || /^account:/.test(String(autoAccount)), String(autoAccount));
   }
 
   /* ── 流式分块 + 思考档（2026-10-10 用户实测"面板内容一直覆盖"；赠送 5.3-Flash 补思考档）──
@@ -2672,7 +2778,7 @@ async function assertRejects(promise, pattern, label) {
       !(summaryEl instanceof Error) && !(pageEl instanceof Error) && !!summaryEl && !!pageEl,
       `${summaryEl?.message ?? ''} ${pageEl?.message ?? ''}`
     );
-    check('client: page 视图在状态路由缺席时回退静态表（3 个显隐勾选行，T22 裁剪）', byDataRole(pageEl, 'enable').length === 3, `enable=${byDataRole(pageEl, 'enable').length}`);
+    check('client: page 视图在状态路由缺席时回退静态表（2 个显隐勾选行，T22 裁剪；FlashX 已移除）', byDataRole(pageEl, 'enable').length === 2, `enable=${byDataRole(pageEl, 'enable').length}`);
     check('client: 勾选语义文案在场（全部不勾 = 全部显示）', JSON.stringify(pageEl).includes('全部不勾 = 全部显示'));
 
     /* T22 §1.5-6：带权威事实目录 + 可写配置的面板行控件断言。

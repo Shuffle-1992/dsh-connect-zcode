@@ -209,11 +209,11 @@ DSH 插件设置页的本 bundle 卡片（slot `plugins.bundle.config`，key = �
   ```
   [✓] GLM-5.3       ·官方  图片  ◉200K ○1M   推理档: low / max / high（官方，锁定）
   [✓] GLM-5.3-Flash ·官方  ☑图片 ◉200K ○1M   推理档: low / max / high（官方，锁定）
-  [✓] GLM-5.3-FlashX       ☐图片 ◉200K        推理 ☐（未提供官方数据，开关自担）
+
   ```
 
 - **5.3 系过滤（T22）**：目录（网关与静态表）先按**显式集合**
-  `{glm-5.3, glm-5.3-flash, glm-5.3-flashx}` 过滤（大小写不敏感）——网关其余 8 个
+  `{glm-5.3, glm-5.3-flash}` 过滤（大小写不敏感）——网关其余 9 个
   模型（glm-5.2/5.1/5/5-turbo/4.7/4.6/4.5/4.5-air）不再暴露；不用模糊前缀，
   防未来网关多出 `glm-5.3-pro` 之类被误放行。
 - **锁定 vs 开关的判定来源（T22）**：ZCode config.json `provider[planKey].models` 段
@@ -222,7 +222,7 @@ DSH 插件设置页的本 bundle 卡片（slot `plugins.bundle.config`，key = �
     与输入模态**只展示、不可勾改**（disabled 控件）；Flash 的图片随官方 modalities
     **默认勾选且锁定**（官方声明含 image/video，原样保留）；GLM-5.3 官方纯文本，
     图片不可开。
-  - **无官方数据**（GLM-5.3-FlashX）：推理与图片提供**开关**（默认关，开启后果自担）。
+  - **无官方数据**（未来的新模型）：推理与图片提供**开关**（默认关，开启后果自担）。
 - **200K / 1M（T22）**：每行默认 200K；**仅官方声明 1M 上下文（`limit.context=1000000`
   高于基础档）的模型**才出现 1M 单选。勾选写入 `contextBudgets`，host 侧
   `applyContextBudgets` **只允许切到该模型官方声明的 Max 档**（trae :246-251 同语义）——
@@ -805,7 +805,7 @@ DSH 工具全部可用），或者把任务拆开——需要浏览器/组队/�
     宿主在模型未声明 `defaultEffort` 时会补一个 "Provider default" 项。本插件现在按
     "当前暴露模型是否全都支持同一档"自动决定 provider 默认档（优先 max→high→low）：
     全支持 ⇒ 自动设（`Default` 项消失，且与官方 `defaultVariant=max` 一致）；
-    混入非推理模型（如未开推理开关的 FlashX）⇒ 不设（避免其请求硬失败）。面板保存后即时重算。
+    混入非推理模型（如未开推理开关的新模型）⇒ 不设（避免其请求硬失败）。面板保存后即时重算。
     见 TROUBLESHOOTING §2.14。
 22. **官方 MCP 工具在桥接进程里不可用**：CLI agent 会看到 ZCode 配置里的官方 MCP 服务器
     （`node_repl` / `image_search` 等），但它们需要**桌面端才有的官方签名头**

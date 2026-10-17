@@ -203,6 +203,16 @@ entryId: include:zcode-connect  moduleName: dsh-connect-zcode  enabled: true  fi
 
 **待真机确认**：重载插件 / 重启 DSH 后再 toggle，该 TypeError 应消失；若仍出现，请把报错文本发来（届时说明还有第三处异步校验点）。
 
+**第九批（同日）：删掉 FlashX 模型 + 补 5.4/5.5 边界断言（ZB-50/51）**
+
+| # | 内容 | 说明 |
+|---|---|---|
+| **ZB-50** | **移除 `glm-5.3-flashx`**（用户面板要求） | 它已无官方元数据，只能在面板上以"未提供官方数据、开关自担"的噪音形态出现。改动：`model-meta.GLM53_FAMILY`、`discovery.STATIC_MODEL_NAMES`、`client.STATIC_MODEL_IDS` 三处清单；同步更新 20 条受影响的断言。**两处真实行为变化**（非 bug）：① 剩余两个模型都支持 max ⇒ 默认推理档由 `none` 自动变成 `max`；② 不再有"不支持该档"的模型 ⇒ 启动守卫不再 warn。 |
+| **ZB-51** | **5.4 边界断言**：`turn.failed` ⇒ 立刻以 `finish{reason.kind:'error'}` 收尾（不死等回合超时）且错误文本过 `redactSecrets`；`session/create` 未返回 sessionId ⇒ 明确报错（不挂死）；硬重启路径 `try/finally` + `sessions.clear()` 静态防回归 | 三条均为**行为级**断言（前两条用假 client 端到端跑真实 stream），已验证通过 |
+| **ZB-51** | **5.5 边界断言**：显式 `appServerAccountProviderId` 优先（不读凭据库）；未配置时返回 `account:*` 形态或 null（读取失败不抛） | 两条行为断言 |
+
+**验证**：`selfcheck` **343/343 PASS**（+5 边界断言）、`compat-check` COMPAT PASS。
+
 **最终 backlog（未做，附理由）**：**5.4/5.5**（`suppressDeath` 错误路径、账号家族漂移的**更多**断言 —— 行为已修，1.10 的断言已覆盖主路径，边界断言可后续补）；真机三项（1.1 两轮裁决 / workspace 字段 / HMR）待有额度。
 
 **独立复核结论（另一只读分析，2026-10-17）——候选逐条：**

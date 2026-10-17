@@ -948,7 +948,7 @@ Get-Content "$env:USERPROFILE\.dsh\dispatch-runs.jsonl" | Select-Object -Last 3
 
 - 常见情况（只勾官方 5.3 模型，档位表里 low/high/max 都在）⇒ 自动设 `max` ⇒ **`Default` 项消失**，
   且与 ZCode 官方 `defaultVariant=max` 一致；
-- 勾了非推理模型（如未开推理开关的 GLM-5.3-FlashX）⇒ 自动退回不设（否则它**请求期硬失败**，
+- 勾了非推理模型（如未开推理开关的模型）⇒ 自动退回不设（否则它**请求期硬失败**，
   见 `dsh-llm-pi-ai` 的无条件校验）；
 - 面板保存后 `loader/volatile-update` 里**同步重算**并改写 profile（不必重启才生效）。
 
