@@ -129,6 +129,27 @@ entryId: include:zcode-connect  moduleName: dsh-connect-zcode  enabled: true  fi
 | **压缩交互（0 风险版）** | app-server 通道下，任何改变历史的操作（**`/compact`**、编辑/回退、恢复草稿）都会让下一轮**重建会话 + 首轮全量拍平重放**（实测单会话 ~880KB）。原先日志只说"历史变化"；现在**点明常见诱因 + 本轮条数 + 属一次性成本尖峰** | `selfcheck`：`conversationFingerprint` 三态语义断言（追加/同输入/前缀或系统提示被改写）+ 日志文案断言 |
 | **热重载核查** | 事实：0.2.1-rc.2 激活了 `@deepseek-ai/dsh-hmr`（`include:hmr` active），其服务面含 `watchConfig`/`getLinked`/`reconcileProfile`，事件含 `hmr/reload`/`hmr/change`；本插件为 junction 链接（`ReparsePoint`）⇒ 属 linked 范畴。**实证未完成**：插件状态路由只挂内嵌端口（50818/50819）且需 DSH 连接鉴权（外部请求 401），GUI 本会话无法驱动、desktop 无可读插件日志 | 标为**未验证**；给出 GUI 复跑步骤（改一行 host 日志 → 看面板状态区是否即时刷新；client 半边需 `pnpm run dev:web`） |
 
+**第三批（同日）：独立审查驱动的强制性优化（ZB-43）**
+
+> 触发：一个**只读审查队友**对 HEAD 做全量审查（正确性/耦合/死码/文档漂移/测试缺口/安全面），
+> 交付 40+ 条带 `文件:行号` 的发现与 Top-5 清单。以下为本批已落地项。
+
+| # | 发现（审查） | 修复 | 验证 |
+|---|---|---|---|
+| **1.1 P1** | **历史判据把"正常追加"当"历史改写"**：`sentFingerprint` 存整数组 hash，而 DSH 每轮传全量派生历史 ⇒ 第 2 轮起**每轮重建 + 全量重放** | 新增 `lib/history-guard.js`：`makeHistorySnapshot` + **`isPureAppend`（前缀校验）**；`stream()` 只在"前缀被改写或整体变短"时重建；删除重复的 `conversationFingerprint` 实现 | ✅ **新增"自然两轮"端到端断言**（旧实现必失败）：`creates=1 / sends=2`，且续轮内容只含最新用户消息；`/compact`（前缀改写）仍重建（`creates=2`）。⚠️ **真机两轮日志**可最终裁决（审查已标未验证） |
+| **1.8 P1** | `dispatch()` 对**服务端请求**无 try/catch：异常从 stdout `data` 回调冒成未捕获异常，**可能打挂宿主** | 加 try/catch + 回写 JSON-RPC 错误，日志过 `redactSecrets` | 语法 + 既有 323 断言全绿 |
+| **1.5 P2** | `suppressDeath = true` 后若 `restart/ensureSession` 抛错则**永久为真** ⇒ 之后真实死亡不再唤醒在途流（只能等 900s） | 改 `try { … } finally { suppressDeath = false }` | 同上（行为收敛，无断言依赖） |
+| **1.6 P2** | 硬重启后只删当前 key ⇒ **其它会话**条目指向已死进程，下一轮先失败一次 | 硬重启分支改 `this.sessions.clear()` | 同上 |
+| **1.3 P2** | 目录比对是裸 `!==`；大小写/尾斜杠/来源差异会被当成"目录变更"白白重建 | `lib/session-workspace.js` 新增 **`normalizeWorkspacePath()`**（`resolve`+`normalize`+win32 小写），比较与下发都用归一值 | ✅ 纯函数表新增"大小写/尾斜杠视为同目录"；ZB-42 断言改用归一值 |
+| **3.2 / 1.7 P2** | `_configureClient(workspace)` 连调两次（第一次必被覆盖）；`appServerInjectAccount:false` 仍白等 2s | 删重复调用；`injectAccount` 返回是否真的注入，`sleep` 改为条件执行 | 自检 323 全绿 |
+| **6.2 P2** | `turn.failed` 的 `payload.error.message` **原样**进日志且渲染到会话（上游可能回显 `zcodejwttoken`） | 统一过 `redactSecrets` + 截断 400 字符 | 自检现有"零明文"断言仍绿 |
+| **4.x** | 文档漂移：`index.js:256` 已过期（实测 261）；README 配置表漏 `credentialFallback` / `defaultReasoningEffort`；README 与 1.1 行为矛盾 | 本批一并修正（README 配置表补齐、行为说明改写） | — |
+
+**审查结论中的明确"不做"（附理由，避免后人重复尝试）**：
+- **1.2**（旧 app-server 会话从不 `session/close`）：需先确定 ZCode CLI 3.14.5 是否有该 RPC（**未验证**）；短期以日志/计数观测替代。
+- **1.4**（队列超时静默放行 ⇒ 可能双流并行）：改"真等待"会触及回合时序，属行为变更 ⇒ 留待单独一批（需真机两份证据）。
+- **1.10**（账号家族漂移不重注入）、**1.12**（每回合重复读目录/凭据库 IO）、**2.2**（gift 模型行三处实现）、**3.1**（冗余 export）、**3.3**（死字段 `lastChannel`）、**5.4/5.5/5.7**（更多错误路径与并发断言）、**6.1**（`keyFingerprint` 再收紧为哈希指纹）⇒ 已登记为下一批 backlog（价值中、风险中或需真机）。
+
 **独立复核结论（另一只读分析，2026-10-17）——候选逐条：**
 
 | 候选 | 结论 | 理由 |

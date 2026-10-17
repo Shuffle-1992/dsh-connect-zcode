@@ -1415,12 +1415,20 @@ async function assertRejects(promise, pattern, label) {
       appServer.sanitizeLeakedCalls('<antml:invoke name="pwsh">x</antml:invoke>ok').startsWith('（历史') &&
         appServer.sanitizeLeakedCalls('正常文本') === '正常文本'
     );
-    const f1 = appServer.conversationFingerprint([{ role: 'user', content: 'a' }], 's');
+    /* ZB-43：旧"整数组指纹"已删除，判据改为 `lib/history-guard.js` 的**前缀**校验
+     * （整数组指纹会把"正常追加"误判成"历史改写"⇒ 每轮重建 + 全量重放）。 */
+    const historyGuard = await import('../lib/history-guard.js');
+    const snapA = historyGuard.makeHistorySnapshot([{ role: 'user', content: 'a' }]);
     check(
-      'appserver: 会话指纹对内容与 system 都敏感（历史分叉检测）',
-      f1 !== appServer.conversationFingerprint([{ role: 'user', content: 'b' }], 's') &&
-        f1 !== appServer.conversationFingerprint([{ role: 'user', content: 'a' }], 's2') &&
-        f1 === appServer.conversationFingerprint([{ role: 'user', content: 'a' }], 's')
+      'appserver: 历史快照对内容敏感、对同内容稳定（重建判据的基础）',
+      snapA.hash !== historyGuard.makeHistorySnapshot([{ role: 'user', content: 'b' }]).hash &&
+        snapA.hash === historyGuard.makeHistorySnapshot([{ role: 'user', content: 'a' }]).hash &&
+        snapA.len === 1
+    );
+    check(
+      'appserver: 纯追加不重建 / 前缀改写才重建（旧整数组判据的反例）',
+      historyGuard.isPureAppend(snapA, [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'x' }]) === true &&
+        historyGuard.isPureAppend(snapA, [{ role: 'user', content: 'a2' }]) === false
     );
   }
 
@@ -1692,6 +1700,9 @@ async function assertRejects(promise, pattern, label) {
     };
     const createsOf = (adapter) => adapter.client.calls.filter((c) => c.method === 'session/create');
 
+    /* ZB-42/43：工作目录策略模块（纯函数 + 归一）。路径在模块内归一 ⇒ 断言也用归一值比较。 */
+    const wsMod = await import('../lib/session-workspace.js');
+    const norm = (p) => wsMod.normalizeWorkspacePath(p);
     const followCfg = { ...cfgLike, appServerWorkspace: 'C:\\fallback-dir', appServerWorkspaceFollow: true };
     let currentWs = 'C:\\proj-a';
     /* 计数：既断言"回落正确"，也断言 resolver **真的被执行**（防"没执行也绿"）。 */
@@ -1704,19 +1715,19 @@ async function assertRejects(promise, pattern, label) {
     check(
       'ZB-42: 建会话用宿主解析出的会话工作目录（而不是 homedir / 配置兜底）',
       createsOf(followAdapter).length === 1 &&
-        createsOf(followAdapter)[0].params.workspace.workspacePath === 'C:\\proj-a' &&
-        wsFirst.workspace === 'C:\\proj-a',
+        createsOf(followAdapter)[0].params.workspace.workspacePath === norm('C:\\proj-a') &&
+        wsFirst.workspace === norm('C:\\proj-a'),
       `${j(createsOf(followAdapter)[0]?.params)} ws=${wsFirst.workspace}`
     );
-    check('ZB-42: app-server 子进程 cwd 同步为该目录', followAdapter.client.cwd === 'C:\\proj-a', String(followAdapter.client.cwd));
+    check('ZB-42: app-server 子进程 cwd 同步为该目录（含路径归一）', followAdapter.client.cwd === norm('C:\\proj-a'), String(followAdapter.client.cwd));
 
     currentWs = 'C:\\proj-b';
     const wsSecond = await followAdapter.ensureSession('s-ws', 'GLM-5.2', 'max');
     check(
       'ZB-42: 会话工作目录中途变化 ⇒ 丢弃旧会话并按新目录重建',
       createsOf(followAdapter).length === 2 &&
-        createsOf(followAdapter)[1].params.workspace.workspacePath === 'C:\\proj-b' &&
-        wsSecond.workspace === 'C:\\proj-b',
+        createsOf(followAdapter)[1].params.workspace.workspacePath === norm('C:\\proj-b') &&
+        wsSecond.workspace === norm('C:\\proj-b'),
       j(createsOf(followAdapter).map((c) => c.params.workspace.workspacePath))
     );
     await followAdapter.ensureSession('s-ws', 'GLM-5.2', 'max');
@@ -1735,7 +1746,7 @@ async function assertRejects(promise, pattern, label) {
     await pinAdapter.ensureSession('s-pin', 'GLM-5.2', 'max');
     check(
       'ZB-42: appServerWorkspaceFollow=false ⇒ 恒用配置目录（忽略解析器）',
-      createsOf(pinAdapter)[0]?.params.workspace.workspacePath === 'C:\\pinned-dir',
+      createsOf(pinAdapter)[0]?.params.workspace.workspacePath === norm('C:\\pinned-dir'),
       j(createsOf(pinAdapter)[0]?.params)
     );
     pinAdapter.dispose();
@@ -1746,7 +1757,7 @@ async function assertRejects(promise, pattern, label) {
     await boomAdapter.ensureSession('s-boom', 'GLM-5.2', 'max');
     check(
       'ZB-42: 解析器抛错 ⇒ 回落配置目录（不炸推理通道）',
-      createsOf(boomAdapter)[0]?.params.workspace.workspacePath === 'C:\\boom-fallback',
+      createsOf(boomAdapter)[0]?.params.workspace.workspacePath === norm('C:\\boom-fallback'),
       j(createsOf(boomAdapter)[0]?.params)
     );
     boomAdapter.dispose();
@@ -1774,12 +1785,12 @@ async function assertRejects(promise, pattern, label) {
     );
 
     /* ── 纯函数表：pickWorkspace 优先级（离线可测，不碰宿主服务）────────────── */
-    const wsMod = await import('../lib/session-workspace.js');
     const picked = [
-      ['follow=false ⇒ 配置钉死', wsMod.pickWorkspace({ follow: false, configured: 'C:\\pin', resolved: 'C:\\sess' }), 'C:\\pin', 'config-pinned'],
-      ['follow=true + 解析值 ⇒ 会话目录', wsMod.pickWorkspace({ follow: true, configured: 'C:\\cfg', resolved: 'C:\\sess' }), 'C:\\sess', 'session'],
-      ['解析值空白 ⇒ 回落配置', wsMod.pickWorkspace({ follow: true, configured: 'C:\\cfg', resolved: '   ' }), 'C:\\cfg', 'fallback'],
-      ['两者都无 ⇒ 用户主目录', wsMod.pickWorkspace({ follow: true }), homedir(), 'fallback'],
+      ['follow=false ⇒ 配置钉死', wsMod.pickWorkspace({ follow: false, configured: 'C:\\pin', resolved: 'C:\\sess' }), norm('C:\\pin'), 'config-pinned'],
+      ['follow=true + 解析值 ⇒ 会话目录', wsMod.pickWorkspace({ follow: true, configured: 'C:\\cfg', resolved: 'C:\\sess' }), norm('C:\\sess'), 'session'],
+      ['解析值空白 ⇒ 回落配置', wsMod.pickWorkspace({ follow: true, configured: 'C:\\cfg', resolved: '   ' }), norm('C:\\cfg'), 'fallback'],
+      ['两者都无 ⇒ 用户主目录', wsMod.pickWorkspace({ follow: true }), norm(homedir()), 'fallback'],
+      ['路径归一：大小写/尾斜杠视为同目录', wsMod.pickWorkspace({ follow: true, configured: '', resolved: 'C:\\Proj-A\\' }), norm('c:\\proj-a'), 'session'],
     ];
     for (const [label, got, wantPath, wantSource] of picked) {
       check(`ZB-42 纯函数: ${label}`, got.path === wantPath && got.source === wantSource, `${got.path} / ${got.source}`);
@@ -1803,24 +1814,76 @@ async function assertRejects(promise, pattern, label) {
         /workspace: \(\) => workspaceTracker\.snapshot\(\)/.test(indexSrcForWs)
     );
 
-    /* ── 压缩交互（/compact）语义：指纹变化 ⇒ 重建（纯函数层离线断言）────────── */
+    /* ── 历史守卫（ZB-43）：判据是**前缀**而不是整数组 ─────────────────────────
+     * 旧实现把整数组消息 hash 存起来、下轮不等即重建；而 DSH 每轮传全量派生历史 ⇒
+     * 正常追加必然不等 ⇒ 第 2 轮起每轮重建 + 全量重放（额度/延迟/上下文全亏）。 */
+    const hg = await import('../lib/history-guard.js');
     const fpBase = [{ role: 'user', content: [{ type: 'text', text: 'a' }] }];
+    const fpGrown = [...fpBase, { role: 'assistant', content: [{ type: 'text', text: 'b' }] }, { role: 'user', content: [{ type: 'text', text: 'c' }] }];
+    check('历史守卫: 纯追加 ⇒ true（会话复用，不重建）', hg.isPureAppend(hg.makeHistorySnapshot(fpBase), fpGrown) === true);
+    check('历史守卫: 同长度同内容 ⇒ true（幂等）', hg.isPureAppend(hg.makeHistorySnapshot(fpBase), fpBase) === true);
     check(
-      '压缩交互: 追加消息 ⇒ 指纹变化（应触发重建 + 首轮重放）',
-      appServer.conversationFingerprint(fpBase, 'sys') !==
-        appServer.conversationFingerprint([...fpBase, { role: 'assistant', content: [{ type: 'text', text: 'b' }] }], 'sys')
+      '历史守卫: 前缀被改写（压缩/编辑）⇒ false（重建 + 首轮重放）',
+      hg.isPureAppend(hg.makeHistorySnapshot(fpBase), [{ role: 'user', content: [{ type: 'text', text: 'COMPACTED' }] }, ...fpBase]) === false
     );
+    check('历史守卫: 整体变短（压缩掉前缀）⇒ false', hg.isPureAppend(hg.makeHistorySnapshot(fpGrown), fpGrown.slice(0, 1)) === false);
+    check('历史守卫: 无快照（首轮/旧条目）⇒ false', hg.isPureAppend(undefined, fpBase) === false);
     check(
-      '压缩交互: 同输入 ⇒ 指纹稳定（不该误重建）',
-      appServer.conversationFingerprint(fpBase, 'sys') === appServer.conversationFingerprint(fpBase, 'sys')
+      '解耦: 旧"整数组指纹"实现已删除，判据只此一份',
+      !/conversationFingerprint/.test(appServerSrcForWs) &&
+        !/conversationFingerprint/.test(indexSrcForWs) &&
+        /export function isPureAppend/.test(readFileSync(join(PLUGIN_ROOT, 'lib', 'history-guard.js'), 'utf8'))
     );
+
+    /* ── 自然两轮端到端（旧实现必失败：每轮都被误判"历史改写"）──────────────── */
+    const twoTurnFake = (() => {
+      const calls = [];
+      const listeners = new Set();
+      return {
+        calls, disposed: false, cliPath: '', cliNode: '', cwd: '', rpcTimeoutMs: 0, env: {}, lastChannel: null, onServerRequest: null,
+        onNotification(l) { listeners.add(l); return () => listeners.delete(l); },
+        write() {}, notify() {}, dispose() {}, async ensureStarted() {}, restart() {},
+        async request(method, params) {
+          calls.push({ method, params });
+          if (method === 'session/create') return { sessionId: `sess-${calls.filter((c) => c.method === 'session/create').length}` };
+          if (method === 'session/send') {
+            queueMicrotask(() => {
+              for (const l of listeners) {
+                l({
+                  method: 'session/event',
+                  params: { type: 'turn.completed', payload: { response: 'ok', resultType: 'success', usage: { inputTokens: 10, outputTokens: 2, modelRequestCount: 1 } } },
+                });
+              }
+            });
+          }
+          return {};
+        },
+      };
+    })();
+    const twoTurn = appServer.createAppServerAdapter({
+      BaseAdapter: class {}, LlmError: class LlmError extends Error {},
+      options: () => ({ ...cfgLike, appServerInjectAccount: false }),
+      logger: {}, record: () => {}, gate: () => {},
+    });
+    twoTurn.client = twoTurnFake;
+    const u1 = [{ role: 'user', content: [{ type: 'text', text: '第一轮' }] }];
+    for await (const _ of twoTurn.stream({ provider: 'zcode-appserver', model: 'GLM-5.2', sessionId: 's-two', messages: u1 })) { /* drain */ }
+    const grown = [...u1, { role: 'assistant', content: [{ type: 'text', text: 'ok' }] }, { role: 'user', content: [{ type: 'text', text: '第二轮' }] }];
+    for await (const _ of twoTurn.stream({ provider: 'zcode-appserver', model: 'GLM-5.2', sessionId: 's-two', messages: grown })) { /* drain */ }
+    const createsOfTwo = () => twoTurnFake.calls.filter((c) => c.method === 'session/create').length;
+    const sendsOfTwo = twoTurnFake.calls.filter((c) => c.method === 'session/send');
+    check('ZB-43 端到端: 自然两轮只建一次会话（纯增长不重建）', createsOfTwo() === 1, `creates=${createsOfTwo()} sends=${sendsOfTwo.length}`);
     check(
-      '压缩交互: 前缀/系统提示被改写（压缩、编辑历史）⇒ 指纹变化',
-      appServer.conversationFingerprint(fpBase, 'sys') !== appServer.conversationFingerprint(fpBase, 'sys-compacted') &&
-        appServer.conversationFingerprint(fpBase, 'sys') !== appServer.conversationFingerprint([], 'sys')
+      'ZB-43 端到端: 续轮发的是最新用户消息而非全量重放',
+      typeof sendsOfTwo[1]?.params?.content === 'string' && sendsOfTwo[1].params.content.includes('第二轮') && !sendsOfTwo[1].params.content.includes('第一轮'),
+      String(sendsOfTwo[1]?.params?.content).slice(0, 90)
     );
+    const compacted = [{ role: 'user', content: [{ type: 'text', text: '【压缩摘要】' }] }, ...grown.slice(1)];
+    for await (const _ of twoTurn.stream({ provider: 'zcode-appserver', model: 'GLM-5.2', sessionId: 's-two', messages: compacted })) { /* drain */ }
+    check('ZB-43 端到端: 前缀被改写（/compact）⇒ 重建会话并按首轮重放', createsOfTwo() === 2, `creates=${createsOfTwo()}`);
+    twoTurn.dispose();
     check(
-      '压缩交互: 重建日志点明常见诱因与一次性成本（可诊断）',
+      '压缩交互: 重建日志点明诱因与一次性成本（可诊断）',
       /\/compact 压缩/.test(appServerSrcForWs) && /全量重放/.test(appServerSrcForWs)
     );
   }
