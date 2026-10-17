@@ -1731,6 +1731,11 @@ async function assertRejects(promise, pattern, label) {
         wsSecond.workspace === norm('C:\\proj-b'),
       j(createsOf(followAdapter).map((c) => c.params.workspace.workspacePath))
     );
+    check(
+      '1.2: 目录变更重建前**销毁**旧会话（session/close 带旧 sessionId）',
+      followAdapter.client.calls.some((c) => c.method === 'session/close' && c.params?.sessionId === 'sess-ws-1'),
+      j(followAdapter.client.calls.filter((c) => c.method === 'session/close').map((c) => c.params?.sessionId))
+    );
     await followAdapter.ensureSession('s-ws', 'GLM-5.2', 'max');
     check('ZB-42: 目录与模型档位都没变 ⇒ 复用会话（不重复 create）', createsOf(followAdapter).length === 2, String(createsOf(followAdapter).length));
     followAdapter.sessions.set('s-legacy', { sessionId: 'sess-legacy', firstTurn: false, modelId: 'GLM-5.2', reasoningLevel: 'max' });
@@ -1882,6 +1887,11 @@ async function assertRejects(promise, pattern, label) {
     const compacted = [{ role: 'user', content: [{ type: 'text', text: '【压缩摘要】' }] }, ...grown.slice(1)];
     for await (const _ of twoTurn.stream({ provider: 'zcode-appserver', model: 'GLM-5.2', sessionId: 's-two', messages: compacted })) { /* drain */ }
     check('ZB-43 端到端: 前缀被改写（/compact）⇒ 重建会话并按首轮重放', createsOfTwo() === 2, `creates=${createsOfTwo()}`);
+    check(
+      '1.2: 历史改写重建前也销毁旧会话（session/close）',
+      twoTurnFake.calls.some((c) => c.method === 'session/close' && c.params?.sessionId === 'sess-1'),
+      j(twoTurnFake.calls.filter((c) => c.method === 'session/close').map((c) => c.params?.sessionId))
+    );
     twoTurn.dispose();
     check(
       '压缩交互: 重建日志点明诱因与一次性成本（可诊断）',

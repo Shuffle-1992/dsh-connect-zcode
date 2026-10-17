@@ -159,7 +159,17 @@ entryId: include:zcode-connect  moduleName: dsh-connect-zcode  enabled: true  fi
 | **6.1 P2** | `keyFingerprint` 打印 `head=前8*** tail=***后4`（49 字符 key 露 12 个明文字节进宿主日志） | 改为 `sha256:<前12位十六进制>`，**零明文字节** | ✅ 既有断言改写 + 新断言（正则校验格式且不含片段） |
 | **3.3 / 3.5** | 死字段 `client.lastChannel`（只写不读）；`dispose()` 收尾后未清 `activeStreams` | 删字段；`activeStreams.clear()` | ✅ 静态断言 |
 
-**最终 backlog（未做，附理由）**：**1.2**（旧会话 `session/close`）需先确认 ZCode CLI 是否有该 RPC；**1.4**（队列超时静默放行）属行为变更，需真机证据；**2.2**（gift 模型行三处实现合一）为解耦/防漂移项（当前无观测缺陷），留单独一批；**3.1**（冗余 `export`）低价值；**5.4/5.5/5.7**（更多错误路径与并发断言）随 1.4/1.2 一并做。
+**第五批（同日）：审查 1.2 根治（ZB-45）—— 旧会话真正销毁**
+
+| # | 发现 | 处理 |
+|---|---|---|
+| **1.2 P2** | 丢弃本地映射时只补发 `session/stop`（通知"放弃回合"）⇒ 会话在 agent 进程里仍以 `desktop-continuous` 订阅**继续存活**，反复重建（目录变更 / 历史改写 / 失效恢复）会持续堆积 | 先**离线探明协议面**：`zcode.cjs`（14.4 MB）里 `session/*` 共 **22 个**方法，**含 `session/close`** ✓（`session/close` 字符串实测存在）。据此新增 `closeSession(entry, reason)`（best-effort：失败只告警不影响主流程），并在**目录变更重建**与**历史改写重建**两处调用 |
+
+- 验证：`selfcheck` **330/330**（新增两条运行时断言：重建前 `session/close` 带**旧** sessionId）
+- 未验证：`session/close` 的**参数形状**按兄弟方法（`session/stop`/`session/read`）推断为 `{ sessionId }`；
+  best-effort 语义下即使形状不符也只是告警，不会破坏主流程（真机日志可确证）
+
+**最终 backlog（未做，附理由）**：**1.4**（队列超时静默放行 ⇒ 极端情况下同会话双流并行）属**行为变更**，需真机证据与设计取舍；**2.2**（gift 模型行三处实现合一）为解耦/防漂移项（当前无观测缺陷），建议单独一批；**3.1**（冗余 `export`）低价值；**5.4/5.5/5.7**（更多错误路径与并发断言）随 1.4 一并做。
 
 **独立复核结论（另一只读分析，2026-10-17）——候选逐条：**
 
