@@ -2525,6 +2525,15 @@ async function assertRejects(promise, pattern, label) {
   }
   check('client: 语法合法（new Function 解析）', parsed === true, parsed instanceof Error ? parsed.message : '');
   check('client: 信封自足（零静态 import；require 仅限宿主提供的 react）', !/\bimport\s/.test(clientSource) && !/require\("(?!react")/.test(clientSource));
+  /* ZB-42/43 的"跟随是否生效"原先只能翻日志 ⇒ 面板显示它（状态文档 `workspace` 字段消费点）。 */
+  check(
+    'client: 面板显示 app-server 工作目录跟随状态（workspace → 中文行）',
+    clientSource.includes('workspaceLineText') &&
+      clientSource.includes('status?.workspace') &&
+      clientSource.includes('工作目录') &&
+      clientSource.includes('跟随当前会话') &&
+      clientSource.includes('回落（未取到会话目录）')
+  );
 
   const hadWindow = typeof globalThis.window !== 'undefined';
   const realWindow = globalThis.window;
