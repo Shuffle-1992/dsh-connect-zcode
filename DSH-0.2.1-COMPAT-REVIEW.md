@@ -178,6 +178,31 @@ entryId: include:zcode-connect  moduleName: dsh-connect-zcode  enabled: true  fi
 
 **第七批（同日）：3.1 冗余导出清理（ZB-47）** —— 11 处 `export` 只在本文件内部使用（`runtimePlatformDir` / `HOST_INJECTED_TEACHING_KIND` / `TOOL_RULE_HEAD` / `BRIDGE_NOTE` / `STATIC_MODEL_NAMES` / `readPackageVersionNear` / `defaultZcodeLogDir` / `findNewestBalanceLine` / `parseBalanceLine` / `parseLineTimestamp` / `redactStatusText`），全仓库（含 test/scripts）外部引用 0 ⇒ 去掉 `export` 关键字（避免"导出但没人用"的假 API）。`selfcheck` 334/334、`compat-check` PASS。
 
+**第八批（同日）：真机事故 ZB-48 —— `Async config validation is not supported`**
+
+> 另一个会话在 toggle 插件时报：`zcode-connect (dsh-connect-zcode): TypeError: Async config validation is not supported`
+> （DSH 0.2.1-rc.2 起**不再支持异步 Config 校验**）。
+
+**根因（两层，均已核实）**：
+1. `@deepseek-ai/schemastery` **3.18.5 把入口从 `lib/index.js` 改成 `lib/index.mjs` / `lib/index.cjs`**，
+   而 `lib/host-modules.js` 的候选文件是**静态清单**（只列 `lib/index.js` / `dist/index.js` / `index.js`）
+   ⇒ 候选全部落空 ⇒ Config **悄悄降级**成手写 schema（探针实测可复现"入口不可达"）。
+2. 手写降级 schema 的 `'~standard'.validate` 当时写成 **`async`** ⇒ DSH 0.2.1 直接抛 TypeError（每次 toggle 必现）。
+
+**修复（两道防线，互为兜底）**：
+- `lib/host-modules.js`：解析改为**清单驱动**（新增 `manifestEntries()`，读包自己的 `package.json` 的
+  `exports['.'].import/require/default` + `module` + `main` 再加载）；静态清单保留为兜底并补 `.mjs/.cjs`。
+- `index.js`：`fallbackConfigSchema().validate` 改为**同步**（并导出仅供自检断言"同步"这一事实）。
+
+**验证**：
+- 新增 `scripts/probe-host-modules.mjs`（**离线**读 asar 头，零额度、不启动 DSH）→ **PROBE PASS**：
+  `schemastery → lib/index.mjs（manifest）`（正是修复前落空的那条）、`dsh-llm → lib/index.js（manifest）`、
+  `dsh-llm-pi-ai → lib/index.js（manifest）`、`pi-ai → dist/index.js（manifest）`；
+- `selfcheck` **337/337**（+3：全链路无 `async validate`、降级校验返回**非 Promise**、清单驱动实现存在）；
+- `compat-check` **COMPAT PASS**。
+
+**待真机确认**：重载插件 / 重启 DSH 后再 toggle，该 TypeError 应消失；若仍出现，请把报错文本发来（届时说明还有第三处异步校验点）。
+
 **最终 backlog（未做，附理由）**：**5.4/5.5**（`suppressDeath` 错误路径、账号家族漂移的**更多**断言 —— 行为已修，1.10 的断言已覆盖主路径，边界断言可后续补）；真机三项（1.1 两轮裁决 / workspace 字段 / HMR）待有额度。
 
 **独立复核结论（另一只读分析，2026-10-17）——候选逐条：**

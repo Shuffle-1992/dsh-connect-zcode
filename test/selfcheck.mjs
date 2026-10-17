@@ -1943,6 +1943,37 @@ async function assertRejects(promise, pattern, label) {
       !/lastChannel/.test(appServerSrcForWs) && /this\.activeStreams\.clear\(\)/.test(appServerSrcForWs)
     );
 
+    /* ── ZB-48（真机事故）：Config 校验必须**同步** + 宿主模块解析要清单驱动 ────────
+     * 事故：`schemastery` 3.18.5 入口改成 `lib/index.mjs` ⇒ 静态候选全落空 ⇒ 降级到
+     * 手写 schema，而它当时是 `async validate` ⇒ DSH 0.2.1 每次 toggle 抛
+     * `TypeError: Async config validation is not supported`。 */
+    check(
+      'ZB-48: Config 校验全链路无 async（0.2.1 不再支持异步校验）',
+      !/async\s+validate/.test(indexSrcForWs) && !/async\s+validate/.test(readFileSync(join(PLUGIN_ROOT, 'lib', 'client.js'), 'utf8'))
+    );
+    const fallbackSchema = (await import('../index.js')).fallbackConfigSchema;
+    let fallbackResult = null;
+    let fallbackSync = false;
+    try {
+      const out = fallbackSchema()['~standard'].validate({ unknownField: 1 });
+      fallbackSync = out !== null && typeof out === 'object' && typeof out.then !== 'function';
+      fallbackResult = out;
+    } catch {
+      fallbackSync = false;
+    }
+    check(
+      'ZB-48: 手写降级 schema 的 validate 返回**同步对象**（不是 Promise）',
+      fallbackSync === true && fallbackResult !== null && typeof fallbackResult === 'object' && 'value' in fallbackResult,
+      String(fallbackSync)
+    );
+    const hostModulesSrc = readFileSync(join(PLUGIN_ROOT, 'lib', 'host-modules.js'), 'utf8');
+    check(
+      'ZB-48: 宿主模块解析改为**清单驱动**（读包 package.json），静态候选仍保留兜底',
+      /function manifestEntries/.test(hostModulesSrc) &&
+        /manifestEntries\(join\(root, pkg\.dir\)\)/.test(hostModulesSrc) &&
+        /lib\/index\.mjs/.test(hostModulesSrc)
+    );
+
     /* ── 审查 2.2：赠送通道"目录行口径"只此一份（纯函数表）──────────────────── */
     const giftMod = await import('../lib/gift-catalog.js');
     check(

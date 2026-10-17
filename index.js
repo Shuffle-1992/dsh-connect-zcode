@@ -212,13 +212,22 @@ function normalizeConfig(config) {
   };
 }
 
-/** 手写 Standard Schema v1 降级（Z10-1：cordis 只认 ~standard.validate；只归一不抛，激活永不被配置打崩）。 */
-function fallbackConfigSchema() {
+/**
+ * 手写 Standard Schema v1 降级（Z10-1：cordis 只认 ~standard.validate；只归一不抛，激活永不被配置打崩）。
+ *
+ * ⚠️ **必须同步**：DSH 0.2.1 起**不再支持异步 Config 校验**（真机报错
+ * `TypeError: Async config validation is not supported`，每次 toggle 插件都会抛出）。
+ * 触发链：`schemastery` 3.18.5 把入口从 `lib/index.js` 改成 `lib/index.mjs`/`.cjs`
+ * ⇒ 旧候选清单全部落空 ⇒ 降级被启用，而这里曾写成 `async` ⇒ 报错。
+ * 现在两道防线：`lib/host-modules.js` 改为**清单驱动**解析入口；本函数保持**同步**。
+ * 导出仅为本项目自检断言"同步"这一事实（不是对外 API）。
+ */
+export function fallbackConfigSchema() {
   return {
     '~standard': {
       version: 1,
       vendor: 'dsh-connect-zcode-fallback',
-      async validate(value) {
+      validate(value) {
         return { value: normalizeConfig(value) };
       },
     },
