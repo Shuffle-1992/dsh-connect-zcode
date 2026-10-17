@@ -2,7 +2,7 @@
   "name": "dsh-connect-zcode",
   "displayName": "DSH Connect ZCode",
   "description": "把 ZCode（Z.ai / 智谱 BigModel）接入 DeepSeek Harness：Coding Plan 走标准 anthropic 通道，Start Plan / 活动赠送额度走官方 agent app-server 通道；含模型显隐、200K/1M 上下文预算、推理档/图片能力面板与赠送额度进度条。",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "license": "MIT",
   "type": "module",
   "icon": "./icon.svg",
@@ -21,7 +21,12 @@
     "llm-provider"
   ],
   "engines": {
-    "node": "^22.19.0 || >=24.0.0"
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.2.0-rc.2 <0.3.0-0"
+  },
+  "scripts": {
+    "check:compat": "node scripts/compat-check.mjs",
+    "check:compat:self-test": "node scripts/compat-check.mjs --self-test"
   },
   "exports": {
     ".": "./index.js",

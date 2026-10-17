@@ -128,6 +128,36 @@ dsh plugin --profile desktop add /absolute/path/to/dsh-connect-zcode
 node test/selfcheck.mjs     # 应输出 SELFCHECK PASS：N/N，exit 0（N 随断言增加而变，不写死）
 ```
 
+### DSH 版本兼容性（0.2.1 适配）
+
+本插件在 `package.json` 声明了 **`engines.dsh: ">=0.2.0-rc.2 <0.3.0-0"`** —— DSH 0.2.1 起，
+第三方插件的版本兼容性**优先按 `engines.dsh` 判断**（DSH 的判定使用 `includePrerelease` 语义，
+预发布版本如 `0.2.1-rc.1` 也能匹配，故无需为每个 rc 改区间）。
+
+**升级 DSH 前后各跑一次兼容自检**（离线、零依赖、不读凭据、不 spawn）：
+
+```bash
+node scripts/compat-check.mjs                      # 自动探测本机 DSH（读 app.asar）
+node scripts/compat-check.mjs --dsh-version 0.2.1-rc.1   # 升级前**预演**目标版本
+node scripts/compat-check.mjs --json               # 机器可读
+node scripts/compat-check.mjs --self-test          # 只跑内置 semver 自测
+```
+
+输出末行 `COMPAT PASS` 即兼容（exit 0）；`COMPAT FAIL` 会指明失败项。检查项：
+
+| # | 检查 | 说明 |
+|---|---|---|
+| ① | `engines.dsh` | 当前 DSH 是否落在声明区间（按 DSH 的真实判定语义） |
+| ② | `engines.node` | 当前 Node 是否在支持区间 |
+| ③ | `peerDependencies` | 同时报告 pnpm 默认语义与 DSH 语义（见下方说明，**不单独判失败**） |
+| ④ | `dsh.client.inject` | 注入的内部 UI 模块在**当前 DSH 运行时**里是否都存在（读 asar） |
+| ⑤ | 清单契约 | `dsh.bundle.patch` 文件存在、`cordis.patch.yml` 为标准 `insert` 结构、`exports` 含 `./package.json`（0.2.1 子路径规则） |
+| ⑥ | semver 自测 | 内置判定器对 10 组经 Node semver 7.8.4 实测过的用例（防自检自身算错） |
+
+> **关于 ③**：`peerDependencies` 的区间是按"稳定版语义"写的（`>=0.1.7-rc.1 <0.3.0-0`），在 pnpm 的**默认**语义下对预发布 DSH 版本会显示"不满足"——本机是 **junction 链接安装**、DSH 自身的兼容判定又使用 `includePrerelease` 语义，因此**不构成阻塞**；脚本以 ℹ️ 报告该差异而不是判失败。
+>
+> 0.2.1 的 12 项破坏性变更对本插件**0 命中**（逐条比对与证据见 [`DSH-0.2.1-COMPAT-REVIEW.md`](./DSH-0.2.1-COMPAT-REVIEW.md)）。
+
 ---
 
 ## 配置
