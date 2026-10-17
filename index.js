@@ -185,7 +185,9 @@ function normalizeConfig(config) {
     contextBudgets: contextBudgetsOf(v),
     modelOverrides: modelOverridesOf(v),
     // ── app-server 通道（第二 provider；默认关 = 对既有行为零回归） ──
-    appServer: v.appServer === true,
+    /* ZB-53：Start Plan（app-server）接入**不完整**，已停用 —— 只保留 Coding Plan 通道。
+     * 这里强制 false（无视历史配置），保证模型选择器/面板不再出现第二个 provider。 */
+    appServer: false,
     zcodeCliPath: typeof v.zcodeCliPath === 'string' ? v.zcodeCliPath : '',
     zcodeCliNode: nonEmptyStr(v.zcodeCliNode, 'node'),
     zcodeDataBaseDir: typeof v.zcodeDataBaseDir === 'string' ? v.zcodeDataBaseDir : '',
@@ -990,41 +992,7 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
         /* ZB-42：app-server 会话工作目录的解析留痕（跟随是否真的生效、用的是哪个目录）。
          * 这是**唯一**能证明 `ctx.get('workingDirectory')` 可达性是否生效的运行时观测点。 */
         workspace: () => workspaceTracker.snapshot(),
-        /* 赠送额度剩余：**只读 ZCode 自己写的日志**（`~/.zcode/v2/logs/*.log` 里它自己的
-         * `billing/balance` 响应）。为什么不自己调上游：该端点属 Plan 通道，外部直连实测会被
-         * 风控拦（3012），而客户端本来就在调、结果就在日志里 —— 零新请求、零风控面。 */
-        planQuota: () => readPlanQuota({ dataBaseDir: cfg.zcodeDataBaseDir }),
-        /* 赠送额度通道（app-server）的注册状态 + 面板可配的模型清单。
-         * 面板据此渲染「赠送额度通道」区块；未启用/未注册时给出**可操作原因**。 */
-        appServer: () => {
-          /* 推理档事实（官方 variants）：与适配器 `_catalog()` 同源（`reasoningFacts`），
-           * 面板据此渲染"默认思考档"单选；每次现读 config.json，不缓存（跟随官方配置变化）。 */
-          const reasoningMeta = appServerState.enabled
-            ? readStartPlanReasoningMeta(resolveAccountProviderId(cfg))
-            : {};
-          return {
-            ...appServerState,
-            toolPolicy: cfg.appServerToolPolicy,
-            reasoningLevel: cfg.appServerReasoningLevel,
-            imagesSupported: canImages(),
-            models: appServerState.enabled
-              ? readGiftModels().map((id) => {
-                  const entry = START_PLAN_CATALOG.find((m) => m.id === id) ?? { id, name: id, contextWindow: 200000 };
-                  const override = readBudgets()[id];
-                  const facts = reasoningFacts(reasoningMeta, id, cfg.appServerReasoningLevel);
-                  return {
-                    id: entry.id,
-                    name: entry.name ?? entry.id,
-                    /* 与发现行、适配器同一口径（`lib/gift-catalog.js`）——此前这条少了非整数兜底。 */
-                    contextWindow: giftContextWindow(entry, override),
-                    reasoningLevels: facts.levels,
-                    defaultReasoningLevel: facts.defaultLevel,
-                  };
-                })
-              : [],
-          };
-        },
-      })
+              })
     );
   } catch {
     /* webServer 服务缺席 → 面板显示状态不可用 */
