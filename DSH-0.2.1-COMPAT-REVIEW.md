@@ -176,7 +176,9 @@ entryId: include:zcode-connect  moduleName: dsh-connect-zcode  enabled: true  fi
 | **2.2 P2** | 赠送通道"模型 id 归一 + 上下文预算覆盖 + 兜底"在**三处**各写一遍（发现回调行 / 面板状态行 / 适配器 `_catalog`）⇒ 任何一处改口径都会让"面板显示 / 宿主看到 / 实际发送"静默漂移；另发现状态行少了一处非整数元数据兜底 | 新增 `lib/gift-catalog.js`：`normalizeGiftModelIds` / `giftContextWindow` / `giftMaxTokens`（**只统一共同口径**，各处差异字段仍留调用点；常量复用 `model-meta` 单一来源，不新造字面量）；三处 + `resolveAppServerCatalog` 全部改用 | ✅ 纯函数表（id 归一 3 例、上下文口径 5 例）+ 静态核对"旧的各自口径代码已清零" |
 | **1.4 P1** | 同一会话排队等上一轮最多 60s，**超时后静默放行** ⇒ 两轮并行 → 后一轮撞 `already running` → 撞锁恢复阶梯**硬重启子进程**，把前一轮也杀掉 | `settleWithin` 改为返回"是否落定"；队列上界改为**回合超时**（上一轮的合法上界），仍不释放则**明确报错且不发送**（先释放尾锁）；排队 >60s 打 warn。宁可一次可重试的失败，也不并行污染会话 | ✅ 端到端断言：上一轮永不结束 ⇒ 抛"排队超时"且**零 `session/send`** |
 
-**最终 backlog（未做，附理由）**：**3.1**（11 处只在本文件使用的 `export`，纯清理、低价值）；**5.4/5.5**（`suppressDeath` 错误路径、账号家族漂移的更多断言 —— 行为已修，断言可后续补）；真机三项（1.1 两轮裁决 / workspace 字段 / HMR）待有额度。
+**第七批（同日）：3.1 冗余导出清理（ZB-47）** —— 11 处 `export` 只在本文件内部使用（`runtimePlatformDir` / `HOST_INJECTED_TEACHING_KIND` / `TOOL_RULE_HEAD` / `BRIDGE_NOTE` / `STATIC_MODEL_NAMES` / `readPackageVersionNear` / `defaultZcodeLogDir` / `findNewestBalanceLine` / `parseBalanceLine` / `parseLineTimestamp` / `redactStatusText`），全仓库（含 test/scripts）外部引用 0 ⇒ 去掉 `export` 关键字（避免"导出但没人用"的假 API）。`selfcheck` 334/334、`compat-check` PASS。
+
+**最终 backlog（未做，附理由）**：**5.4/5.5**（`suppressDeath` 错误路径、账号家族漂移的**更多**断言 —— 行为已修，1.10 的断言已覆盖主路径，边界断言可后续补）；真机三项（1.1 两轮裁决 / workspace 字段 / HMR）待有额度。
 
 **独立复核结论（另一只读分析，2026-10-17）——候选逐条：**
 
