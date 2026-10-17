@@ -137,7 +137,7 @@ node scripts/compat-check.mjs --self-test          # 只跑内置 semver 自测
 
 > **关于 ③**：`peerDependencies` 的区间是按"稳定版语义"写的（`>=0.1.7-rc.1 <0.3.0-0`），在 pnpm 的**默认**语义下对预发布 DSH 版本会显示"不满足"——本机是 **junction 链接安装**、DSH 自身的兼容判定又使用 `includePrerelease` 语义，因此**不构成阻塞**；脚本以 ℹ️ 报告该差异而不是判失败。
 >
-> **关于 ④**：DSH **0.2.1 合并了部分内部 UI 包**（`dsh-client-ui-slots` / `dsh-client-ui-primitives` 已不再作为独立包存在）。本插件的客户端代码**不 import 任何 `@deepseek-ai/*` 包**，`inject` 仅作加载顺序声明，故**无影响**（0.2.1-rc.2 实测：`plugins.bundle.config` 注册点正常挂载；赠送额度进度条曾用的 `conversation.composer.dock` 随该通道一起下线）。该声明保留是为了向后兼容 0.2.0 系列；需要把它当硬门禁时用 `--strict-inject`。
+> **关于 ④**：DSH **0.2.1 合并了部分内部 UI 包**（`dsh-client-ui-slots` / `dsh-client-ui-primitives` 已不再作为独立包存在）。本插件的客户端代码**不 import 任何 `@deepseek-ai/*` 包**，`inject` 仅作客户端**加载顺序**声明，故**无影响**（0.2.1-rc.2 实测：`plugins.bundle.config` 注册点正常挂载）。> 这两条死条目**评估后保留**：DSH 0.2.0 系列仍以独立包提供它们，而"删除后是否影响 `slots` 服务激活"无法离线验证 —— 为一条信息性警告冒面板挂载风险不划算。> 该声明需要当硬门禁时用 `--strict-inject`。
 >
 > 0.2.1 的 12 项破坏性变更对本插件**0 命中**；升级后实测记录（含 client 插槽 occupant 证据）见 [`DSH-0.2.1-COMPAT-REVIEW.md`](./DSH-0.2.1-COMPAT-REVIEW.md) §F。
 
