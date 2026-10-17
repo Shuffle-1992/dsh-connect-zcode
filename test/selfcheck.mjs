@@ -246,10 +246,11 @@ async function assertRejects(promise, pattern, label) {
     const list = credStore.readStoredApiKeys(store);
     return list.length === 1 && list[0].id === 'unknown';
   })());
-  check('凭据库: keyFingerprint 不含完整 key', (() => {
+  check('凭据库: keyFingerprint 零明文字节（只出 sha256 前缀）', (() => {
     const k = mkKey('a');
     const fp = credStore.keyFingerprint(k);
-    return !fp.includes(k) && fp.includes('***');
+    /* 早期实现会打印 `head=前8*** tail=***后4`（49 字符 key 里露 12 个明文字节）⇒ 已收紧为哈希。 */
+    return !fp.includes(k) && /^sha256:[0-9a-f]{12}$/.test(fp);
   })());
 
   /* 真实网关契约（2026-10-01 实测，**本组断言的核心**）：
@@ -1885,6 +1886,51 @@ async function assertRejects(promise, pattern, label) {
     check(
       '压缩交互: 重建日志点明诱因与一次性成本（可诊断）',
       /\/compact 压缩/.test(appServerSrcForWs) && /全量重放/.test(appServerSrcForWs)
+    );
+
+    /* ── 审查 1.10：复用会话时**账号家族**变化必须重新 setModel（旧实现只看 model/level）── */
+    const acctCfg = { ...cfgLike, appServerWorkspace: 'C:\\acct', appServerWorkspaceFollow: false, appServerInjectAccount: false };
+    const acctAdapter = mkWsAdapter(acctCfg, async () => undefined);
+    acctAdapter.sessions.set('s-acct', {
+      sessionId: 'sess-acct',
+      workspace: norm('C:\\acct'),
+      accountProviderId: 'account:STALE-family',
+      firstTurn: false,
+      modelId: 'GLM-5.2',
+      reasoningLevel: 'max',
+      history: undefined,
+    });
+    await acctAdapter.ensureSession('s-acct', 'GLM-5.2', 'max');
+    const acctSetModels = acctAdapter.client.calls.filter((c) => c.method === 'session/setModel').length;
+    check('1.10: 复用会话时账号家族变化 ⇒ 重新 setModel（不再沿用旧 provider）', acctSetModels === 1, `setModel=${acctSetModels}`);
+    const acctEntry = acctAdapter.sessions.get('s-acct');
+    check(
+      '1.10: 条目记录最新账号家族（供下次比对）',
+      typeof acctEntry?.accountProviderId === 'string' && acctEntry.accountProviderId !== 'account:STALE-family',
+      String(acctEntry?.accountProviderId)
+    );
+    const acctCallsBefore = acctAdapter.client.calls.length;
+    await acctAdapter.ensureSession('s-acct', 'GLM-5.2', 'max');
+    check(
+      '1.10: 家族与档位都没变 ⇒ 直接复用（零额外 RPC）',
+      acctAdapter.client.calls.length === acctCallsBefore,
+      `newCalls=${acctAdapter.client.calls.length - acctCallsBefore}`
+    );
+    acctAdapter.dispose();
+
+    /* ── 审查 6.1：keyFingerprint 零明文字节 ───────────────────────────────── */
+    const credStoreMod = await import('../lib/credential-store.js');
+    const fpText = credStoreMod.keyFingerprint('sk-abcdefghijklmnop0123456789');
+    check(
+      '6.1: keyFingerprint 不再打印 key 片段（只出 sha256 前缀）',
+      /^sha256:[0-9a-f]{12}$/.test(fpText) && !fpText.includes('sk-abcdef') && !fpText.includes('6789'),
+      fpText
+    );
+
+    /* ── 审查 3.3 / 3.5：死字段与容器清理（简化）──────────────────────────── */
+    check(
+      '3.3/3.5 简化: 死字段 lastChannel 已删、dispose 清空 activeStreams',
+      !/lastChannel/.test(appServerSrcForWs) && /this\.activeStreams\.clear\(\)/.test(appServerSrcForWs)
     );
   }
 
