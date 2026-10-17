@@ -17,6 +17,7 @@
  *   node scripts/compat-check.mjs --dsh-version 0.2.1-rc.1
  *   node scripts/compat-check.mjs --asar "D:\\DeepSeek\\resources\\app.asar"
  *   node scripts/compat-check.mjs --json              # 机器可读输出
+ *   node scripts/compat-check.mjs --strict-inject     # 把"inject 模块运行时不存在"当硬失败
  *   node scripts/compat-check.mjs --self-test         # 只跑内置 semver 自测
  *
  * 判定：末行 `COMPAT PASS` / `COMPAT FAIL`；exit 0 = 兼容。
@@ -138,9 +139,22 @@ function readAsar(asarPath) {
     const dshFiles = header.files?.dsh?.files ?? {};
     const pkgText = readFileEntry(dshFiles['package.json']);
     const version = pkgText ? JSON.parse(pkgText).version : null;
-    const dshModules = header.files?.dsh?.files?.node_modules?.files ?? {};
-    const scoped = dshModules['@deepseek-ai']?.files ?? {};
-    return { version, scoped: new Set(Object.keys(scoped)) };
+    /* 收集**全 asar** 的 @deepseek-ai 包名与路径 —— 0.2.1 把部分内部 UI 包合并/改名
+     * （实测 dsh-client-ui-slots / -primitives 已不再作为独立包存在），
+     * 只查 dsh/node_modules 会误判成"缺失"。 */
+    const names = new Set();
+    const paths = new Set();
+    const walk = (node, parts) => {
+      for (const [n, entry] of Object.entries(node?.files ?? {})) {
+        const p = [...parts, n];
+        if (parts.length <= 8) paths.add(p.join('/'));
+        const i = p.indexOf('@deepseek-ai');
+        if (i >= 0 && p[i + 1]) names.add(p[i + 1]);
+        if (entry.files) walk(entry, p);
+      }
+    };
+    walk(header, []);
+    return { version, scoped: names, paths: [...paths] };
   } finally {
     closeSync(fd);
   }
@@ -208,16 +222,29 @@ else {
   }
 }
 
-/* ④ dsh.client.inject 的内部模块在运行时是否存在 */
+/* ④ dsh.client.inject：这些是"宿主客户端需先提供哪些模块"的声明。
+ * 0.2.1 合并/改名了部分内部 UI 包（实测 dsh-client-ui-slots / -primitives 不再作为独立包存在），
+ * 而插件客户端半边**照常挂载**（客户端代码并不 import 这些包，声明主要用于加载顺序）。
+ * 因此：运行时找不到 → ⚠️ 警告（附实测指引），**不判 FAIL**；要当硬门禁用 --strict-inject。 */
 const inject = PKG.dsh?.client?.inject ?? [];
+const strictInject = argv.includes('--strict-inject');
 if (inject.length === 0) add('PASS', 'dsh.client.inject', '未声明（纯 host 侧插件）');
 else if (!asar?.scoped) add('SKIP', 'dsh.client.inject', `运行时不可读（${ASAR}）——无法核对 ${inject.length} 个内部模块`);
 else {
-  const missing = inject.filter((m) => {
+  const absent = inject.filter((m) => {
     const bare = m.replace(/^@deepseek-ai\//, '');
-    return !asar.scoped.has(bare);
+    if (asar.scoped.has(bare)) return false;
+    return !asar.paths.some((p) => p.includes(bare)); // 全 asar 路径里也找不到 ⇒ 运行时未以独立包提供
   });
-  add(missing.length === 0 ? 'PASS' : 'FAIL', 'dsh.client.inject', missing.length === 0 ? `${inject.length} 个内部模块在运行时均存在` : `缺失: ${missing.join(', ')}`);
+  if (absent.length === 0) add('PASS', 'dsh.client.inject', `${inject.length} 个声明模块在运行时均可解析（包或路径）`);
+  else
+    add(
+      strictInject ? 'FAIL' : 'WARN',
+      'dsh.client.inject',
+      `运行时未以独立包提供: ${absent.join(', ')} —— DSH 0.2.1 合并了部分内部 UI 包；` +
+        `该声明只影响客户端加载顺序，插件客户端半边是否真的挂上请用 client Slots inspect 实测` +
+        `（本机 0.2.1-rc.2 实测：plugins.bundle.config 与 conversation.composer.dock 均已有本插件 occupant）`,
+    );
 }
 
 /* ⑤ 清单契约 */

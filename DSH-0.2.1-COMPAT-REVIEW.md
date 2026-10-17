@@ -79,6 +79,33 @@
 
 **升级后的操作**：更新 DSH → `node scripts/compat-check.mjs` 应仍为 `COMPAT PASS` → 再按 §六 做真机功能验证。
 
+### F. 升级后验证记录（2026-10-17，已更新到 **DSH 0.2.1-rc.2**）
+
+**上游**：`dsh-v0.2.1-rc.2` 发布 2026-10-17T08:16:33Z；`rc.1 → rc.2` 仅 **9 个提交**（DeepSeek-V4.1-Flash-1017 适配 + DeepSeek Search/Fetch API），**无新增破坏性变更** ⇒ §三 的 12 项比对结论继续成立。
+
+**① 兼容自检**（`node scripts/compat-check.mjs`）→ **COMPAT PASS（0 失败 / 1 警告）**：`engines.dsh` ✅（0.2.1-rc.2 命中）、清单契约 ✅、semver 自测 10/10 ✅。
+
+**② 插件加载状态**（`plugin_manager list_plugins`）✅ host 半边：
+```
+entryId: include:zcode-connect  moduleName: dsh-connect-zcode  enabled: true  fiberPhase: active
+```
+
+**③ 客户端半边实测**（client `Slots.listSubTree`）✅ **两个注册点都挂上了**：
+| 槽位 | occupant |
+|---|---|
+| `plugins.bundle.config` | `{ registrant: dsh-connect-zcode-client, key: dsh-connect-zcode, active: true }` |
+| `conversation.composer.dock` | `{ registrant: dsh-connect-zcode-client, id: zcode-quota-bar, order: 10, active: true }` |
+
+**④ 新发现：0.2.1 合并了部分内部 UI 包（不影响本插件）**
+- `@deepseek-ai/dsh-client-ui-slots` 与 `@deepseek-ai/dsh-client-ui-primitives` **在 0.2.1 全 asar 中已不存在**（306 个 `@deepseek-ai` 包里没有；renderer bundle 中也无该 id）
+- 但**客户端半边照常挂载** ⇒ 原因：`lib/client.js` **不 import 任何 `@deepseek-ai/*` 包**（grep 0 命中），`dsh.client.inject` 只是**加载顺序声明**
+- **决定：inject 列表保持现状，不改** —— 旧名在 0.2.0-rc.2（本插件声明的最低版本）里是真实存在的包，删掉会破坏向后兼容；留着在 0.2.1 上已被证明无害
+- 自检脚本 ④ 相应从"判 FAIL"改为 **⚠️ 警告 + 实测指引**（需要硬门禁时加 `--strict-inject`）
+
+**⑤ 待办：真机功能验证**（§六 清单，需要一次真实模型调用）：
+- UI 侧：`/model` 里应能看到 zcode 分组与模型；设置页应能看到本插件卡片与额度条
+- 通道侧：`node scripts/verify-appserver-channel.mjs`（**会消耗一次真实额度**；Start Plan 的 300M 活动窗口已于 10-12 09:00 结束，若报 `1005 exceed quota limit` 属**额度时序**而非故障）
+
 ---
 
 ## 一、结论速览

@@ -150,13 +150,15 @@ node scripts/compat-check.mjs --self-test          # 只跑内置 semver 自测
 | ① | `engines.dsh` | 当前 DSH 是否落在声明区间（按 DSH 的真实判定语义） |
 | ② | `engines.node` | 当前 Node 是否在支持区间 |
 | ③ | `peerDependencies` | 同时报告 pnpm 默认语义与 DSH 语义（见下方说明，**不单独判失败**） |
-| ④ | `dsh.client.inject` | 注入的内部 UI 模块在**当前 DSH 运行时**里是否都存在（读 asar） |
+| ④ | `dsh.client.inject` | 声明模块在**当前 DSH 运行时**能否解析（包或路径）；0.2.1 合并内部 UI 包后可能报 ⚠️，见下方说明 |
 | ⑤ | 清单契约 | `dsh.bundle.patch` 文件存在、`cordis.patch.yml` 为标准 `insert` 结构、`exports` 含 `./package.json`（0.2.1 子路径规则） |
 | ⑥ | semver 自测 | 内置判定器对 10 组经 Node semver 7.8.4 实测过的用例（防自检自身算错） |
 
 > **关于 ③**：`peerDependencies` 的区间是按"稳定版语义"写的（`>=0.1.7-rc.1 <0.3.0-0`），在 pnpm 的**默认**语义下对预发布 DSH 版本会显示"不满足"——本机是 **junction 链接安装**、DSH 自身的兼容判定又使用 `includePrerelease` 语义，因此**不构成阻塞**；脚本以 ℹ️ 报告该差异而不是判失败。
 >
-> 0.2.1 的 12 项破坏性变更对本插件**0 命中**（逐条比对与证据见 [`DSH-0.2.1-COMPAT-REVIEW.md`](./DSH-0.2.1-COMPAT-REVIEW.md)）。
+> **关于 ④**：DSH **0.2.1 合并了部分内部 UI 包**（`dsh-client-ui-slots` / `dsh-client-ui-primitives` 已不再作为独立包存在）。本插件的客户端代码**不 import 任何 `@deepseek-ai/*` 包**，`inject` 仅作加载顺序声明，故**无影响**（0.2.1-rc.2 实测：`plugins.bundle.config` 与 `conversation.composer.dock` 两个注册点都正常挂载）。该声明保留是为了向后兼容 0.2.0 系列；需要把它当硬门禁时用 `--strict-inject`。
+>
+> 0.2.1 的 12 项破坏性变更对本插件**0 命中**；升级后实测记录（含 client 插槽 occupant 证据）见 [`DSH-0.2.1-COMPAT-REVIEW.md`](./DSH-0.2.1-COMPAT-REVIEW.md) §F。
 
 ---
 
