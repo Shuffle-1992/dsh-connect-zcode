@@ -160,6 +160,14 @@ node scripts/compat-check.mjs --self-test          # 只跑内置 semver 自测
 >
 > 0.2.1 的 12 项破坏性变更对本插件**0 命中**；升级后实测记录（含 client 插槽 occupant 证据）见 [`DSH-0.2.1-COMPAT-REVIEW.md`](./DSH-0.2.1-COMPAT-REVIEW.md) §F。
 
+#### 用 0.2.1 新能力做的正向优化
+
+| 优化 | 用的新能力 | 行为变化与验证 |
+|---|---|---|
+| **app-server 会话工作目录跟随** | `working_directory` 服务（0.2.1 新增工具 + SDK 会话目录接口） | 旧行为恒用 `homedir()`（ZCode agent 在用户主目录跑、启动扫目录树，与 DSH 会话看到的目录不是同一个）；现在**默认跟随当前会话目录**，模型用 `working_directory` 工具中途改目录也跟随（此时重建 app-server 会话）。落地日志：`新建 app-server 会话 <id>（工作目录 <路径>）`、`[dsh-connect-zcode] 会话工作目录解析：session=… → …`；若后者打印 `(服务不可达/未取到 ⇒ 回落配置目录)` 说明宿主没暴露该服务。可用 `appServerWorkspaceFollow: false` 钉回固定目录。 |
+
+> 逐条候选评估（含**明确不做**的项：Session 状态记录、密钥脱敏、pi-ai 工具动态增删…）见 [`DSH-0.2.1-COMPAT-REVIEW.md`](./DSH-0.2.1-COMPAT-REVIEW.md) §G。
+
 ---
 
 ## 配置
@@ -447,7 +455,8 @@ ZCode Start Plan（赠送额度）→ GLM-5.3-Flash（赠送额度）        ←
 | `appServerReasoningLevel` | `max` | `session/setModel` 的推理档（low/high/max） |
 | `appServerToolPolicy` | `allow-all` | ⚠️ **安全面，见下** |
 | `appServerInjectAccount` | `true` | 注入套餐账户（GUI 同款） |
-| `appServerWorkspace` | 空 = 用户主目录 | 会话工作目录（勿指向巨型目录树，agent 启动会扫它） |
+| `appServerWorkspaceFollow` | `true` | **跟随当前会话的官方工作目录**（DSH 内置 `working_directory` 服务；模型用 `working_directory` 工具中途改目录也会跟随 —— 目录变化时重建 app-server 会话）。关掉则恒用 `appServerWorkspace` |
+| `appServerWorkspace` | 空 = 用户主目录 | 会话工作目录**兜底值**：只在"未跟随"或解析不到会话目录时生效（勿指向巨型目录树，agent 启动会扫它） |
 | `appServerRpcTimeoutMs` | `120000` | 单次 RPC 超时 |
 | `appServerTurnTimeoutMs` | `900000` | 单回合超时 |
 | `childEnvAllow` | `[]` | 额外透传给子进程的 env 名（默认只放行系统基础变量与 `ZCODE_*`） |

@@ -1662,6 +1662,105 @@ async function assertRejects(promise, pattern, label) {
       failUsage?.inputTokens === 200000 && failUsage?.outputTokens === 1000 && failChunks.some((c) => c.type === 'finish'),
       j(failUsage)
     );
+
+    /* ── ZB-42：app-server 会话工作目录跟随（DSH 0.2.1 官方 `working_directory` 服务）────
+     * 旧行为：恒用 `cfg.appServerWorkspace`（默认 `homedir()`）⇒ ZCode agent 与 DSH 会话
+     * 不在同一目录，且 agent 启动会扫用户主目录。新行为：默认跟随宿主解析出的**当前会话**
+     * 工作目录（模型用内置 working_directory 工具改目录也会跟随）；目录变化 ⇒ 重建会话。 */
+    const makeWsFake = () => {
+      const listeners = new Set();
+      const calls = [];
+      return {
+        disposed: false, calls, cliPath: '', cliNode: '', cwd: '', rpcTimeoutMs: 0, env: {}, lastChannel: null, onServerRequest: null,
+        onNotification(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+        write() {}, notify() {}, dispose() {}, async ensureStarted() {},
+        async request(method, params) {
+          calls.push({ method, params });
+          if (method === 'session/create') return { sessionId: `sess-ws-${calls.filter((c) => c.method === 'session/create').length}` };
+          return {};
+        },
+      };
+    };
+    const mkWsAdapter = (cfg, resolver) => {
+      const adapter = appServer.createAppServerAdapter({
+        BaseAdapter: class {}, LlmError: class LlmError extends Error {},
+        options: () => cfg, logger: {}, record: () => {}, gate: () => {},
+        ...(resolver === undefined ? {} : { resolveWorkspace: resolver }),
+      });
+      adapter.client = makeWsFake();
+      return adapter;
+    };
+    const createsOf = (adapter) => adapter.client.calls.filter((c) => c.method === 'session/create');
+
+    const followCfg = { ...cfgLike, appServerWorkspace: 'C:\\fallback-dir', appServerWorkspaceFollow: true };
+    let currentWs = 'C:\\proj-a';
+    /* 计数：既断言"回落正确"，也断言 resolver **真的被执行**（防"没执行也绿"）。 */
+    let resolverCalls = 0;
+    const followAdapter = mkWsAdapter(followCfg, async () => {
+      resolverCalls += 1;
+      return currentWs;
+    });
+    const wsFirst = await followAdapter.ensureSession('s-ws', 'GLM-5.2', 'max');
+    check(
+      'ZB-42: 建会话用宿主解析出的会话工作目录（而不是 homedir / 配置兜底）',
+      createsOf(followAdapter).length === 1 &&
+        createsOf(followAdapter)[0].params.workspace.workspacePath === 'C:\\proj-a' &&
+        wsFirst.workspace === 'C:\\proj-a',
+      `${j(createsOf(followAdapter)[0]?.params)} ws=${wsFirst.workspace}`
+    );
+    check('ZB-42: app-server 子进程 cwd 同步为该目录', followAdapter.client.cwd === 'C:\\proj-a', String(followAdapter.client.cwd));
+
+    currentWs = 'C:\\proj-b';
+    const wsSecond = await followAdapter.ensureSession('s-ws', 'GLM-5.2', 'max');
+    check(
+      'ZB-42: 会话工作目录中途变化 ⇒ 丢弃旧会话并按新目录重建',
+      createsOf(followAdapter).length === 2 &&
+        createsOf(followAdapter)[1].params.workspace.workspacePath === 'C:\\proj-b' &&
+        wsSecond.workspace === 'C:\\proj-b',
+      j(createsOf(followAdapter).map((c) => c.params.workspace.workspacePath))
+    );
+    await followAdapter.ensureSession('s-ws', 'GLM-5.2', 'max');
+    check('ZB-42: 目录与模型档位都没变 ⇒ 复用会话（不重复 create）', createsOf(followAdapter).length === 2, String(createsOf(followAdapter).length));
+    followAdapter.sessions.set('s-legacy', { sessionId: 'sess-legacy', firstTurn: false, modelId: 'GLM-5.2', reasoningLevel: 'max' });
+    await followAdapter.ensureSession('s-legacy', 'GLM-5.2', 'max');
+    check('ZB-42: 无 workspace 字段的旧条目 ⇒ 回填复用（不重建）', createsOf(followAdapter).length === 2, String(createsOf(followAdapter).length));
+    check(
+      'ZB-42: 解析器每次都真被执行（跟随模式 4 次 ensureSession 全走解析）',
+      resolverCalls === 4,
+      `calls=${resolverCalls}`
+    );
+    followAdapter.dispose();
+
+    const pinAdapter = mkWsAdapter({ ...cfgLike, appServerWorkspace: 'C:\\pinned-dir', appServerWorkspaceFollow: false }, async () => 'C:\\proj-a');
+    await pinAdapter.ensureSession('s-pin', 'GLM-5.2', 'max');
+    check(
+      'ZB-42: appServerWorkspaceFollow=false ⇒ 恒用配置目录（忽略解析器）',
+      createsOf(pinAdapter)[0]?.params.workspace.workspacePath === 'C:\\pinned-dir',
+      j(createsOf(pinAdapter)[0]?.params)
+    );
+    pinAdapter.dispose();
+
+    const boomAdapter = mkWsAdapter({ ...cfgLike, appServerWorkspace: 'C:\\boom-fallback', appServerWorkspaceFollow: true }, async () => {
+      throw new Error('解析器故意失败');
+    });
+    await boomAdapter.ensureSession('s-boom', 'GLM-5.2', 'max');
+    check(
+      'ZB-42: 解析器抛错 ⇒ 回落配置目录（不炸推理通道）',
+      createsOf(boomAdapter)[0]?.params.workspace.workspacePath === 'C:\\boom-fallback',
+      j(createsOf(boomAdapter)[0]?.params)
+    );
+    boomAdapter.dispose();
+
+    /* 服务可达性是本改动**收益的唯一前提**：插件 inject 只有 ['llm']，故必须用仓库既有
+     * 软取惯例 ctx.get(name)（:713 attachments 同款），不能假设 ctx.<service> 可达。 */
+    const indexSrcForWs = readFileSync(join(PLUGIN_ROOT, 'index.js'), 'utf8');
+    check(
+      'ZB-42: 会话目录服务用 ctx.get 软取（不硬 inject、不依赖 ctx.<service>）',
+      /ctx\.get\('workingDirectory'\)/.test(indexSrcForWs) &&
+        /ctx\.get\('agents'\)/.test(indexSrcForWs) &&
+        /wsResolveLogged/.test(indexSrcForWs),
+      'index.js 需同时出现 ctx.get(\'workingDirectory\')、ctx.get(\'agents\') 与 wsResolveLogged'
+    );
   }
 
   /* ── 流式分块 + 思考档（2026-10-10 用户实测"面板内容一直覆盖"；赠送 5.3-Flash 补思考档）──

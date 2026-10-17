@@ -37,8 +37,8 @@
 
 ### C. 优化项的修正与新增
 
-**C1. §五-1 / §五-2 收益下调（不适用）**：app-server 通道的请求体是
-`JSON.stringify({ system, messages })`（`lib/app-server.js:668`，**没有 `tools` 字段**），且本插件**不注册任何 agent 工具** ⇒ DSH 工具**本来就不在**这个 payload 里，"工具动态移除"对该通道**不适用**；"系统提示词动态更新"同理（自定义 adapter 自己拼 payload，pi-ai 路由能力不经过它）。真实可做的是**在 adapter 侧按需重写 system**——这件事现在就能做，无需 0.2.1。建议把这两条从"收益最大"降为"不适用 / 已可做"。
+**C1. §五-1 / §五-2 收益下调（不适用）**：app-server 通道发给 agent 的真实请求体是 `buildContent()` 的**纯文本**（经 `session/send` 发出，`lib/app-server.js:1606`/`:1618`），**没有 `tools` 字段**，且本插件**不注册任何 agent 工具** ⇒ DSH 工具**本来就不在**这个 payload 里，"工具动态移除"对该通道**不适用**；"系统提示词动态更新"同理（自定义 adapter 自己拼 payload，pi-ai 路由能力不经过它）。真实可做的是**在 adapter 侧按需重写 system**——这件事现在就能做，无需 0.2.1。建议把这两条从"收益最大"降为"不适用 / 已可做"。
+> **勘误（2026-10-17，经独立复核）**：本条早前把 `lib/app-server.js:668` 的 `JSON.stringify({ system, messages })` 当成"请求体"引证 —— 那其实是 `conversationFingerprint()` 的**指纹载荷**（只用于判断会话历史是否变化），不是发给 agent 的请求体。**结论不变，引证已更正**。
 
 **C2. 新增可优化点（原文缺的）**
 
@@ -47,7 +47,7 @@
 | 1 | **Session 状态记录接口**（实验性） | 把"本会话用的 provider / 令牌到期 / 剩余额度"写进 DSH 会话记录，恢复会话时直接展示 |
 | 2 | **`working_directory` 工具 + SDK API** | app-server 通道的 cwd 目前自算，可改为读写官方会话工作目录，避免与宿主漂移 |
 | 3 | **插件热重载 + 依赖同步** | 4 个插件都是 junction；改 client 后无需重启（注意：client 插件 HMR 仅在 `pnpm run dev:web` 时自动重载） |
-| 4 | **密钥/令牌默认脱敏 + 按需显示** | 设置卡片的"令牌有效期"展示可复用官方脱敏，避免自渲染明文 |
+| 4 | **密钥/令牌默认脱敏 + 按需显示** | ~~设置卡片的"令牌有效期"展示可复用官方脱敏~~ **不适用（勘误）**：本插件卡片**不渲染任何令牌/Key**（`lib/client.js` grep `token|apiKey|密钥|令牌` **0 命中**；状态文档零凭据，见 `lib/web-status.js` 的脱敏与只读路由）⇒ 无"自渲染明文"可治理，收益 ≈ 0 |
 | 5 | **工具调用"准备阶段"进度** | （对派发台更相关）面板"当前工作"可复用官方进度事件，替代自建心跳 |
 | 6 | **`/compact` 手动压缩 + 极简模式自动压缩** | ⚠️ **跨插件风险**：context-pilot 自己在 pre-step 压缩，需确认与官方压缩不冲突（本插件无影响） |
 
@@ -105,6 +105,34 @@ entryId: include:zcode-connect  moduleName: dsh-connect-zcode  enabled: true  fi
 **⑤ 待办：真机功能验证**（§六 清单，需要一次真实模型调用）：
 - UI 侧：`/model` 里应能看到 zcode 分组与模型；设置页应能看到本插件卡片与额度条
 - 通道侧：`node scripts/verify-appserver-channel.mjs`（**会消耗一次真实额度**；Start Plan 的 300M 活动窗口已于 10-12 09:00 结束，若报 `1005 exceed quota limit` 属**额度时序**而非故障）
+
+### G. 用 0.2.1 新能力做的正向优化（2026-10-17 本轮）
+
+**已落地：ZB-42 —— app-server 会话工作目录跟随**（唯一真正对症的新能力接入）
+
+| 项 | 内容 |
+|---|---|
+| 用的新能力 | **`working_directory` 服务**（0.2.1 新增「`working_directory` 工具 + SDK 会话工作目录读写接口」） |
+| 旧行为（负向） | `appServerWorkspace` 默认 `homedir()`（`index.js` normalizeConfig）⇒ **ZCode agent 在用户主目录里跑**：与 DSH 会话看到的目录**语义错位**，且 agent 启动会扫该目录树（schema 描述里早有警告） |
+| 新行为 | 默认跟随**当前会话**的官方工作目录（`ctx.get('workingDirectory').ensure(agent)`，`ctx.get('agents').get(sessionId)` 解析）；模型用内置 `working_directory` 工具**中途改目录也会跟随**（目录变化 ⇒ 停掉在途回合并重建 app-server 会话）；配置 `appServerWorkspaceFollow=false` 可钉回固定目录，解析器抛错/不可达回落配置值 |
+| 改动 | `lib/app-server.js`（`resolveWorkspace` 依赖、`_resolveSessionWorkspace`、`ensureSession` 目录比对与重建、`_configureClient(workspace)`、entry 记 `workspace`）；`index.js`（`appServerWorkspaceFollow` 配置 + 软取解析器 `ctx.get(...)` + 一次性留痕日志） |
+| 测试 | `test/selfcheck.mjs` **+9 条断言**：解析值进 `session/create`、子进程 cwd 同步、目录变化重建、同目录复用、旧条目回填不重建、`follow=false` 恒用配置、**解析器抛错回落**、**解析器确实被执行（防"没执行也绿"）**、`ctx.get` 软取静态断言 ⇒ **SELFCHECK 304/304 PASS** |
+| 真机验证（待做） | 新会话启动日志应出现 `新建 app-server 会话 <id>（工作目录 <路径>）`；首轮解析留痕 `[dsh-connect-zcode] 会话工作目录解析：session=… → …`。若打印 `(服务不可达/未取到 ⇒ 回落配置目录)` ⇒ 宿主未暴露该服务，需查 `ctx.get('workingDirectory')` 可达性 |
+| 未验证 | ①`ctx.get('agents')`/`ctx.get('workingDirectory')` 在本插件（`inject=['llm']`）下的**真实可达性**（自检用 stub 证明逻辑正确，但证明不了可达性）；②目录变化即重建会话会丢 agent 侧上下文（设计取舍，已在日志明示） |
+
+**独立复核结论（另一只读分析，2026-10-17）——候选逐条：**
+
+| 候选 | 结论 | 理由 |
+|---|---|---|
+| ② 工作目录跟随 | ✅ **已落地**（收益最高） | 见上 |
+| ③ 插件热重载 | ✅ 可用、**零代码** | `hmr` 服务与 `hmr/reload` 事件存在；host 半边改完免重启即生效（client 半边是手写预构建 bundle，是否在 HMR watch 路径**未验证**）⇒ 建议先实测一次并写进 README |
+| ⑧ `/compact` 与 app-server 交互 | ⚠️ 有真实交互，先做 0 风险版 | 手动压缩改变历史 ⇒ `conversationFingerprint` 变化 ⇒ **重建会话 + 首轮全量拍平重放**（实测单会话 ~880KB 的尖峰）；建议先补一条可诊断日志 + README 说明，再评估"不重建" |
+| ① Session 状态记录 | ❌ 暂不做 | 实验性接口，且 `practices.md` 明确「不要用新 `type` 追加会话事件；`appendPluginRecord()` 仅保留给 DSH 实验包，且迁移时为 best-effort」⇒ 会污染会话日志，收益不抵风险 |
+| ④ 密钥脱敏 / ⑤ 官方凭据来源提示 | ❌ 不适用 | 本插件**零敏感渲染**（见上「勘误」），且官方凭据服务看不到 `~/.zcode/v2/config.json`，与本插件"凭据零落盘零缓存"红线冲突 |
+| ⑥ pi-ai 系统提示词/工具动态增删 | ❌ 不适用 | 真实请求体是纯文本（`buildContent`），不含 `tools`；插件不注册任何 agent 工具 |
+| ⑦ 工具"准备阶段"进度 | ❌ 不适用 | 本插件不注册工具；app-server 通道 DSH 工具调用实测为 0 次 |
+
+**文档勘误（本轮自查 + 复核发现）**：① §C1 早前把 `conversationFingerprint` 的指纹载荷当成"请求体"引证（结论不变，引证已更正）；② §五-5 称本插件卡片已自建"令牌有效期"面板（与代码不符，已更正）；③ §五-4/5 相应从"建议优化"下调为"不适用"。
 
 ---
 
@@ -287,7 +315,8 @@ const head = session.firstTurn ? `${TOOL_RULE_HEAD}\n${base}${BRIDGE_NOTE}` : ba
 
 > 模型设置更清楚地提示凭据来源和检测状态，支持按需显示输入的 API Key。
 
-与本插件的设置卡片功能重叠（它已自建"账号、令牌有效期、剩余积分、模型优惠"面板）。可评估是否把**凭据来源/检测状态**部分交给官方展示，减少重复。
+~~与本插件的设置卡片功能重叠（它已自建"账号、令牌有效期、剩余积分、模型优惠"面板）。可评估是否把**凭据来源/检测状态**部分交给官方展示，减少重复。~~
+> **勘误（2026-10-17，经独立复核）**：原文称本插件卡片已自建"账号、**令牌有效期**、剩余积分、模型优惠"面板 —— **与代码不符**。本插件卡片实际展示的是：provider 注册态 / 冻结开关 / 端点 host（仅 host，不含路径与凭据）/ 赠送额度 / 最近一次调用；`lib/client.js` 对 `token|apiKey|密钥|令牌` **0 命中**，状态文档亦零凭据（`lib/web-status.js`）。⇒ 与官方"凭据来源/检测状态"**功能不重叠**，本条优化不成立（保持本插件"凭据零落盘、零渲染"的红线）。
 
 ---
 

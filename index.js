@@ -199,8 +199,13 @@ function normalizeConfig(config) {
       : DEFAULT_REASONING_LEVEL,
     appServerToolPolicy: v.appServerToolPolicy === 'deny-all' ? 'deny-all' : 'allow-all',
     appServerInjectAccount: v.appServerInjectAccount !== false,
-    // 留空 = 用户主目录（DSH 进程 cwd 可能是巨大目录树，让 agent 扫它会把回合拖死）
+    // 留空 = 用户主目录 —— 仅在"未跟随会话目录"(appServerWorkspaceFollow=false) 或解析不到时用到
     appServerWorkspace: nonEmptyStr(v.appServerWorkspace, homedir()),
+    /* ZB-42（DSH 0.2.1）：app-server 会话是否**跟随当前会话的官方工作目录**
+     * （宿主 `working_directory` 服务；模型用内置 working_directory 工具改目录也会跟随）。
+     * 默认 true：旧行为是恒用 homedir()，会让 ZCode agent 在用户主目录里跑 —— 与 DSH 会话
+     * 看到的目录语义错位，且 agent 启动扫目录树会拖慢回合。 */
+    appServerWorkspaceFollow: v.appServerWorkspaceFollow !== false,
     appServerRpcTimeoutMs: clampInt(v.appServerRpcTimeoutMs, 5000, 600000, 120000),
     appServerTurnTimeoutMs: clampInt(v.appServerTurnTimeoutMs, 30000, 3600000, 900000),
     childEnvAllow: Array.isArray(v.childEnvAllow) ? v.childEnvAllow.filter((k) => typeof k === 'string' && k.trim() !== '') : [],
@@ -323,7 +328,11 @@ async function loadConfig() {
             'deny-all = 留 build 模式并一律拒绝工具请求（更安全，但 agent 基本只能纯对话）'
         ),
       appServerInjectAccount: z.boolean().default(true).description('把 Start Plan 账户注入 agent（GUI 同款）；关闭则用 agent 冷启动的默认供应商'),
-      appServerWorkspace: z.string().default('').description('app-server 会话工作目录；留空 = 用户主目录（勿指向巨型目录树，agent 启动会扫它）'),
+      appServerWorkspace: z.string().default('').description('app-server 会话工作目录**兜底值**；留空 = 用户主目录（只在"未跟随会话目录"或解析不到会话目录时用到）'),
+      appServerWorkspaceFollow: z
+        .boolean()
+        .default(true)
+        .description('app-server 会话是否跟随当前会话的官方工作目录（DSH 内置 working_directory；模型中途改目录也跟随）。关掉则恒用 appServerWorkspace'),
       appServerRpcTimeoutMs: z.number().step(1).min(5000).max(600000).default(120000).description('app-server 单次请求（create/inject/setModel/send）超时'),
       appServerTurnTimeoutMs: z.number().step(1).min(30000).max(3600000).default(900000).description('app-server 单回合（send → turn 完成）超时'),
       childEnvAllow: z.array(z.string()).default([]).description('额外透传给 app-server 子进程的环境变量名（默认只透传系统基础变量与 ZCODE_*）'),
@@ -852,6 +861,8 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
           }
           return out;
         };
+        /* 一次性留痕开关：真机排查"到底有没有跟随会话目录"看这一行（见 resolveWorkspace）。 */
+        let wsResolveLogged = false;
         const appServerAdapter = createAppServerAdapter({
           BaseAdapter: mods.LlmAdapter,
           LlmError: mods.LlmError,
@@ -871,6 +882,35 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
               : {}),
           }),
           logger: ctx.logger ?? console,
+          /* ZB-42（DSH 0.2.1）：把"当前会话的工作目录"交给适配器 —— 用官方
+           * `working_directory` 服务。**软取**（与 :713 的 attachments 同款 `ctx.get`）：
+           * 服务缺席时返回 undefined，由适配器回落配置目录，不扩大启动失败面。
+           * 收益：ZCode agent 与 DSH 会话在同一个目录里工作，并跟随模型用内置
+           * `working_directory` 工具中途改目录（旧行为恒用 homedir()）。 */
+          resolveWorkspace: async (sessionId) => {
+            try {
+              const agents = typeof ctx.get === 'function' ? ctx.get('agents') : ctx.agents;
+              const workingDirectory = typeof ctx.get === 'function' ? ctx.get('workingDirectory') : ctx.workingDirectory;
+              const agent = agents?.get?.(sessionId);
+              if (agent === undefined) return undefined;
+              const resolved =
+                typeof workingDirectory?.ensure === 'function'
+                  ? await workingDirectory.ensure(agent)
+                  : typeof workingDirectory?.get === 'function' && agent.session !== undefined
+                    ? workingDirectory.get(agent.session)
+                    : undefined;
+              if (!wsResolveLogged) {
+                wsResolveLogged = true;
+                console.log(
+                  `[dsh-connect-zcode] 会话工作目录解析：session=${sessionId} → ${resolved ?? '(服务不可达/未取到 ⇒ 回落配置目录)'}`
+                );
+              }
+              return resolved;
+            } catch (error) {
+              ctx.logger?.warn?.(`[dsh-connect-zcode] 读取会话工作目录失败（回落配置目录）：${error?.message ?? error}`);
+            }
+            return undefined;
+          },
           // 同一把冻结开关（PROTOCOL §7.1）：关闭时连 agent 进程都不起。
           gate: () => {
             assertSwitchEnabled(cfg.switchPath);
