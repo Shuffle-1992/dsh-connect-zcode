@@ -213,6 +213,26 @@ entryId: include:zcode-connect  moduleName: dsh-connect-zcode  enabled: true  fi
 
 **验证**：`selfcheck` **343/343 PASS**（+5 边界断言）、`compat-check` COMPAT PASS。
 
+**第十批（2026-10-17）：物理删除 Start Plan 通道（ZB-53 第二步）**
+
+> 用户决定：Start Plan 接入不完整，删除相关代码，只保留 Coding Plan。
+
+| 删除对象 | 行数 | 说明 |
+|---|---|---|
+| `lib/app-server.js` | 1618 | 托管 `zcode.cjs app-server` 的适配器（整文件删除） |
+| `lib/plan-quota.js` | 179 | 赠送额度日志读取（整文件删除） |
+| `lib/session-workspace.js` | 90 | app-server 工作目录跟随（整文件删除） |
+| `lib/gift-catalog.js` | 49 | 赠送通道目录口径（整文件删除） |
+| `lib/history-guard.js` | 31 | app-server 历史前缀判据（整文件删除） |
+| `scripts/verify-appserver-channel.mjs` / `probe-session-read.mjs` | — | 专属探针（删除） |
+| `index.js` | 1082 → 783 | 删 app-server 配置字段（20 个）/注册块/赠送目录发现/状态文档 workspace 段/相关 import |
+| `lib/client.js` | 1018 → 649 | 删赠送面板区块、composer 进度条、`appServer*` 写入字段、额度/工作目录展示 |
+| `lib/web-status.js` | 281 → 173 | 删 `toQuotaSummary` / `toAppServerSummary` / 三个 deps 块 |
+| `lib/host-modules.js` | — | 删 `LlmAdapter`/`LlmError` 接线与兜底循环（只服务该通道） |
+| `test/selfcheck.mjs` | 3348 → 1656 | 删 7.4 / 7.6 两整节 + 7.5 及全链路注册里的通道断言，改写为两条「已下线」断言 |
+| 文档 | — | README 835 → 325（删三大节）；TROUBLESHOOTING 加历史横幅 + 8 章标〔历史〕；package.json / cordis.patch.yml 描述与注释同步 |
+
+**验证**：`selfcheck` **167/167 PASS**、`compat-check` **COMPAT PASS**、断言里明确覆盖「历史配置写着 `appServer: true` 也只注册 Coding Plan」。
 **最终 backlog（未做，附理由）**：**5.4/5.5**（`suppressDeath` 错误路径、账号家族漂移的**更多**断言 —— 行为已修，1.10 的断言已覆盖主路径，边界断言可后续补）；真机三项（1.1 两轮裁决 / workspace 字段 / HMR）待有额度。
 
 **独立复核结论（另一只读分析，2026-10-17）——候选逐条：**

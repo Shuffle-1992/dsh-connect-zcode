@@ -51,8 +51,8 @@
     }
   },
   "meta": {
-    "title": "ZCode Coding Plan / Start Plan",
-    "description": "把 ZCode 注册为 DSH 的 LLM provider：Coding Plan 走 anthropic 通道，Start Plan 走 app-server 通道（凭据零落盘，含模型显隐/能力面板）"
+    "title": "ZCode Coding Plan",
+    "description": "把 ZCode 注册为 DSH 的 LLM provider（仅 Coding Plan：anthropic 通道；凭据零落盘，含模型显隐/能力面板）"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-client-ui-primitives": ">=0.1.7-rc.1 <0.3.0-0",

@@ -1,5 +1,10 @@
 # 故障排查与踩坑记录（TROUBLESHOOTING）
 
+> ⚠️ **2026-10-17 起：本插件的 Start Plan / app-server 通道已下线并从代码中删除**
+> （接入不完整，只保留 Coding Plan 通道）。
+> 文中标注 **〔历史·通道已下线〕** 的章节记录的是该通道的排查过程与工程教训——
+> **代码已不存在**，仅作历史参考，不要照着它们去配置或复现。
+
 本文件记录开发/使用 **dsh-connect-zcode** 过程中**在真机上实际踩过**的坑。
 每条都给出：**现象 → 根因 → 判据 → 修法**，便于他人快速定位、避免重踩。
 
@@ -218,7 +223,7 @@ account-provider:coding-plan:account:<planId>:account:<accountId>:api-key
 
 ---
 
-### 1.4 Coding Plan vs Start Plan：为什么社区说"取不到 Key"
+〔历史·通道已下线〕### 1.4 Coding Plan vs Start Plan：为什么社区说"取不到 Key"
 
 **不同套餐的凭据形态根本不同** —— 这是本项目最核心的发现：
 
@@ -302,7 +307,7 @@ Start Plan 额度请在 ZCode 桌面端使用。
 
 ---
 
-### 1.5 Start Plan 到底能不能用：app-server 通道的六个坑
+〔历史·通道已下线〕### 1.5 Start Plan 到底能不能用：app-server 通道的六个坑
 
 **能。但"能"的前提是：不要自己发那个 HTTP 请求。**
 
@@ -719,7 +724,7 @@ Select-String -Path "$env:USERPROFILE\.dsh\profiles\desktop\cordis.patch.yml" -P
 
 ---
 
-### 2.10 agent 型通道的 usage 口径：把 CLI 的「回合聚合」当「单次调用」上报 ⇒ DSH 上下文占用虚高 N 倍
+〔历史·通道已下线〕### 2.10 agent 型通道的 usage 口径：把 CLI 的「回合聚合」当「单次调用」上报 ⇒ DSH 上下文占用虚高 N 倍
 
 **现象**（2026-10-10 真机，`zcode-appserver` 通道 / DSH 1M 窗口）：
 
@@ -890,7 +895,7 @@ node $env:TEMP\restore\rebuild-merged.mjs rebuilt.js session-父.jsonl session-�
 
 ---
 
-### 2.13 provider 报「零 usage」会把上下文占用**清零**（弹窗 0%，明细却有几万）
+〔历史·通道已下线〕### 2.13 provider 报「零 usage」会把上下文占用**清零**（弹窗 0%，明细却有几万）
 
 **现象**（2026-10-11 真机，用户在赠送额度通道上实测）：弹窗顶部「上下文已用 **0%** ~0 / 1M」，
 而**同一个弹窗**的启发式明细还有「对话消息 ~383K」；侧栏用量行仍报 40%。两者自相矛盾。
@@ -962,7 +967,7 @@ Get-Content "$env:USERPROFILE\.dsh\dispatch-runs.jsonl" | Select-Object -Last 3
 
 ---
 
-### 2.15 图片「静默丢失」：物化函数被放错口袋（deps 顶层 vs `options()`）
+〔历史·通道已下线〕### 2.15 图片「静默丢失」：物化函数被放错口袋（deps 顶层 vs `options()`）
 
 **现象**（2026-10-11 真机，用户在赠送额度通道上发图）：界面显示图片已附上、回合能跑，
 但**模型完全看不到图**。取证三条（零额度）：CLI 日志 `attachmentCount: 0`；
@@ -999,7 +1004,7 @@ node scripts/verify-appserver-channel.mjs --tools deny-all `
 
 ---
 
-### 2.16 回合超时后，重试撞上 `A prompt is already running for this session`
+〔历史·通道已下线〕### 2.16 回合超时后，重试撞上 `A prompt is already running for this session`
 
 **现象**（2026-10-11 真机）：赠送额度通道的一轮跑满 15 分钟（900s）被本地超时掐掉；
 DSH 自动重试（1/5）**立刻失败**：`app-server 通道失败：A prompt is already running for this session`
@@ -1034,7 +1039,7 @@ DSH 自动重试（1/5）**立刻失败**：`app-server 通道失败：A prompt 
 
 ---
 
-### 2.17 图片再次「静默丢失」：`context-pilot` 注入把"最后一条用户消息"顶掉
+〔历史·通道已下线〕### 2.17 图片再次「静默丢失」：`context-pilot` 注入把"最后一条用户消息"顶掉
 
 **现象**（2026-10-11 真机，用户第二次发图实测）：`collectImageBlocks` 明明已按 §2.15 修好
 （物化函数对齐 + 告警），模型**仍然**说没收到图；CLI 日志 `session/send accepted` 的
@@ -1077,7 +1082,7 @@ rollout: 请求中 image 块 = 1     ← CLI 把 localPath 附件嵌进了模型
 
 ---
 
-### 2.18 赠送通道「第 2 轮起答非所问」：同源的第二处 —— `lastUserText` 也取到了注入快照
+〔历史·通道已下线〕### 2.18 赠送通道「第 2 轮起答非所问」：同源的第二处 —— `lastUserText` 也取到了注入快照
 
 **现象**（2026-10-11，`keysion-dac-vue` 会话切到免费额度模型后）：agent 像"没看懂需求"，
 整轮**一次 DSH 工具都没用**；用户感受是"没拿到 DSH 的工具、还在用 ZCode 的自己那套"。

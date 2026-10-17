@@ -11,9 +11,6 @@
         planKey: 'builtin:bigmodel-coding-plan'
         contextWindow: 200000
         maxConcurrent: 2
-        # ⚠️ 这里**不要**写 appServer / appServerToolPolicy 这类开关的默认值。
         # 2026-10-10 教训：本 bundle patch 会被插件管理器**materialize 成 profile patch 里的一条
         # 独立条目**（与用户手写的同 id 条目并列，且排在后面）。同 id 相遇时**后一条整体覆盖
         # 前一条**，于是这里写的"注释式默认值"变成了一条真配置，把用户在 profile 里设的
-        # appServer: true 整个压掉 —— 表现为"改了配置、重启了，模型选项里还是没有"。
-        # 默认值交给 schema（index.js 的 Config：appServer 默认 false）即可，不在这里钉死。

@@ -2,33 +2,24 @@
 
 **把 ZCode（Z.ai / 智谱 BigModel）作为模型通道接进 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）** —— 让 DSH 直接消费你的 ZCode 套餐额度。
 
-**✅ 支持免费额度模式**：ZCode「Start Plan」的活动赠送额度（如 Weekend Build 的免费 GLM-5.3-Flash）可以直接在 DSH 里用 —— 通过托管官方 agent 代发请求，零破解、零凭据落盘（见 [Start Plan 通道](#start-plan-通道app-server)）。
+**只保留 Coding Plan 通道**（provider `zcode`，anthropic-messages 线协议，**DSH 自己发模型请求**；
+凭据零落盘、每次调用现读）。
 
-> ⚠️ 免费额度通道是**模型对话通道**：DSH 的**工具层在这条通道上不参与**（agent 用自己进程内的原生工具）。
-> 上哪些能力能用、哪些完全没有（浏览器面板 / Agent Teams / 派发台 / `ask_user_question` / TODO …），
-> 以及各类替代做法，见 [**免费额度通道目前缺失的功能速查**](#-免费额度通道zcode-appserver目前缺失的功能速查)。
->
-> ✅ **要让 agent 自主用工具干活、又要烧免费额度 ⇒ 用姊妹项目 [派发台（zcode-dispatch）](https://github.com/Shuffle-1992/zcode-dispatch)。**
-> 它现在也支持免费额度通道（`account:<family>-start-plan`：面板有**额度条**、agent 派发前能看到剩余额度与窗口剩余时间、
-> 台账按 `billing=zcode-plan-gift` 与付费套餐分账），而且**"走 ZCode 自己的工具"在派发台是设计而非缺陷** ——
-> 那里本来就是"**独立 ZCode 进程 + 它自己的工具 + 独立会话 + 独立额度**"。
-> **已在真机验证**（2026-10-11，见派发台 `tasks/ZB-34-gift-tool-parity.md`）：Write/Edit、Bash、
-> 本地 MCP（`node_repl`）、远程 MCP（`web_reader`）**全部可用** —— 即派发台那条免费额度通道的
-> **工具执行能力与付费套餐派发实测等同**。
-> **一句话选型：纯模型对话 / 要 DSH 自己的工具链 ⇒ 本插件；要 agent 自主执行任务 ⇒ 派发台。**
+> 原「Start Plan / 活动赠送额度」通道（托管 `zcode.cjs app-server` 代发请求）因**接入不完整**，
+> 已于 2026-10-17 **下线并从代码中删除**（适配器 / 额度读取 / 进度条 / 面板区块 / 相关配置项全部移除）。
+> 需要"agent 自主执行任务 + 免费额度"的场景，用姊妹项目
+> [派发台（zcode-dispatch）](https://github.com/Shuffle-1992/zcode-dispatch)。
 
 一个 DSH 原生 provider 插件，**两条互补通道**：
 
 ```
-provider id : zcode              provider id : zcode-appserver（可选，默认关）
-线协议       : anthropic-messages  线协议       : ZCode app-server（stdio JSON-RPC）
-谁发模型请求 : DSH 自己             谁发模型请求 : 官方 agent 进程（zcode.cjs）
+provider id : zcode
+线协议       : anthropic-messages
+谁发模型请求 : DSH 自己
 端点         : ~/.zcode/v2/config.json 的 baseURL
 凭据         : 零落盘、零缓存、每次调用现读
-适用         : Coding Plan（付费套餐）  适用 : Start Plan / 活动赠送额度（免费额度）
+适用         : Coding Plan（付费套餐）
 ```
-
-> 免费额度通道见 [Start Plan 通道（app-server）](#start-plan-通道app-server)，赠送额度用量会显示在设置面板与输入框下方的进度条里。
 
 ---
 
@@ -45,21 +36,11 @@ ZCode 桌面端自带一个 agent（有自己的 loop、子代理、记忆）。
 | 套餐类型 | 凭据形态 | 能否直连 |
 |---|---|---|
 | **Coding Plan**（付费套餐） | 一等 API Key（zhipu 平台 `id.secret` 格式），存于 `config.json` 或**加密凭据库** `credentials.json` | ✅ **可以** —— 走标准 Anthropic 兼容端点（本插件 `zcode` provider） |
-| **Start Plan**（赠送/活动额度） | 账户 **JWT** + 端点要求**逐请求的客户端证明** | ❌ 不能**直连**；✅ 但能**托管官方 agent 代发**（本插件 `zcode-appserver` provider） |
+| **Start Plan**（赠送/活动额度） | 账户 **JWT** + 端点要求**逐请求的客户端证明** | ❌ 不能直连（上游风控 3012）；该通道**已下线**（接入不完整） |
 
-社区里 [dsh-zcode-connector](https://github.com/ZhaoAndy821/dsh-zcode-connector) 断言"ZCode 无可提取 Key"，**那是"不能直连"的限制，不是"用不上"的结论** —— 正确解法是**让官方 agent 去发请求**。
-
-#### 2026-10-10 实测订正：直连的阻断点是**风控 3012**，不是验证码 3007
-
-早期把 Start Plan 直连失败归因为"需要阿里云无痕验证码"（`3007 captcha verify failed`）。本机带齐验证码头再打一次：
-
-| 请求形态 | 上游响应 |
-|---|---|
-| `POST {plan}/anthropic/v1/messages`，**带**现场解出的 `X-Aliyun-Captcha-Verify-Param` | `HTTP 405 {"code":3012,"msg":"request has been blocked due to unusual activity."}` |
-| 同上，**不带**验证码头 | **同样** `405 / 3012` |
-
-⇒ **验证码只是必要条件**：上游还按客户端指纹判定（设备 ID、companion 头、安装序仿真、客户端版本对齐）。要么做完整桌面指纹仿真（如 [dengyie/zcode2api](https://github.com/dengyie/zcode2api)），要么**根本不自己发请求** —— 后者才是本插件选的路线：**托管官方 agent，让二进制自己去签**。
-
+> **历史注记**：Start Plan 直连实测被上游风控拦成 `HTTP 405 {"code":3012,"msg":"request has been blocked due to unusual activity."}`
+> （带不带验证码头都一样）—— 这也是当初改用"托管官方 agent 代发"的原因。该通道已于 2026-10-17 下线，
+> 排查过程保留在 [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md) 第一章（仅作历史参考）。
 > **Coding Plan 的 Key 有两个存放位置**（这很关键，见「故障排查」）：
 > - `~/.zcode/v2/config.json` → `provider["builtin:bigmodel-coding-plan"].options.apiKey`（**明文**）
 > - `~/.zcode/v2/credentials.json` → `account-provider:coding-plan:...:api-key`（**加密** `enc:v1`）
@@ -156,7 +137,7 @@ node scripts/compat-check.mjs --self-test          # 只跑内置 semver 自测
 
 > **关于 ③**：`peerDependencies` 的区间是按"稳定版语义"写的（`>=0.1.7-rc.1 <0.3.0-0`），在 pnpm 的**默认**语义下对预发布 DSH 版本会显示"不满足"——本机是 **junction 链接安装**、DSH 自身的兼容判定又使用 `includePrerelease` 语义，因此**不构成阻塞**；脚本以 ℹ️ 报告该差异而不是判失败。
 >
-> **关于 ④**：DSH **0.2.1 合并了部分内部 UI 包**（`dsh-client-ui-slots` / `dsh-client-ui-primitives` 已不再作为独立包存在）。本插件的客户端代码**不 import 任何 `@deepseek-ai/*` 包**，`inject` 仅作加载顺序声明，故**无影响**（0.2.1-rc.2 实测：`plugins.bundle.config` 与 `conversation.composer.dock` 两个注册点都正常挂载）。该声明保留是为了向后兼容 0.2.0 系列；需要把它当硬门禁时用 `--strict-inject`。
+> **关于 ④**：DSH **0.2.1 合并了部分内部 UI 包**（`dsh-client-ui-slots` / `dsh-client-ui-primitives` 已不再作为独立包存在）。本插件的客户端代码**不 import 任何 `@deepseek-ai/*` 包**，`inject` 仅作加载顺序声明，故**无影响**（0.2.1-rc.2 实测：`plugins.bundle.config` 注册点正常挂载；赠送额度进度条曾用的 `conversation.composer.dock` 随该通道一起下线）。该声明保留是为了向后兼容 0.2.0 系列；需要把它当硬门禁时用 `--strict-inject`。
 >
 > 0.2.1 的 12 项破坏性变更对本插件**0 命中**；升级后实测记录（含 client 插槽 occupant 证据）见 [`DSH-0.2.1-COMPAT-REVIEW.md`](./DSH-0.2.1-COMPAT-REVIEW.md) §F。
 
@@ -164,8 +145,6 @@ node scripts/compat-check.mjs --self-test          # 只跑内置 semver 自测
 
 | 优化 | 用的新能力 | 行为变化与验证 |
 |---|---|---|
-| **app-server 会话工作目录跟随** | `working_directory` 服务（0.2.1 新增工具 + SDK 会话目录接口） | 旧行为恒用 `homedir()`（ZCode agent 在用户主目录跑、启动扫目录树，与 DSH 会话看到的目录不是同一个）；现在**默认跟随当前会话目录**，模型用 `working_directory` 工具中途改目录也跟随（此时重建 app-server 会话）。落地日志：`新建 app-server 会话 <id>（工作目录 <路径>，来源 session/config-pinned/fallback）`；状态文档新增 `workspace` 字段（最近一次决策 + 计数，**不含凭据**）—— 这是判断"服务是否真的可达"的运行时观测点。可用 `appServerWorkspaceFollow: false` 钉回固定目录。 |
-| **历史改写判据修正（ZB-43）** | —— | **旧判据有真问题**：它把**整数组**消息 hash 存起来、下轮不等就重建；而 DSH 每轮交给适配器的 `messages` 是**全量派生历史**（正常对话必然是上一轮的超集）⇒ **第 2 轮起每轮都被误判成"历史改写"，于是每轮重建会话 + 首轮全量重放**（多 4 个 RPC、多次固定 sleep、整段 token 重发），README 里"续轮只发当轮用户消息"的设计形同虚设。现在改为 **前缀校验**（`lib/history-guard.js`）：纯增长 ⇒ 复用会话、只发最新用户消息；只有**前缀被改写或整体变短**（`/compact` 压缩、编辑/回退历史、恢复草稿）才重建并按首轮重放。日志会点明诱因与条数，属**一次性**成本尖峰。自检新增"自然两轮只建一次会话"端到端断言（旧实现必失败）。 |
 | **热重载（迭代提速）** | `hmr` 服务（`include:hmr` 已激活，含 `hmr/reload`/`hmr/change` 事件与 `getLinked`/`reconcileProfile`） | 本插件是 **junction 链接**的本地插件，属其 "linked" 范畴 ⇒ host 半边改动**理论上免重启**；**实证未做**（本会话无法驱动 GUI：插件状态路由只在内嵌端口且需 DSH 连接鉴权）——请在 GUI 里验证一次：改一行 host 日志 → 看面板「状态」区是否立即刷新（client 半边是手写预构建 bundle，需 `pnpm run dev:web` 才会自动重建）。**不改代码也有保证**：`test/selfcheck.mjs` 离线覆盖逻辑、`scripts/compat-check.mjs` 覆盖声明兼容性。 |
 
 > 逐条候选评估（含**明确不做**的项：Session 状态记录、密钥脱敏、pi-ai 工具动态增删…）见 [`DSH-0.2.1-COMPAT-REVIEW.md`](./DSH-0.2.1-COMPAT-REVIEW.md) §G。
@@ -354,7 +333,6 @@ node scripts/sync-key-to-config.mjs             # 验活通过才写回（写前
 见 **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** —— 那里系统整理了本插件开发过程中
 **在真机上踩过的全部坑**（含误判、假绿、以及每个坑的判据与修法）。
 
-
 ---
 
 ## 与「派发模式」的关系
@@ -376,277 +354,7 @@ ZCode 有两条消费路径，**互补而非替代**：
 > 并带单写者文件锁、用量台账、暂停分类（额度耗尽/未开通/需签名）、自动降级链、任务落地自动唤醒。
 > **它同样支持免费额度通道**（`--provider start-plan` / 通道 `account:<family>-start-plan`，
 > 台账 `billing=zcode-plan-gift` 与付费套餐分账；面板有额度条，agent 派发前能看到剩余额度）。
-> 所以"**要工具 + 要免费额度**"的组合，答案是派发台而不是本插件的 provider 通道 —— 见文末
-> [需要 A 类能力时怎么办](#-免费额度通道zcode-appserver目前缺失的功能速查)。
-
----
-
-## Start Plan 通道（app-server）
-
-**默认关闭**（`appServer: false`）。开启后额外注册一个 provider `zcode-appserver`，用于消费
-**Start Plan / 活动赠送额度**这类**账号型**（非 API Key）额度。
-
-### 它为什么必须"托管一个进程"
-
-Start Plan 的端点 `https://zcode.z.ai/api/v1/zcode-plan/anthropic` 要求**逐请求的客户端证明**。
-本机实测：外部 HTTP 直连（哪怕带齐现场解出的验证码头）被上游拦成
-`405 / code 3012 unusual activity`；而**官方 agent 二进制自己发出的请求能过**。
-
-所以本通道不是 HTTP 网关，而是：
-
-```
-DSH ──► provider "zcode-appserver" ──► 常驻 zcode.cjs app-server（stdio JSON-RPC）
-                                          ├─ provider/updateAccountConfig  注入 account:{bigmodel|zai}-start-plan
-                                          ├─ session/setMode               权限模式（见下「安全须知」）
-                                          ├─ session/setModel              切到 Start Plan 模型
-                                          ├─ session/send                  发回合
-                                          └─ interaction/requestProviderRuntimeHeaders
-                                                └─ 宿主把 zcodejwttoken 递回去，agent 自己算签名
-                                                     └──► zcode.z.ai/api/v1/zcode-plan/anthropic
-```
-
-三个"错了会**静默失效**"的点（都已在代码里加了对策与断言）：
-
-1. spawn 必须按 GUI 同款设置 `ZCODE_APP_VERSION` / `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` /
-   `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` / `ZCODE_BASE_URL`，否则 CLI 落到 `0.0.0-dev` 运行时目录；
-2. `basedOnZCodeBuiltinRevision` 必须**逐字符等于** `zcode-builtin:<revision>:<sha256(路径)>`，
-   否则 registry 合并守卫**静默跳过**（不报错）；
-3. 鉴权 token 必须是共享凭证里的 **`zcodejwttoken`** —— `oauth:*:access_token` 早已过期，回它上游 401。
-
-### 开启方式
-
-```yaml
-# cordis.patch.yml（profile 的 patch 层）或设置面板
-appServer: true
-appServerToolPolicy: allow-all        # 见下「安全须知」；要收紧改 deny-all
-zcodeCliPath: 'F:\Program Files\ZCode\resources\glm\zcode.cjs'   # ZCode 装在非系统盘时显式指定
-```
-
-> ⚠️ **profile 里可能有同 id 的两条 `- id: <entry>`**（一条你手写、一条插件管理器把本 bundle 的
-> `cordis.patch.yml` 物化出来的）。同 id 相遇时**后一条整体覆盖前一条**（不是逐键合并）——
-> 写在前一条里的开关**完全不生效，而且没有任何报错**。改配置前先数一数：
->
-> ```powershell
-> Select-String -Path "$env:USERPROFILE\.dsh\profiles\desktop\cordis.patch.yml" -Pattern '^- id: zcode-connect$'
-> ```
->
-> 生效值要写在**最后**那条。详见 [TROUBLESHOOTING §2.9](TROUBLESHOOTING.md)。
-
-开启后模型选择器里会多出一条**独立的** provider 与模型：
-
-```
-ZCode Coding Plan          → GLM-5.3-Flash                  ← 付费 Coding Plan 额度
-ZCode Start Plan（赠送额度）→ GLM-5.3-Flash（赠送额度）        ← Start Plan / 活动赠送额度
-```
-
-**两者是两笔账**（ZCode 桌面端里也是分开列的）：选谁就烧谁的额度，输入框下方的
-赠送额度进度条**只在选中「赠送额度」那条时显示**（判据是宿主自己的 `modelSelection` 投影，
-即模型选择器写什么、下一次请求就用什么，所以不会出现"显示着赠送额度、实际烧 Coding Plan"的错配）。
-
-### 配置项
-
-| 键 | 默认 | 说明 |
-|---|---|---|
-| `appServer` | `false` | 总开关 |
-| `zcodeCliPath` | 空 = 自动探测 | `zcode.cjs` 路径。**ZCode 常装在非系统盘**，自动探测含盘符扫描；仍找不到就显式填绝对路径 |
-| `zcodeCliNode` | `node` | 运行 `zcode.cjs` 的 node |
-| `zcodeDataBaseDir` | 空 = 用户主目录 | 读 `runtime/provider/**/zcode-builtin.json` 的根 |
-| `appServerCredentialStorePath` | 空 = `~/.zcode/v2/credentials.json` | Start Plan token 来源 |
-| `appServerAccountProviderId` | 空 = 按 `oauth:active_provider` 自动选 | 注入 `account:bigmodel-start-plan` / `account:zai-start-plan` |
-| `appServerModels` | `['GLM-5.3-Flash']` | 暴露给 DSH 的模型（内置目录：GLM-5.3-Flash / GLM-5.2 / GLM-5-Turbo；**不含 GLM-5.3**，builtin 未给 start-plan 声明它） |
-| `appServerReasoningLevel` | `max` | `session/setModel` 的推理档（low/high/max） |
-| `appServerToolPolicy` | `allow-all` | ⚠️ **安全面，见下** |
-| `appServerInjectAccount` | `true` | 注入套餐账户（GUI 同款） |
-| `appServerWorkspaceFollow` | `true` | **跟随当前会话的官方工作目录**（DSH 内置 `working_directory` 服务；模型用 `working_directory` 工具中途改目录也会跟随 —— 目录变化时重建 app-server 会话）。关掉则恒用 `appServerWorkspace` |
-| `appServerWorkspace` | 空 = 用户主目录 | 会话工作目录**兜底值**：只在"未跟随"或解析不到会话目录时生效（勿指向巨型目录树，agent 启动会扫它） |
-| `appServerRpcTimeoutMs` | `120000` | 单次 RPC 超时 |
-| `appServerTurnTimeoutMs` | `900000` | 单回合超时 |
-| `childEnvAllow` | `[]` | 额外透传给子进程的 env 名（默认只放行系统基础变量与 `ZCODE_*`） |
-
-### 面板里能配什么（设置 → 插件 → 本插件）
-
-面板底部有一块**独立的**「赠送额度通道（Start Plan）」区块，与上面 Coding Plan 的模型列表并列：
-
-| 控件 | 写回的配置 | 说明 |
-|---|---|---|
-| 状态行 | — | `未启用` / `已启用但未注册：<原因>` / `已注册 · CLI=… · 工具策略=…` —— **"模型选项里没有它"时先看这一行** |
-| 模型勾选 | `appServerModels` | 勾上的模型出现在选择器的「ZCode Start Plan（赠送额度）」分组下；全不勾 = 回默认单条 `GLM-5.3-Flash` |
-| 200K / 1M | `contextBudgets[<id>]` | 与 Coding Plan **共用同一份预算表**（模型 id 不重叠，互不影响） |
-| 图片 | — | 显示**当前能力**：接了 DSH `attachments` 服务 → `支持`；否则 `未启用`（如实反映，不写死） |
-| 默认思考档 | `appServerReasoningLevel` | 全通道一个值（low / high / max，**档位候选来自官方 `reasoning.variants`**，面板不硬编码）。只在宿主未下发档位时兜底；日常在**输入框的模型选择器**里逐轮切换 |
-
-保存按钮一次写回 `enabledModelIds / contextBudgets / modelOverrides / appServerModels / appServerReasoningLevel`，每项都做**写后回读校验**。
-
-> 面板写入的这些字段都是 **volatile**（DSH 面板可写的硬前提），host 半**活读**——保存后下一次会话生效。
-
-### 思考档（赠送额度的 5.3-Flash 支持思考模式）
-
-官方 `~/.zcode/v2/config.json` 的 `builtin:{bigmodel,zai}-start-plan` 段里，`GLM-5.3-Flash`
-声明了 `reasoning.variants = ["low","max","high"]`、`defaultVariant = "max"` —— 与 Coding Plan
-**同源同档**。本通道如实把它接上：
-
-| 环节 | 做法 |
-|---|---|
-| 声明给宿主 | `resolveModel` 返回 `reasoning: { efforts: [{id,name}], defaultEffort }` ⇒ 模型选择器出现思考档（`reasoningFacts` 是适配器与面板的**单一来源**，避免两处漂移） |
-| 档位落到 CLI | 宿主按声明校验后从 `request.reasoningEffort` 传回；适配器据此调 `session/setModel{options:{reasoningLevel}}`，**档位变化时复用会话重发**（不是只在建会话时设一次） |
-| 读不到官方档位 | 回退到模块常量（同样源自官方声明），**绝不发明档位**；面板的默认档单选也只在候选集合内取值 |
-| 兜底默认档 | `appServerReasoningLevel`（面板可改）：宿主没下发档位时用它 |
-
-真机实测（2026-10-10，`node scripts/verify-appserver-channel.mjs --tools allow-all`）：
-
-```
-usage 口径=context-used（CLI 回合聚合 input=36904 output=64 调用次数=2；CLI contextUsed=18910）⇒ 上报 DSH input=18910 output=0
-块序列     : #0:reasoning #1:text      ← 推理与正文各自独立 index（修复前都在 index 0，互相覆盖）
-块不变量   : PASS                     ← 每个 block-end 的负载 == 该 index 已流出文本
-模型元数据 : {"inputModalities":["text"],"contextWindow":200000,
-              "reasoning":{"efforts":[{"id":"low","name":"Low"},{"id":"max","name":"Max"},{"id":"high","name":"High"}],"defaultEffort":"max"}}
-CHUNKS PASS
-VERIFY PASS
-```
-
-### 图片怎么走（Start Plan 通道）
-
-支持。链路是**文件路径**而不是 base64：
-
-```
-DSH 消息里的图片块 {type:"image", attachment:<ref>}
-      └─ attachments.imageHostPath(ref)  →  绝对宿主路径（同步方法，返回 string | undefined）
-             └─ session/send { content, attachments:[{kind:"image", filename, mimeType, localPath}] }
-                    └─ 官方 agent 按路径读取该文件（它自带 Read 工具认得图片）
-```
-
-- 为什么用 `localPath` 而不是 `dataBase64`：协议两种都支持，但 agent 是**独立进程**，
-  给真实 OS 路径最省事，也避免把大图塞进 JSON-RPC 帧。
-- **能力是按需声明的**：只有 `ctx.get("attachments")?.imageHostPath` 可用时才在模型元数据里声明 `image`；
-  否则一律声明 `text`（"声明了却拿不到图"会让带图会话整体失败 —— TROUBLESHOOTING §2.7）。
-- 图片解析失败**降级为纯文本**并告警；**有图却没物化出附件也一定告警**（2026-10-11 的"静默丢图"
-  就是缺这条 —— 物化函数被放进 `options()` 而非顶层注入，见 TROUBLESHOOTING §2.15）。
-- 只转发**本轮输入段**（最后一条 assistant 之后的所有 user 消息）里的图：历史图片由
-  agent 自己的会话历史承载。⚠️ 不能只看"最后一条 user 消息"—— context-pilot 等注入类插件
-  会在用户消息**之后**追加 user 角色消息，把真图顶出扫描范围（2026-10-11 真机事故，
-  见 TROUBLESHOOTING §2.17）。
-- **真机验证（不经 DSH，零额度可复现）**：
-
-  ```bash
-  node scripts/verify-appserver-channel.mjs --tools deny-all \
-    --image "$HOME/.dsh/attachments/v1/objects/02/02fd8051…" \
-    --prompt "只回答一件事：这张图里最上面那行标题文字是什么？原样引用。"
-  # 实测：附件行 = 本轮随消息转发 1 张图片
-  #       回复正文 = 图里最上面那行标题文字是：**你要做的**   ← 模型确实读到了图内文字
-  ```
-
-### ⚠️ 安全须知（开之前必读）
-
-这个"模型 provider"的真身是一个**以你当前用户权限运行、且带有全套工具执行能力的 agent**：
-
-- `appServerToolPolicy: 'allow-all'`（默认）会把会话切到 `yolo`，并**自动放行** agent 的每一次
-  工具请求 —— 它执行 Bash、读写文件、联网**不会弹任何确认**。
-- agent 的输入是 DSH 拍平后的整段对话（含网页抓取、工具结果等外部内容）。**不要把不可信
-  内容喂进挂着本通道的会话**。
-- 想收紧就设 `appServerToolPolicy: 'deny-all'`：留 `build` 模式并一律拒绝工具请求。
-  代价是 agent 基本只能纯对话（它本就靠自己的原生工具干活）。
-- 子进程 env 按白名单透传（系统基础变量 + `ZCODE_*` + `NODE_EXTRA_CA_CERTS`），
-  **不继承 DSH 宿主的全部 env**（防止把其他供应商的密钥漏给它）。
-- 鉴权 token 只经**本机 stdio**交给 agent 进程，不发往任何第三方；日志只打长度。
-
-### 与 Coding Plan 通道的能力差异
-
-| | `zcode`（anthropic 直连） | `zcode-appserver`（托管 agent） |
-|---|---|---|
-| 额度 | Coding Plan | Start Plan / 活动赠送 |
-| 并发 | `maxConcurrent`（默认 2） | 一个会话同时 **1 个在途回合**（插件内部排队串行化） |
-| 图片输入 | ✅（pi-ai 附件链路） | ✅（DSH 图片 → `localPath` 附件，见下） |
-| 工具调用 | DSH 的工具直通模型 | **用 agent 自己的原生工具**，DSH 工具不透传 |
-| 冻结开关 / 台账 | ✅ | ✅（同一把开关、同一本台账） |
-
-### 真机验证
-
-```bash
-node scripts/verify-appserver-channel.mjs           # 驱动的是生产模块本身
-node scripts/verify-appserver-channel.mjs --tools allow-all
-node scripts/probe-session-read.mjs                 # 零额度：只验按次上下文读数（见下）
-```
-
-⚠️ 会消耗真实额度（一轮对话）。判定看输出末行 `VERIFY PASS/FAIL`，以及
-`本轮执行渠道 providerId=… baseURL=…` 是否命中 `zcode.z.ai/api/v1/zcode-plan/anthropic`。
-`probe-session-read.mjs` **不发消息、不消耗额度**，只确认 `session/read` 仍下发
-`projection.contextUsed`（usage 口径折算的数据源，ZCode 升版时最先失效的就是它）。
-
-> **"已领取" ≠ "已生效"**：活动套餐在 `billing/balance` 里可能是 `status: active`，
-> 但 entitlement 带 `effective_at`（本机实测 `ZCode Weekend Build`：`starts_at 20:12` /
-> `effective_at 23:00`）。窗口开始前调用会拿到 `code 1005 exceed quota limit` ——
-> **那是额度时序，不是通道故障**（判据：`providerId`/`baseURL` 已命中 plan 端点）。
-
----
-
-## 赠送额度进度条（面板 + 输入框下方）
-
-显示位置（两处同源，口径不会漂移）：
-
-- **设置面板**（设置 → 插件 → 本插件）概览里一行「赠送额度」；
-- **输入框下方**（模型选择器之下）一条细进度条 —— **悬浮显示 `剩余 X / 总量 Y`**。
-  填充比例 = 剩余/总量；**剩余 ≤10% 变红**；未生效时为灰底满格 + 「待生效 HH:MM」。
-
-### 显示门禁：只在你选中"赠送额度"那条模型时才出现
-
-进度条**不是常显**的 —— 只有当前选中的是赠送额度通道
-（provider `zcode-appserver`，即选择器里的 `ZCode Start Plan（赠送额度）`）才渲染：
-
-| 当前选中 | 进度条 |
-|---|---|
-| `ZCode Start Plan（赠送额度）` 下的任一模型 | **显示** |
-| `ZCode Coding Plan` 下的 5.3 Flash（或其它任何 provider） | 不显示 |
-
-判据取自宿主自己的 **`modelSelection` 投影**（官方 UI 同款数据源，`dsh-connect-trae`
-的 composer 门禁也用同一招），所以它与"下一次请求实际用哪个模型"永远一致。
-投影读不到 / 形状不认识时**整块不渲染并告警一次**（不猜、不误导）。
-
-> 实现细节：投影字段名在 DSH 内部有 `next` / `pending` / `lastUsed` 两套写法，
-> 代码三个候选都读（顺序 `next → pending → lastUsed`），避免上游一改就静默消失。
-
-### 数据从哪来（为什么不是实时查询）
-
-**读 ZCode 桌面端自己写的日志**（`~/.zcode/v2/logs/<date>.log` 里它自己的
-`billing/balance` 响应），**不自己调上游**：
-
-```
-ZCode 桌面端 ──► GET {origin}/api/v1/zcode-plan/billing/balance   （它本来就在轮询）
-                        └─► 响应逐次落在 ~/.zcode/v2/logs/<date>.log
-                                  └─► 本插件尾部倒读最后一条 ──► 面板 / 进度条
-```
-
-原因是**风险**：该端点属 Plan 通道，外部直连实测会被上游风控拦（同类 plan 端点本机实测
-`405 / code 3012 unusual activity`）。而客户端本来就在调、结果就在本机日志里 ——
-**零新请求、零风控面**。代价是新鲜度取决于桌面端是否在运行（悬浮提示里会带**数据时间**）。
-
-### 三种状态（**刻意不混同**）
-
-| 上游状态 | 显示 |
-|---|---|
-| 已生效，有余额桶 | 进度条，悬浮 `剩余 X / 总量 Y` |
-| **未生效**（`effective_at` 未到，余额桶还没建） | 灰底满格 + `待生效 HH:MM`，悬浮 `剩余 —（未生效） / 总量 Y` |
-| 已过期 / 读不到日志 / 非 start-plan | **整块不渲染** |
-
-> ⚠️ 「未生效」**不会**拿 `grant_units` 冒充"剩余" —— 那会在面板上显示成"一分没用"的假象。
-> 这是本项目对"静默误导"的一贯取舍：**宁可不显示，也不给错数字**（自检里有专门断言守着）。
-
-### 刷新机制
-
-两处显示**共用一个轮询器**（单定时器 + 单 in-flight 请求）：
-
-| 时机 | 行为 |
-|---|---|
-| 组件挂载 | 立即拉一次状态文档 |
-| **每 60 秒** | 自动刷新；面板与进度条**同步**更新 |
-| 面板从 summary 切到 page / 设置命名空间变更 | 重订阅并立即拉一次 |
-| 最后一个消费者卸载 | **撤掉定时器**（不留后台空转） |
-
-> 为什么必须"共用"而不是各拉各的：除了省一半请求，更要紧的是**一致性** —— 各自持有
-> 状态副本时，进度条刷新不会让面板重渲染，同一个额度会在两处显示成**不同时刻**的值
-> （用户看到的是"两个数对不上"）。自检里有单定时器 / 单 fetch 源的结构断言守着。
-
-上游余额本身是分钟级刷新的，宿主每次 GET 又只做一次**有界尾部读**（64KB 块倒读、命中即止），
-所以 60s 一次的代价可以忽略。
+> 所以"**要工具 + 要免费额度**"的组合，答案是派发台而不是本插件的 provider 通道（本插件只做纯模型通道）。
 
 ---
 
@@ -670,9 +378,6 @@ provider.models 输出）、面板行控件（锁定 disabled、1M 按官方数�
 
 1. 上下文窗口：基础档保守声明 200k（CLI 实测有效窗口）；1M 为 ZCode config 官方声明值，
    仅官方 Max 档模型可选（勾选后 `contextWindow` 按官方值声明，实测有效窗口仍以 CLI 为准）。
-2. usage（input/output token）由网关返回、从事件流提取，取不到时台账记 `null`。
-   **app-server 通道额外做口径折算**（第 17 条）：CLI 给的是"整回合 N 次调用之和"，
-   直接上报会让宿主把上下文占用算成 N 倍。
 3. 模型能力声明（T22）：官方行按 ZCode config `models` 段如实声明（Flash 的
    `input` 含 image/video——**video 为官方声明、未实测**；无官方数据的行默认纯文本，
    推理/图片由用户开关显式开启）。推理档的 wire 下发（thinkingLevelMap / effort 枚举）
@@ -699,134 +404,13 @@ provider.models 输出）、面板行控件（锁定 disabled、1M 按官方数�
     启动日志会输出宿主栈版本（`宿主 LLM 栈：pi-ai=… / dsh-llm-pi-ai=…`）并做 C5 形状自检
     （未通过时告警），**升级 DSH 后请先看这两行**。
 
-### ⚠️ 免费额度通道（`zcode-appserver`）**目前缺失的功能**速查
-
-> 一句话：**模型对话、思考档、图片、流式、额度进度条、费用台账都能用；但 DSH 的"工具层"
-> 在这条通道上不参与**。原因是架构边界 —— agent 是官方 CLI 的**独立进程**，工具在它自己
-> 进程内执行，DSH 只负责注入账户、转发消息、翻译事件流（这也是它零破解、零凭据落盘的原因）。
-> 下面按"有没有等价替代"分三类。实测依据见 TROUBLESHOOTING §2.18（同会话按通道统计：
-> 直连通道 DSH 工具调用 792 次，免费额度通道 **0 次**）。
-
-**A. 完全没有对应能力（在这条通道上做不到）**
-
-| 能力 | 受影响的 DSH 工具 | 影响 |
-|---|---|---|
-| 浏览器面板 / 批注 / 截图 | `browser_*`（browser-kit 全部） | 你在 DSH 里开的浏览器窗口、页面批注、截图能力都用不上 |
-| Agent Teams（多代理协作） | `spawn_teammate` / `send_message` / `wait_agent` / `list_agents` / `interrupt_agent` / `team_task_*` | 无法组队、无法共享任务板 |
-| 派发台 | `zcode_dispatch` | 无法在**通道会话里**再派发任务给 ZCode —— 但"**用派发台消费免费额度**"完全可行：派发台自己也支持该通道（见下方「需要 A 类能力时怎么办」第 1 条） |
-| 工作流编排 | `workflow` | 无多子代理扇出 |
-| 后台任务 | `job_list` / `job_output` / `job_kill` | 无托管后台作业 |
-| 定时提醒 | `schedule_*` | 无定时/周期提醒 |
-| 交付物卡片 | `present` | 不能生成可点击打开的文件卡片 |
-| 中途提问 | `ask_user_question` | 模型**无法在做任务途中问你** —— 只能一次问清，或直接猜 |
-| TODO 可视化 | `todo_write` | 聊天窗里不再有 TODO 清单进度 |
-| 目标管理 | `create_goal` / `update_goal` / `get_goal` | 无目标态与自动续跑 |
-| 技能加载 | `skill` | 模型读不到 DSH 的技能目录 |
-| 依赖自检 | `load_workspace_dependencies` | 无内置的 Python/Node 依赖路径注入 |
-
-**B. 能力有等价物，但**旁路 DSH**（agent 用自己的原生工具做）**
-
-| 能力 | agent 实际用什么 | 代价（重要） |
-|---|---|---|
-| 读写改文件 | 它自己的 Read / Write / Edit | **不走 DSH 的沙箱策略与文件版本守卫**（不会有 `FS_STALE_VERSION` 保护），也不进 DSH 的工具调用记录与聊天窗展示 |
-| 跑命令 | 它自己的 Bash | 同上；**不受 DSH 的审批/拦截约束**（本通道默认 `yolo`，见「安全须知」） |
-| 找文件/搜内容 | 它自己的 Glob / Grep | 结果不回流到 DSH 的工具结果面板 |
-| 联网 | 它自己的 WebSearch / WebFetch | 与 DSH 的 `web_search` / `web_fetch` 是两套实现，结果形态不同 |
-
-**C. 宿主侧机制的差异（不是工具，但你会感觉到）**
-
-| 机制 | 现状 |
-|---|---|
-| context-pilot 的**决策卡 / 工具教学** | **不转发给模型**（它教的是 `compact_context` / `set_reasoning_effort` 等本通道不存在的 DSH 工具）。侧栏用量行、面板这些**客户端**功能照常；压缩改由**宿主引擎/强制线**驱动，模型无法主动"智能压缩" |
-| DSH 图片 | 只转发**最后一条 assistant 之后**的用户消息里的图；历史图靠 agent 自己的会话承载 |
-| 并发 | **单会话同时只允许一个在途回合**，吞吐低于直连；撞锁有自愈阶梯（含硬重启），但要等 |
-| 首轮成本 | 切换通道后的**第一轮要把整段对话拍平成文本**（实测单个会话到过 ~880 KB 文本）；之后只发当轮真实用户消息 |
-| 上下文窗口 | agent 自己的窗口约 200K，与 DSH 声明的窗口**是两套**；DSH 侧压缩不会改变 agent 侧上下文 |
-| 官方 MCP 服务器 | 桥接进程拿不到桌面端签名头（`Official MCP auth headers unavailable`），`node_repl` / `image_search` 等**连不上**；agent 可能在这些坏工具上打转，拖到本地超时（默认 15 分钟） |
-| 模型目录 | 只能在官方 start-plan 段声明过的模型里选（如 GLM-5.3-Flash / GLM-5.2 / GLM-5-Turbo）；写未声明的模型会 `setModel` 失败 |
-
-**需要 A 类能力时怎么办**（按推荐顺序）：
-
-1. **要「agent 自主用工具干活」、又想烧免费额度 ⇒ 用姊妹项目 [派发台（zcode-dispatch）](https://github.com/Shuffle-1992/zcode-dispatch)**：它**也支持免费额度通道**（与本通道同源的「托管官方 agent」方案，通道 id `account:<family>-start-plan`；面板有**额度条**、agent 派发前能读到剩余额度与窗口剩余时间、台账按 `billing=zcode-plan-gift` 与付费套餐分账）。而且那里的语义**本来就是对的** —— 派发 = **独立 ZCode 进程做它自己的事**（用它自己的原生工具、独立会话、独立额度），所以「工具是 ZCode 自己的」**不是缺陷而是设计**，本节说的「DSH 工具层不参与」在派发台上根本不存在。**这是把免费额度用在「真干活」上的正确姿势**（配套：单写者文件锁 / 用量台账 / 暂停分类 / 自动降级链 / 任务落地自动唤醒）。
-2. 需要 **DSH 自己的工具链**（浏览器面板 / 批注 / 截图 / Agent Teams / 交付卡片 / `ask_user_question` …）⇒ **改用直连通道**（provider `zcode`，走 Coding Plan / API Key 形态，
-DSH 工具全部可用），或者把任务拆开——需要浏览器/组队/交付卡片的步骤放在直连通道做，
-单纯"烧免费额度"的对话与代码问答放在本通道。
-
----
-
-### app-server 通道（`zcode-appserver`，默认关）
-
-11. **DSH 的工具不会透传给 agent**：模型实际是"用 agent 自己的原生工具干完活再把结果讲给你"，
-    所以 DSH 侧的 `pwsh` / `fs-local` / `browser_*` / `todo_write` / `ask_user_question` 等工具
-    在这条通道上**不会被调用**（真机实测：同一次会话里直连通道的回合共 792 次 DSH 工具调用，
-    赠送额度通道的回合 **0 次**）；adapter 会把模型误写的 `<antml:…>` 伪调用文本拦下
-    （并在聊天窗留一条拦截说明）。**后果**：agent 只能用自己的原生工具（Bash/Read/Write/Edit…），
-    DSH 侧的副作用（TODO、浏览器面板、向用户提问、子代理）在这条通道上不会发生 ——
-    需要这些能力时请用直连通道（`zcode`）或让 agent 直接跑命令。
-    同理，**context-pilot 的决策卡与"工具教学"在本通道不转发**（它教的是 `compact_context` /
-    `set_reasoning_effort` 这类 DSH 侧工具，agent 无法调用；占用数字也是 DSH 会话的，与 agent
-    自己的上下文窗口无关）。本通道的压缩仍由宿主自身的引擎/强制线驱动，不受影响。
-    见 TROUBLESHOOTING §2.17。
-12. **图片输入**：已支持 —— DSH 的图片附件经 `attachments.imageHostPath(ref)` 取**绝对宿主路径**，
-    以 app-server 的 `{kind:'image', filename, mimeType, localPath}` 附件随消息转发（见「图片怎么走」）。
-    仅当宿主 `attachments` 服务在位时才声明 `image`（否则一律 `text`）；服务缺席时面板会显示「图片：未启用」。
-13. **单会话同时只允许一个在途回合**（app-server 的硬约束）。插件内部做了排队串行化、撞锁
-    自愈（补发 `session/stop` 后重试）与会话失效重建，但**吞吐仍低于直连通道**；长任务建议
-    按会话分摊。
-14. **Start Plan 的是账号型额度**：额度与"是否生效"由服务端按窗口授予，`status: active`
-    不等于可消费（见上文 `effective_at`）。窗口未开始时表现为 `code 1005 exceed quota limit`。
-15. 通道打通依赖 ZCode 的 `app-server` 子协议（`session/create` → `setModel` → `send` →
-    `session/event`）与 `basedOnZCodeBuiltinRevision` 的算法。**ZCode 升版后若改协议，本通道会失效**
-    —— 启动/回合日志里的 `已注入 …（providerCount=… status=…）` 与
-    `本轮执行渠道 providerId=…` 就是第一手判据。
-16. **赠送额度进度条的数据新鲜度**取决于 ZCode 桌面端是否在运行/轮询（见
-    「赠送额度进度条」一节）：它是**读客户端日志**而非实时查询上游 —— 这是为规避
-    Plan 通道风控（3012）付出的代价。悬浮提示里的「数据 HH:MM」就是这条日志的时刻。
-17. **usage 口径已折算**（`lib/app-server.js` 的 `deriveReportedUsage`）：CLI 的
-    `turn.completed.usage` 是**本回合 N 次模型调用之和**（`modelRequestCount` 即次数），
-    而宿主的 usage 是**单次请求**口径（tokenMeter 拿它当 `contextPressure` 锚点）。
-    单调用回合原样上报；多调用回合改读 CLI 的 `session/read → projection.contextUsed`
-    （按次上下文读数），读不到则按次数取均值。**若不折算，1M 窗口会被算成 708%**，
-    表现为弹窗顶部 100%/~7.1M 与同弹窗的启发式明细（~24.9K）自相矛盾，并连续触发压缩
-    —— 完整取证与三条判据见 TROUBLESHOOTING §2.10。
-18. **思考档已接上并真机验证**（见上文「思考档」）：`resolveModel` 按官方 `reasoning.variants`
-    声明 `reasoning.efforts`，档位变化时重发 `session/setModel`。面板的「默认思考档」只在
-    宿主未下发档位时兜底；**日常切换用输入框的模型选择器**（宿主的档位选择器）。
-19. **流式块按类型拆分**（修「内容被覆盖」）：推理与正文各自独立 index + 显式 `block-start`，
-    每块用自己的累计文本收尾；CLI 的最终答案**只在没出现在流出内容里时**作为新块追加
-    （流恢复 / 伪调用标记拦截等场景），不再整体替换已流出内容。判据：验证脚本的
-    `CHUNKS PASS`（见「真机验证」）。机制与坑位见 TROUBLESHOOTING §2.11。
-20. **usage 只在可信时下发**（修「弹窗 0%」）：宿主把这个 usage 当上下文压力锚点，
-    **报 0 等于把占用清零**（实测一次 561 秒未落定的回合让弹窗从 40% 掉到 0%，
-    而同一弹窗的明细仍有 383K）。现在：全零 / 拿不到读数 / 本地标题 ⇒ **不发 usage 块**
-    （宿主退回启发式估值）；回合末落定（中止/超时）⇒ 改用 CLI 的按次上下文当锚点
-    （真实读数，能把已被清零的锚点自愈回来）。见 TROUBLESHOOTING §2.13。
-21. **`defaultReasoningEffort` 默认 `none` 表示"自动"**（修「档位选择器里多一个 `Default`」）：
-    宿主在模型未声明 `defaultEffort` 时会补一个 "Provider default" 项。本插件现在按
-    "当前暴露模型是否全都支持同一档"自动决定 provider 默认档（优先 max→high→low）：
-    全支持 ⇒ 自动设（`Default` 项消失，且与官方 `defaultVariant=max` 一致）；
-    混入非推理模型（如未开推理开关的新模型）⇒ 不设（避免其请求硬失败）。面板保存后即时重算。
-    见 TROUBLESHOOTING §2.14。
-22. **官方 MCP 工具在桥接进程里不可用**：CLI agent 会看到 ZCode 配置里的官方 MCP 服务器
-    （`node_repl` / `image_search` 等），但它们需要**桌面端才有的官方签名头**
-    （CLI 日志：`Official MCP auth headers unavailable` → `MCP server connection failed`）。
-    实测后果：代理可能在这些坏工具上反复重试，把一轮拖到本地超时（默认 15 分钟，
-    `appServerTurnTimeoutMs`）。MCP 相关失败**不是通道故障**；若频繁遇到，请在 ZCode 里
-    关掉这些插件，或把这类任务交给直连通道（`zcode`）。
-23. **超时/中止后的会话自愈**：回合未落定时会补发 `session/stop`；若下一轮仍撞
-    `A prompt is already running for this session`，按阶梯升级恢复（stop+1.5s → stop+6s →
-    **硬重启 CLI 子进程并重建会话**），不再把用户这一轮直接判死。见 TROUBLESHOOTING §2.16。
-
----
-
 ## 免责声明
 
 - 本项目**不是** Z.ai / 智谱官方项目，与官方无关联。
 - 它通过读取**你本机已登录的 ZCode 客户端配置**来复用你自己的套餐额度。请自行确认这符合
   你所同意的服务条款；相关风险（含账号风控）由使用者自负。
-- 本项目**不破解、不绕过**任何验证机制：`zcode` 通道只接凭据本身就是标准 API Key 的套餐形态；
-  `zcode-appserver` 通道则**完全不动验证链路** —— 它托管的是官方 agent 本体，请求由官方二进制
-  自己签发（本插件只在本机 stdio 上把 token 递给它）。两条通道都不伪造设备指纹、不模拟验证码。
+- 本项目**不破解、不绕过**任何验证机制：`zcode` 通道只接凭据本身就是标准 API Key 的套餐形态，
+  不伪造设备指纹、不模拟验证码。（原「托管官方 agent」通道已下线并删除。）
 - 请勿提交任何凭据。仓库内不含、也不会要求你提供任何密钥。
 
 ## License

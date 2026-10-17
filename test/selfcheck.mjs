@@ -51,8 +51,6 @@ const ledger = await import('../lib/ledger.js');
 const discovery = await import('../lib/discovery.js');
 const modelMeta = await import('../lib/model-meta.js');
 const webStatus = await import('../lib/web-status.js');
-const appServer = await import('../lib/app-server.js');
-const planQuota = await import('../lib/plan-quota.js');
 const { Semaphore, instrumentApi } = await import('../lib/api-instrument.js');
 
 const tmp = mkdtempSync(join(tmpdir(), 'dsh-connect-zcode-selfcheck-'));
@@ -713,8 +711,6 @@ async function assertRejects(promise, pattern, label) {
   check('纪律: modelOverrides 带 volatile 标记（T22 写入门禁）', indexSource.includes('modelOverrides: asVolatile('));
   /* 2026-10-17 真机事故：面板保存报 "Host 拒绝写入 appServerReasoningLevel" —— 该字段漏打 volatile。
    * 面板一共写 5 个字段，**全部**必须有标记（DSH 写入门禁只放行 volatile 字段）。 */
-  check('纪律: appServerModels 带 volatile 标记（面板写入）', indexSource.includes('appServerModels: asVolatile('));
-  check('纪律: appServerReasoningLevel 带 volatile 标记（面板「默认思考档」写入）', indexSource.includes('appServerReasoningLevel: asVolatile('));
   check('纪律: 1M 档语义 tripwire（applyContextBudgets 只认官方 Max 档）', indexSource.includes('applyContextBudgets') && indexSource.includes('readOfficialMeta'));
 
   const jsFiles = [];
@@ -1163,15 +1159,6 @@ async function assertRejects(promise, pattern, label) {
   }
   check('client: 语法合法（new Function 解析）', parsed === true, parsed instanceof Error ? parsed.message : '');
   check('client: 信封自足（零静态 import；require 仅限宿主提供的 react）', !/\bimport\s/.test(clientSource) && !/require\("(?!react")/.test(clientSource));
-  /* ZB-42/43 的"跟随是否生效"原先只能翻日志 ⇒ 面板显示它（状态文档 `workspace` 字段消费点）。 */
-  check(
-    'client: 面板显示 app-server 工作目录跟随状态（workspace → 中文行）',
-    clientSource.includes('workspaceLineText') &&
-      clientSource.includes('status?.workspace') &&
-      clientSource.includes('工作目录') &&
-      clientSource.includes('跟随当前会话') &&
-      clientSource.includes('回落（未取到会话目录）')
-  );
 
   const hadWindow = typeof globalThis.window !== 'undefined';
   const realWindow = globalThis.window;
@@ -1245,29 +1232,14 @@ async function assertRejects(promise, pattern, label) {
       applyThrew = err;
     }
     check(
-      'client: apply 在服务缺失 stub ctx 下不抛且注册两个槽位（设置卡 + composer 进度条）',
-      applyThrew === null &&
-        slotInjects.length === 2 &&
-        slotInjects[0].slotName === 'plugins.bundle.config' &&
-        slotInjects[1].slotName === 'conversation.composer.dock',
+      'client: apply 在服务缺失 stub ctx 下不抛且只注册设置卡一个槽位（Start Plan 已下线）',
+      applyThrew === null && slotInjects.length === 1 && slotInjects[0].slotName === 'plugins.bundle.config',
       `injects=${slotInjects.map((s) => s.slotName).join(',')} ${applyThrew?.message ?? ''}`
     );
     slotInjects[0]?.registrar?.();
-    slotInjects[1]?.registrar?.();
     const card = slotRegisters[0];
     check('client: 卡 key = bundle 包名 + priority 30（slot 契约）', card?.desc?.key === 'dsh-connect-zcode' && card?.desc?.priority === 30 && card?.desc?.name === 'plugins.bundle.config', JSON.stringify(card?.desc ?? null));
     check('client: 卡组件为函数（React 函数组件，无构建链）', typeof card?.component === 'function');
-    /* list 型槽位（composer.dock）的注册契约与 single 不同：必须带 `id`（同 priority 下唯一），
-     * `order` 参与同槽位排序。官方先例：chat 注册 { id: "stats", order: 0 }。 */
-    const dock = slotRegisters.find((entry) => entry.desc?.id === 'zcode-quota-bar');
-    check(
-      'client: composer dock 注册描述符符合 list 型契约（name + id + order）',
-      dock !== undefined &&
-        dock.desc.name === 'conversation.composer.dock' &&
-        typeof dock.desc.id === 'string' && dock.desc.id.length > 0 &&
-        Number.isInteger(dock.desc.order),
-      JSON.stringify(dock?.desc ?? null)
-    );
     /* 刷新机制：面板与输入框进度条必须**共用**一个轮询器（单定时器 + 单 fetch 源）。
      * 各自 setInterval 有两个后果：① 双份请求；② 两处 `useState` 副本各自演进
      * ⇒ 同一个额度在两处显示成不同时刻的值，用户看到"两个数对不上"。 */
@@ -1279,8 +1251,8 @@ async function assertRejects(promise, pattern, label) {
       `setInterval=${countOf(/setInterval\(/g)} fetch=${countOf(/fetch\(STATUS_PATH/g)}`
     );
     check(
-      'client: 两个消费者都走 subscribeStatusDoc（面板 + composer 进度条）',
-      countOf(/subscribeStatusDoc\(\{/g) === 2,
+      'client: 状态文档订阅只来自面板（Start Plan 下线后不再有进度条消费者）',
+      countOf(/subscribeStatusDoc\(\{/g) === 1,
       `sites=${countOf(/subscribeStatusDoc\(\{/g)}`
     );
     check(
@@ -1355,166 +1327,6 @@ async function assertRejects(promise, pattern, label) {
     check('client: 概览含上下文预算行（1 个模型已切 1M）', JSON.stringify(factsPage).includes('上下文预算') && JSON.stringify(factsPage).includes('1 个模型已切 1M'));
     check('client: 1M 实测差异提示在场（CLI 实测 200k）', JSON.stringify(factsPage).includes('CLI 实测有效窗口 200k'));
 
-    /* ── 赠送额度进度条（composer dock）：**行为**断言而非源码正则 ──
-     * 三种 state 的语义差异是本功能的红线：
-     *   active  → 填充 = 剩余/总量，悬浮「剩余 X / 总量 Y」；
-     *   pending → 余额桶还没建，剩余**不可知** ⇒ 绝不能用总量冒充剩余（那会显示成"一分没用"）；
-     *   其余    → 整块不渲染（宁可不显示，也不给误导数字）。 */
-    const dockComp = dock?.component;
-    const activeQuota = {
-      ok: true, state: 'active', totalUnits: 300000000, remainingUnits: 30000000, usedUnits: 270000000,
-      model: 'GLM-5.3-Flash', planName: 'ZCode Weekend Build', effectiveAt: 0, observedAt: '2026-10-10T12:12:30.119Z',
-    };
-    const pendingQuota = {
-      ok: true, state: 'pending', totalUnits: 300000000, remainingUnits: null, usedUnits: null,
-      model: 'GLM-5.3-Flash', planName: 'ZCode Weekend Build', effectiveAt: 1791644400, observedAt: null,
-    };
-    const pickBar = (node, cls) =>
-      findAllEls(node, (n) => typeof n.props?.className === 'string' && n.props.className.split(' ').includes(cls))[0];
-    /* 门禁所需的 `modelSelection` 投影桩（宿主真实形状：{next|pending|lastUsed:{provider,model}}）。
-     * 默认选中赠送额度那条 provider —— 否则按新门禁**整块不渲染**（这正是本轮新增的行为）。 */
-    const projectionFor = (provider, model = 'GLM-5.3-Flash') => () => ({ next: { provider, model } });
-    const ownedProjection = projectionFor('zcode-appserver');
-    const barActive = dockComp({ statusRef: { current: { planQuota: activeQuota } }, useProjection: ownedProjection });
-    const barPending = dockComp({ statusRef: { current: { planQuota: pendingQuota } }, useProjection: ownedProjection });
-    const barNone = dockComp({ statusRef: { current: {} }, useProjection: ownedProjection });
-    const rootActive = pickBar(barActive, 'dzc-quota');
-    const rootPending = pickBar(barPending, 'dzc-quota');
-    check(
-      'client: 进度条 active — 悬浮提示为「剩余/总量」（用户要求的确切形状）',
-      typeof rootActive?.props?.title === 'string' && rootActive.props.title.includes('剩余 30,000,000 / 总量 300,000,000'),
-      rootActive?.props?.title
-    );
-    check(
-      'client: 进度条 active — 填充比例 = 剩余/总量（10%）',
-      pickBar(barActive, 'dzc-quota-fill')?.props?.style?.width === '10.00%' &&
-        JSON.stringify(barActive).includes('赠送额度 剩余') && JSON.stringify(barActive).includes('10%'),
-      JSON.stringify(pickBar(barActive, 'dzc-quota-fill')?.props?.style)
-    );
-    check(
-      'client: 进度条 pending — 不把总量冒充剩余（提示「剩余 —（未生效）」+ 满格）',
-      typeof rootPending?.props?.title === 'string' &&
-        rootPending.props.title.includes('剩余 —（未生效） / 总量 300,000,000') &&
-        pickBar(barPending, 'dzc-quota-fill-idle')?.props?.style?.width === '100.00%' &&
-        JSON.stringify(barPending).includes('待生效'),
-      rootPending?.props?.title
-    );
-    check('client: 进度条 — 无额度数据/不可用时整块不渲染（不给误导数字）', barNone === null && findAllEls(barActive, (n) => n.type === 'div').length > 0, String(barNone));
-
-    /* ── 显示门禁：**只有选中赠送额度那条 provider 的模型才显示** ──
-     * 依据是宿主自己的 modelSelection 投影（模型选择器写什么、下一次请求用什么就是它），
-     * 所以不会出现"显示着赠送额度、实际烧的却是 Coding Plan"的错配。 */
-    {
-      const atProvider = (provider) => dockComp({ statusRef: { current: { planQuota: activeQuota } }, useProjection: projectionFor(provider) });
-      check(
-        'client: 门禁 — 选中 Coding Plan（zcode）时进度条不显示',
-        atProvider('zcode') === null,
-        String(atProvider('zcode'))
-      );
-      check(
-        'client: 门禁 — 选中赠送额度（zcode-appserver）时才显示',
-        pickBar(atProvider('zcode-appserver'), 'dzc-quota') !== undefined
-      );
-      /* 投影缺席/形状未知 → 不渲染（且 warn 一次，让"凭空消失"可排查）。 */
-      check('client: 门禁 — useProjection 缺席时整块不渲染（不猜）', dockComp({ statusRef: { current: { planQuota: activeQuota } } }) === null);
-      check(
-        'client: 门禁 — 投影形状不认识时也不渲染（含 next/pending/lastUsed 三种候选）',
-        dockComp({ statusRef: { current: { planQuota: activeQuota } }, useProjection: () => ({ lastUsed: null }) }) === null &&
-          dockComp({ statusRef: { current: { planQuota: activeQuota } }, useProjection: () => ({ pending: { provider: 'zcode-appserver', model: 'GLM-5.3-Flash' } }) }) !== null &&
-          dockComp({ statusRef: { current: { planQuota: activeQuota } }, useProjection: () => ({ lastUsed: { provider: 'zcode-appserver', model: 'GLM-5.3-Flash' } }) }) !== null
-      );
-      check(
-        'client: 门禁 — 投影抛异常被吞（不让输入框崩）',
-        dockComp({ statusRef: { current: { planQuota: activeQuota } }, useProjection: () => { throw new Error('boom'); } }) === null
-      );
-    }
-    check(
-      'client: 面板含「赠送额度」行且与进度条同源',
-      (() => {
-        const page = card.component({ settingsScope: scope, statusRef: { current: { planQuota: activeQuota } }, view: 'page' });
-        return JSON.stringify(page).includes('赠送额度') && JSON.stringify(page).includes('剩余 30,000,000 / 总量 300,000,000');
-      })()
-    );
-
-    /* ── 面板「赠送额度通道」区块（用户要求：把 GLM-5.3-Flash（赠送额度）也做进面板） ──
-     * 它是**独立区块**，事实来源 = 状态文档的 appServer 段；未就绪时必须给出可操作原因。 */
-    {
-      const giftStatus = {
-        enabled: true,
-        registered: true,
-        cliPath: 'F:\\Program Files\\ZCode\\resources\\glm\\zcode.cjs',
-        toolPolicy: 'allow-all',
-        reasoningLevel: 'max',
-        models: [{ id: 'GLM-5.3-Flash', name: 'GLM-5.3-Flash（赠送额度）', contextWindow: 200000 }],
-      };
-      const giftPage = card.component({ settingsScope: scope, statusRef: { current: { appServer: giftStatus } }, view: 'page' });
-      const giftBoxes = byDataRole(giftPage, 'gift-enable');
-      check(
-        'client: 面板含「赠送额度通道」独立区块 + 该通道模型行（勾选与 200K/1M 单选在场）',
-        JSON.stringify(giftPage).includes('赠送额度通道') &&
-          giftBoxes.length === 1 &&
-          giftBoxes[0]?.props?.['data-model'] === 'GLM-5.3-Flash' &&
-          byDataRole(giftPage, 'gift-ctx-1m').length === 1 &&
-          byDataRole(giftPage, 'gift-ctx-base').length === 1,
-        `giftRows=${giftBoxes.length}`
-      );
-      check(
-        'client: 赠送额度行标注「赠送额度」徽标 + 图片能力如实反映（未接 attachments → 未启用）',
-        JSON.stringify(giftPage).includes('赠送额度') &&
-          JSON.stringify(giftPage).includes('图片：未启用') &&
-          /* 思考档由「锁定文案」升级为**官方事实 + 可切换**（2026-10-10 用户要求补思考模式）：
-           * 行内标注官方档位，切换入口是输入框的模型选择器。 */
-          JSON.stringify(giftPage).includes('思考档：low / high / max（官方；默认 max')
-      );
-      check(
-        'client: 赠送额度区块含「默认思考档」单选（data-role=gift-reasoning，档位来自状态文档）',
-        byDataRole(giftPage, 'gift-reasoning').length === 3 &&
-          JSON.stringify(byDataRole(giftPage, 'gift-reasoning').map((r) => r.props['data-level'])) ===
-            JSON.stringify(['low', 'high', 'max']) &&
-          JSON.stringify(giftPage).includes('默认思考档'),
-        `reasoningRadios=${byDataRole(giftPage, 'gift-reasoning').length}`
-      );
-      check(
-        'client: 通道已注册时显示 CLI 与工具策略（可核对真实注册结果）',
-        JSON.stringify(giftPage).includes('已注册') && JSON.stringify(giftPage).includes('allow-all')
-      );
-      check(
-        'client: 图片能力就绪时该行显示"支持"（与 host 的 canImages 活判一致，不写死）',
-        JSON.stringify(card.component({
-          settingsScope: scope,
-          statusRef: { current: { appServer: { ...giftStatus, imagesSupported: true } } },
-          view: 'page',
-        })).includes('图片：支持')
-      );
-      const offPage = card.component({
-        settingsScope: scope,
-        statusRef: { current: { appServer: { enabled: false, registered: false, models: [] } } },
-        view: 'page',
-      });
-      check(
-        'client: 通道未启用 → 区块给可操作提示而非空列表（不显示不存在的模型）',
-        JSON.stringify(offPage).includes('通道未就绪') && byDataRole(offPage, 'gift-enable').length === 0
-      );
-      const failPage = card.component({
-        settingsScope: scope,
-        statusRef: { current: { appServer: { enabled: true, registered: false, reason: '没探测到 ZCode CLI（zcode.cjs）', models: [] } } },
-        view: 'page',
-      });
-      check(
-        'client: 启用但注册失败 → 区块显示具体原因（"模型不见了"要能自查）',
-        JSON.stringify(failPage).includes('已启用但未注册') && JSON.stringify(failPage).includes('没探测到 ZCode CLI')
-      );
-      check('client: 面板保存路径包含 appServerModels（赠送额度显隐写回配置）', /writeField\(settingsScope, "appServerModels"/.test(clientSrcForPoll));
-      /* 默认思考档（2026-10-10 用户要求"给赠送的 5.3-Flash 加上思考模式"）：
-       * 面板单选写 appServerReasoningLevel，档位候选来自状态文档（官方 variants），不硬编码。 */
-      check(
-        'client: 面板写回默认思考档（appServerReasoningLevel），单选档位来自状态文档',
-        /writeField\(\s*settingsScope,\s*"appServerReasoningLevel"/.test(clientSrcForPoll) &&
-          /"data-role": "gift-reasoning"/.test(clientSrcForPoll) &&
-          /giftReasoningLevels/.test(clientSrcForPoll) &&
-          /storedGiftReasoning/.test(clientSrcForPoll)
-      );
-    }
   } finally {
     if (hadWindow) globalThis.window = realWindow;
     else delete globalThis.window;
@@ -1577,13 +1389,6 @@ console.log = REAL_LOG;
     `patch id=${patchId}`
   );
 
-  // ⑤ 赠送额度通道的 provider id：client 的门禁常量必须等于 host 注册的 provider id。
-  // 漂移的后果是**静默**的：进度条永远不显示（选中了也不显示），且没有任何报错。
-  check(
-    'DE-10 守卫: client QUOTA_PROVIDER_ID 等于 host APPSERVER_PROVIDER_ID（漂移=进度条永不显示）',
-    norm(clientSrc).includes(`QUOTA_PROVIDER_ID=${appServer.APPSERVER_PROVIDER_ID}`),
-    `host=${appServer.APPSERVER_PROVIDER_ID}`
-  );
 }
 
 // ─── 8. 零明文终扫（§3.5-4） ─────────────────────────────────────────────────

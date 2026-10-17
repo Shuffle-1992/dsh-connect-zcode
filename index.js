@@ -24,40 +24,18 @@
  *   contextBudgets/modelOverrides 为面板写入的每模型能力配置（volatile），
  *   官方数据锁定的行（推理档/输入模态）不消费覆盖（applyXxx 跳过 official 行）。
  */
-import { homedir } from 'node:os';
 import { DEFAULT_PLAN_KEY, readPlanCredential, resolvePlanCredential } from './lib/credential.js';
-import { defaultCredentialStorePath } from './lib/credential-store.js';
 import { DEFAULT_SWITCH_PATH, assertSwitchEnabled, readDispatchSwitch } from './lib/switch.js';
 import { DEFAULT_LEDGER_PATH, appendProviderRun } from './lib/ledger.js';
 import { resolveHostLlmModules, resolveSchemastery } from './lib/host-modules.js';
-import { readPlanQuota } from './lib/plan-quota.js';
-/* ZB-46（审查 2.2）：赠送通道"模型 id 归一 + 上下文预算覆盖 + 兜底"的唯一口径。 */
-import { giftContextWindow, giftMaxTokens, normalizeGiftModelIds } from './lib/gift-catalog.js';
-import {
-  APPSERVER_PROVIDER_ID,
-  APPSERVER_DISPLAY_NAME,
-  START_PLAN_CATALOG,
-  START_PLAN_REASONING_LEVELS,
-  DEFAULT_REASONING_LEVEL,
-  createAppServerAdapter,
-  resolveAccountProviderId,
-  readStartPlanReasoningMeta,
-  reasoningFacts,
-  resolveZcodeCliPath,
-  imageExtension,
-} from './lib/app-server.js';
 import { staticCatalog, discoverModels, filterByEnabledModels } from './lib/discovery.js';
 import {
-  BASE_CONTEXT_WINDOW,
-  FALLBACK_MAX_TOKENS,
   readOfficialMeta,
   applyImageSelection,
   applyReasoningSelection,
   applyContextBudgets,
 } from './lib/model-meta.js';
 import { ZCODE_STATUS_PATH, originIsLoopback, hostIsLoopback, readLastLedgerRow, buildStatusDocument, writeJson } from './lib/web-status.js';
-/* ZB-42：会话工作目录解析（宿主服务软取）与留痕 —— 逻辑在模块里，宿主只负责接线。 */
-import { createWorkspaceResolver, createWorkspaceTracker } from './lib/session-workspace.js';
 import { Semaphore, instrumentApi } from './lib/api-instrument.js';
 
 const NS = 'zcode';
@@ -184,33 +162,6 @@ function normalizeConfig(config) {
     enabledModelIds: enabledModelIdsOf(v),
     contextBudgets: contextBudgetsOf(v),
     modelOverrides: modelOverridesOf(v),
-    // ── app-server 通道（第二 provider；默认关 = 对既有行为零回归） ──
-    /* ZB-53：Start Plan（app-server）接入**不完整**，已停用 —— 只保留 Coding Plan 通道。
-     * 这里强制 false（无视历史配置），保证模型选择器/面板不再出现第二个 provider。 */
-    appServer: false,
-    zcodeCliPath: typeof v.zcodeCliPath === 'string' ? v.zcodeCliPath : '',
-    zcodeCliNode: nonEmptyStr(v.zcodeCliNode, 'node'),
-    zcodeDataBaseDir: typeof v.zcodeDataBaseDir === 'string' ? v.zcodeDataBaseDir : '',
-    appServerCredentialStorePath: nonEmptyStr(v.appServerCredentialStorePath, defaultCredentialStorePath()),
-    // 留空 = 按 oauth:active_provider 自动选 account:{bigmodel|zai}-start-plan
-    appServerAccountProviderId: typeof v.appServerAccountProviderId === 'string' ? v.appServerAccountProviderId : '',
-    // 只保留内置目录里真实存在的 id（未知 id 会被 setModel 拒绝，宁可丢弃也不透传）
-    appServerModels: normalizeGiftModelIds(v.appServerModels, START_PLAN_CATALOG),
-    appServerReasoningLevel: START_PLAN_REASONING_LEVELS.includes(v.appServerReasoningLevel)
-      ? v.appServerReasoningLevel
-      : DEFAULT_REASONING_LEVEL,
-    appServerToolPolicy: v.appServerToolPolicy === 'deny-all' ? 'deny-all' : 'allow-all',
-    appServerInjectAccount: v.appServerInjectAccount !== false,
-    // 留空 = 用户主目录 —— 仅在"未跟随会话目录"(appServerWorkspaceFollow=false) 或解析不到时用到
-    appServerWorkspace: nonEmptyStr(v.appServerWorkspace, homedir()),
-    /* ZB-42（DSH 0.2.1）：app-server 会话是否**跟随当前会话的官方工作目录**
-     * （宿主 `working_directory` 服务；模型用内置 working_directory 工具改目录也会跟随）。
-     * 默认 true：旧行为是恒用 homedir()，会让 ZCode agent 在用户主目录里跑 —— 与 DSH 会话
-     * 看到的目录语义错位，且 agent 启动扫目录树会拖慢回合。 */
-    appServerWorkspaceFollow: v.appServerWorkspaceFollow !== false,
-    appServerRpcTimeoutMs: clampInt(v.appServerRpcTimeoutMs, 5000, 600000, 120000),
-    appServerTurnTimeoutMs: clampInt(v.appServerTurnTimeoutMs, 30000, 3600000, 900000),
-    childEnvAllow: Array.isArray(v.childEnvAllow) ? v.childEnvAllow.filter((k) => typeof k === 'string' && k.trim() !== '') : [],
   };
 }
 
@@ -297,61 +248,6 @@ async function loadConfig() {
           .default({})
           .description('无官方数据模型的推理/图片开关（设置面板写入）；官方数据锁定的模型忽略此项')
       ),
-      // ── app-server 通道（第二 provider：Start Plan / 账号型额度） ──
-      appServer: z
-        .boolean()
-        .default(false)
-        .description(
-          '启用 app-server 通道（provider `zcode-appserver`）：托管 ZCode 自带的 agent 进程，' +
-            '由**官方 agent 自己发模型请求**，从而能消费 Start Plan / 活动赠送额度。' +
-            '关闭（默认）时只注册既有的 Coding Plan 通道，行为零变化。'
-        ),
-      zcodeCliPath: z
-        .string()
-        .default('')
-        .description('ZCode 自带 zcode.cjs 路径；留空 = 自动探测（含盘符扫描，ZCode 常装在非系统盘）'),
-      zcodeCliNode: z.string().default('node').description('运行 zcode.cjs 的 node 可执行文件'),
-      zcodeDataBaseDir: z.string().default('').description('ZCode 数据目录（读 runtime/provider 下的 zcode-builtin.json）；留空 = 用户主目录'),
-      appServerCredentialStorePath: z
-        .string()
-        .default('')
-        .description('ZCode 加密凭据库路径（读 Start Plan 的 zcodejwttoken）；留空 = ~/.zcode/v2/credentials.json'),
-      appServerAccountProviderId: z
-        .string()
-        .default('')
-        .description('注入的 start-plan 账户条目；留空 = 按 oauth:active_provider 自动选 account:bigmodel-start-plan / account:zai-start-plan'),
-      /* 面板写入目标字段，必须 volatile（见 asVolatile 注释）——赠送额度通道暴露哪些模型。 */
-      appServerModels: asVolatile(
-        z
-          .array(z.string())
-          .default([START_PLAN_CATALOG[0].id])
-          .description('赠送额度通道暴露给 DSH 的模型 id（设置面板写入；取自内置目录：GLM-5.3-Flash / GLM-5.2 / GLM-5-Turbo；未知 id 会被丢弃）')
-      ),
-      /* ⚠️ 面板写入目标字段，**必须 volatile** —— 否则 DSH 写入门禁拒绝，面板保存会报
-       * "Host 拒绝写入 appServerReasoningLevel"（真机事故 2026-10-17：其余 4 个字段都打了标记，
-       * 唯独漏了这一个 ⇒ 赠送额度通道的「默认思考档」下拉保存不了）。 */
-      appServerReasoningLevel: asVolatile(
-        z
-          .union(START_PLAN_REASONING_LEVELS)
-          .default(DEFAULT_REASONING_LEVEL)
-          .description('session/setModel 的推理档（ZCode GUI 默认 max；GLM 系 variants = low/high/max）')
-      ),
-      appServerToolPolicy: z
-        .union(['allow-all', 'deny-all'])
-        .default('allow-all')
-        .description(
-          '⚠️ 安全面：allow-all = 会话切 yolo 且自动放行 agent 的每一次工具请求（= DSH 里挂了一个无人确认的全权限 agent）；' +
-            'deny-all = 留 build 模式并一律拒绝工具请求（更安全，但 agent 基本只能纯对话）'
-        ),
-      appServerInjectAccount: z.boolean().default(true).description('把 Start Plan 账户注入 agent（GUI 同款）；关闭则用 agent 冷启动的默认供应商'),
-      appServerWorkspace: z.string().default('').description('app-server 会话工作目录**兜底值**；留空 = 用户主目录（只在"未跟随会话目录"或解析不到会话目录时用到）'),
-      appServerWorkspaceFollow: z
-        .boolean()
-        .default(true)
-        .description('app-server 会话是否跟随当前会话的官方工作目录（DSH 内置 working_directory；模型中途改目录也跟随）。关掉则恒用 appServerWorkspace'),
-      appServerRpcTimeoutMs: z.number().step(1).min(5000).max(600000).default(120000).description('app-server 单次请求（create/inject/setModel/send）超时'),
-      appServerTurnTimeoutMs: z.number().step(1).min(30000).max(3600000).default(900000).description('app-server 单回合（send → turn 完成）超时'),
-      childEnvAllow: z.array(z.string()).default([]).description('额外透传给 app-server 子进程的环境变量名（默认只透传系统基础变量与 ZCODE_*）'),
     });
   } catch (err) {
     /* ⚠️ 降级必须可见（2026-10-01 教训）：手写 fallback **不是原生 schemastery schema**，
@@ -591,8 +487,6 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
 
   // 面板配置活读（volatile 字段经 settings 写入后以活引用到达，必须现读；T21 §3.1 + T22 §1.2）。
   const readEnabled = () => enabledModelIdsOf(rawConfig);
-  /** 赠送额度通道暴露的模型（**活读**；面板写入 appServerModels 后下一次会话生效）。 */
-  const readGiftModels = () => normalizeGiftModelIds(unwrapLive(rawConfig?.appServerModels), START_PLAN_CATALOG);
   const readBudgets = () => contextBudgetsOf(rawConfig);
   const readOverrides = () => modelOverridesOf(rawConfig);
   const readUserCfg = () => ({ enabledIds: readEnabled(), budgets: readBudgets(), overrides: readOverrides() });
@@ -602,31 +496,8 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
   const baseCatalog = () => staticCatalog(readMeta(), cfg.contextWindow);
   // 目录快照（过滤前全量，供面板重勾）；发现失败/冻结期回静态表。
   const state = { registered: false, lastCatalog: baseCatalog() };
-  /* ZB-42：app-server 会话工作目录的解析留痕（状态文档/日志可读；不含凭据、不缓存目录内容）。 */
-  const workspaceTracker = createWorkspaceTracker();
   // 发现回调 / 冻结期回退的输出：目录事实行 + 用户配置 → 发现行形状（trae :4436-4441 同款）。
   const discoveredFor = (catalog) => applyUserConfig(catalog, readUserCfg()).map(toDiscoveredRow);
-  /* 赠送额度通道的目录行：与 Coding Plan 行**并列**返回（模型 id 不重叠）。
-   * ⚠️ 必须惰性求值（只在 discovery 回调里调用）：canImages / appServerState 都在本函数
-   * 后文才声明，apply 同步执行期处于 TDZ；回调是异步的，届时已初始化。
-   * 没有这些行，宿主的图片策略看不到 gift 模型的 image 能力（2026-10-10 实测：
-   * attachmentCount=0，截图被宿主整层剥掉，适配器根本收不到）。 */
-  const giftDiscoveryRows = () => {
-    if (cfg.appServer !== true || appServerState.registered !== true) return [];
-    const imageInput = canImages() ? ['text', 'image'] : ['text'];
-    return readGiftModels().map((id) => {
-      const entry = START_PLAN_CATALOG.find((m) => m.id === id) ?? { id, name: id, contextWindow: 200000, maxTokens: 128000 };
-      const override = readBudgets()[id];
-      return {
-        id: entry.id,
-        name: entry.name ?? entry.id,
-        /* 上下文/maxTokens 统一走 `lib/gift-catalog.js`（与状态行、适配器同一口径）。 */
-        contextWindow: giftContextWindow(entry, override, { fallback: BASE_CONTEXT_WINDOW }),
-        maxTokens: giftMaxTokens(entry),
-        inputModalities: imageInput,
-      };
-    });
-  };
 
   const semaphore = new Semaphore(cfg.maxConcurrent);
   const record = (info) => {
@@ -759,7 +630,7 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
     ctx.llm.registerModelDiscovery(settingsNs, async (request, signal) => {
       const cancellation = signal ?? request?.signal;
       // PROTOCOL §7.1：冻结期连目录发现也不发请求（GET /v1/models 同样不走）。
-      if (!readDispatchSwitch(cfg.switchPath).enabled) return [...discoveredFor(state.lastCatalog), ...giftDiscoveryRows()];
+      if (!readDispatchSwitch(cfg.switchPath).enabled) return [...discoveredFor(state.lastCatalog)];
       try {
         // 方案 B：与调用门同一凭据解析（config.json 验活失败则回退凭据库），
         // 否则会出现"推理可用但目录发现用旧 key 401"的不一致。
@@ -783,7 +654,7 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
           },
         });
         state.lastCatalog = rows; // 状态路由展示过滤前的全量（面板要能看到被隐藏的模型才能重新勾上）
-        return [...discoveredFor(rows), ...giftDiscoveryRows()];
+        return [...discoveredFor(rows)];
       } catch (err) {
         /* R-06：目录发现双层静默是本项目最典型的"失败无诊断线索"。
          * 调用门有完整 onDiagnostic 通道，发现路径此前一条都没有 ——
@@ -795,149 +666,13 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
         } catch {
           /* 日志失败不影响回退 */
         }
-        return [...discoveredFor(state.lastCatalog), ...giftDiscoveryRows()];
+        return [...discoveredFor(state.lastCatalog)];
       }
     })
   );
-  /* ── app-server 通道（第二 provider：Start Plan / 账号型额度）────────────────
-   * 与既有 `zcode` provider **并存**。默认关（appServer:false）⇒ 本段整体不执行，行为零变化。
-   *
-   * 为什么不能也走 pi-ai HTTP 栈：Start Plan 端点要求**逐请求的客户端证明**，外部 HTTP
-   * （含真实浏览器）直连实测被上游拦成 `405 / code 3012 unusual activity`；只有官方 agent
-   * 二进制自己发出的请求能过。故这里是**自建 LlmAdapter 子类**，由常驻
-   * `zcode.cjs app-server` 代发模型请求（协议与坑见 lib/app-server.js 头部注释）。
-   *
-   * 失败面隔离：本段任何异常只告警，**绝不连带打挂既有 Coding Plan 通道**。 */
-  /* 图片能力**活判**：只有 DSH 的 attachments 服务在位、且能给出宿主路径时才敢声明 image
-   * （声明了却拿不到图 = TROUBLESHOOTING §2.7 那个"带图会话整体失败"的坑）。 */
-  const canImages = () => typeof ctx.get?.('attachments')?.imageHostPath === 'function';
   const directoryEntries = [
     { provider: PROVIDER_ID, displayName: DISPLAY_NAME, settingsNs, settingsPath: [], declared: false },
   ];
-  /* app-server 通道的注册结果 —— 面板要靠它回答"为什么模型选项里没有赠送额度那条"。
-   * 默认 reason=null；每个失败分支都写明可操作原因。 */
-  const appServerState = {
-    enabled: cfg.appServer === true,
-    registered: false,
-    reason: null,
-    cliPath: null,
-    providerId: APPSERVER_PROVIDER_ID,
-  };
-  if (cfg.appServer) {
-    try {
-      const cliPath = resolveZcodeCliPath(cfg.zcodeCliPath);
-      if (cliPath === '') {
-        appServerState.reason = '没探测到 ZCode CLI（zcode.cjs）—— 用配置项 zcodeCliPath 指定绝对路径';
-        console.warn(
-          '[dsh-connect-zcode] ⚠️ appServer 已启用但没探测到 ZCode CLI（zcode.cjs）—— app-server 通道未注册。' +
-            '请用配置项 zcodeCliPath 指定绝对路径（ZCode 常装在非系统盘，自动探测已含盘符扫描）。'
-        );
-      } else if (typeof mods.LlmAdapter !== 'function') {
-        appServerState.reason = '宿主未解析到 @deepseek-ai/dsh-llm 的 LlmAdapter（registerAdapter 的契约基类）';
-        console.warn(
-          '[dsh-connect-zcode] ⚠️ appServer 已启用但宿主没解析到 @deepseek-ai/dsh-llm 的 LlmAdapter —— ' +
-            'app-server 通道未注册（该基类是 DSH `registerAdapter` 的契约）。'
-        );
-      } else {
-        /* DSH 图片块 → app-server 附件（`Rar`：kind/filename/mimeType/localPath）。
-         * 取**绝对宿主路径**（`attachments.imageHostPath(ref)`）：ZCode agent 是独立进程，
-         * 只认真实 OS 路径；DSH 的"执行世界路径"（readonlyPath）对它无效。
-         * ⚠️ 必须作为**顶层注入**传给适配器：2026-10-11 真机事故里它被写在 `options()` 内，
-         * 而适配器只读顶层 ⇒ 恒为 undefined ⇒ 有图也按纯文本发且**零告警**（CLI 侧
-         * `attachmentCount: 0`、模型请求 0 个 image 块）。适配器现在两条路都认，这里也归位。 */
-        const materializeImages = async (blocks) => {
-          const service = ctx.get?.('attachments');
-          if (typeof service?.imageHostPath !== 'function') return [];
-          const out = [];
-          for (let index = 0; index < blocks.length; index += 1) {
-            const block = blocks[index];
-            if (block?.ref === null || block?.ref === undefined) continue;
-            let hostPath;
-            try {
-              hostPath = service.imageHostPath(block.ref);
-            } catch (error) {
-              ctx.logger?.warn?.(`[dsh-connect-zcode] 图片附件定位失败（本轮跳过该图）：${error?.message ?? error}`);
-              continue;
-            }
-            if (typeof hostPath !== 'string' || hostPath === '') continue;
-            const mimeType = block.mimeType ?? 'image/png';
-            out.push({
-              kind: 'image',
-              filename: `dsh-image-${index + 1}${imageExtension(mimeType)}`,
-              mimeType,
-              localPath: hostPath,
-            });
-          }
-          return out;
-        };
-        const appServerAdapter = createAppServerAdapter({
-          BaseAdapter: mods.LlmAdapter,
-          LlmError: mods.LlmError,
-          materializeImages,
-          // 活读配置（与既有通道一致）：每次调用现取，配置改动下一次会话生效。
-          options: () => ({
-            ...cfg,
-            zcodeCliPath: cliPath,
-            /* 面板可写字段**活读**（与既有通道同款）：保存后下一次会话生效。 */
-            appServerModels: readGiftModels(),
-            contextBudgets: readBudgets(),
-            supportsImages: canImages(),
-            /* 同函数的第二条通道（适配器兼容读法；顶层那条才是主路径）。 */
-            materializeImages,
-            ...(mods.resolveRetryPolicy
-              ? { retryPolicy: mods.resolveRetryPolicy(undefined, 'dsh-connect-zcode appServerRetryPolicy') }
-              : {}),
-          }),
-          logger: ctx.logger ?? console,
-          /* ZB-42（DSH 0.2.1）：把"当前会话的工作目录"交给适配器 —— 用官方
-           * `working_directory` 服务。**软取**（与 :713 的 attachments 同款 `ctx.get`）：
-           * 服务缺席时返回 undefined，由适配器回落配置目录，不扩大启动失败面。
-           * 收益：ZCode agent 与 DSH 会话在同一个目录里工作，并跟随模型用内置
-           * `working_directory` 工具中途改目录（旧行为恒用 homedir()）。
-           * 逻辑本体在 `lib/session-workspace.js`（宿主服务访问与优先级各只此一份）。 */
-          resolveWorkspace: createWorkspaceResolver({
-            getService: (name) => (typeof ctx.get === 'function' ? ctx.get(name) : ctx[name]),
-            logger: ctx.logger ?? console,
-          }),
-          /* 最终决策回报（含来源）—— 状态文档据此显示"到底有没有跟随"。 */
-          onWorkspaceDecision: (info) => workspaceTracker.update(info),
-          // 同一把冻结开关（PROTOCOL §7.1）：关闭时连 agent 进程都不起。
-          gate: () => {
-            assertSwitchEnabled(cfg.switchPath);
-          },
-          record: (info) => {
-            try {
-              appendProviderRun(info, cfg.ledgerPath);
-            } catch {
-              /* 记账失败不炸推理通道 */
-            }
-          },
-        });
-        appServerState.registered = true;
-        appServerState.cliPath = cliPath;
-        offs.push(ctx.llm.registerAdapter([APPSERVER_PROVIDER_ID], appServerAdapter));
-        if (typeof ctx.effect === 'function') {
-          // 与仓库既有风格一致：effect 的回调返回值由 cordis 负责在 fiber 卸载时执行，
-          // 不再重复塞进 offs（否则卸载时会 dispose 两次）。
-          ctx.effect(() => () => appServerAdapter.dispose(), 'dsh-connect-zcode: app-server client');
-        }
-        directoryEntries.push({
-          provider: APPSERVER_PROVIDER_ID,
-          displayName: APPSERVER_DISPLAY_NAME,
-          settingsNs,
-          settingsPath: [],
-          declared: false,
-        });
-        console.log(
-          `[dsh-connect-zcode] app-server 通道已注册：provider=${APPSERVER_PROVIDER_ID} ` +
-            `模型=${readGiftModels().join('/')} CLI=${cliPath} 工具策略=${cfg.appServerToolPolicy}`
-        );
-      }
-    } catch (err) {
-      appServerState.reason = `注册时抛错：${String(err?.message ?? err).slice(0, 120)}`;
-      console.warn(`[dsh-connect-zcode] app-server 通道注册失败（既有 Coding Plan 通道不受影响）：${err?.message ?? err}`);
-    }
-  }
   offs.push(ctx.llm.registerConfigurableProviders(directoryEntries));
 
   // 面板保存（volatile 写入）后重导目录：trae :4406-4408 同款联动；事件缺席时保存需重启生效。
@@ -989,9 +724,6 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
         catalog: () => state.lastCatalog,
         enabledModelIds: readEnabled,
         lastLedger: () => readLastLedgerRow(cfg.ledgerPath),
-        /* ZB-42：app-server 会话工作目录的解析留痕（跟随是否真的生效、用的是哪个目录）。
-         * 这是**唯一**能证明 `ctx.get('workingDirectory')` 可达性是否生效的运行时观测点。 */
-        workspace: () => workspaceTracker.snapshot(),
               })
     );
   } catch {
