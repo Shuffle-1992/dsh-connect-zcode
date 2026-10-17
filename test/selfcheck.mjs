@@ -711,6 +711,10 @@ async function assertRejects(promise, pattern, label) {
   check('纪律: enabledModelIds 带 volatile 标记（写入门禁硬前提）', indexSource.includes('enabledModelIds: asVolatile('));
   check('纪律: contextBudgets 带 volatile 标记（T22 写入门禁）', indexSource.includes('contextBudgets: asVolatile('));
   check('纪律: modelOverrides 带 volatile 标记（T22 写入门禁）', indexSource.includes('modelOverrides: asVolatile('));
+  /* 2026-10-17 真机事故：面板保存报 "Host 拒绝写入 appServerReasoningLevel" —— 该字段漏打 volatile。
+   * 面板一共写 5 个字段，**全部**必须有标记（DSH 写入门禁只放行 volatile 字段）。 */
+  check('纪律: appServerModels 带 volatile 标记（面板写入）', indexSource.includes('appServerModels: asVolatile('));
+  check('纪律: appServerReasoningLevel 带 volatile 标记（面板「默认思考档」写入）', indexSource.includes('appServerReasoningLevel: asVolatile('));
   check('纪律: 1M 档语义 tripwire（applyContextBudgets 只认官方 Max 档）', indexSource.includes('applyContextBudgets') && indexSource.includes('readOfficialMeta'));
 
   const jsFiles = [];

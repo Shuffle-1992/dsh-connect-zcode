@@ -325,10 +325,15 @@ async function loadConfig() {
           .default([START_PLAN_CATALOG[0].id])
           .description('赠送额度通道暴露给 DSH 的模型 id（设置面板写入；取自内置目录：GLM-5.3-Flash / GLM-5.2 / GLM-5-Turbo；未知 id 会被丢弃）')
       ),
-      appServerReasoningLevel: z
-        .union(START_PLAN_REASONING_LEVELS)
-        .default(DEFAULT_REASONING_LEVEL)
-        .description('session/setModel 的推理档（ZCode GUI 默认 max；GLM 系 variants = low/high/max）'),
+      /* ⚠️ 面板写入目标字段，**必须 volatile** —— 否则 DSH 写入门禁拒绝，面板保存会报
+       * "Host 拒绝写入 appServerReasoningLevel"（真机事故 2026-10-17：其余 4 个字段都打了标记，
+       * 唯独漏了这一个 ⇒ 赠送额度通道的「默认思考档」下拉保存不了）。 */
+      appServerReasoningLevel: asVolatile(
+        z
+          .union(START_PLAN_REASONING_LEVELS)
+          .default(DEFAULT_REASONING_LEVEL)
+          .description('session/setModel 的推理档（ZCode GUI 默认 max；GLM 系 variants = low/high/max）')
+      ),
       appServerToolPolicy: z
         .union(['allow-all', 'deny-all'])
         .default('allow-all')
