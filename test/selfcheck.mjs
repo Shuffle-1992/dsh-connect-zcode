@@ -1942,6 +1942,58 @@ async function assertRejects(promise, pattern, label) {
       '3.3/3.5 简化: 死字段 lastChannel 已删、dispose 清空 activeStreams',
       !/lastChannel/.test(appServerSrcForWs) && /this\.activeStreams\.clear\(\)/.test(appServerSrcForWs)
     );
+
+    /* ── 审查 2.2：赠送通道"目录行口径"只此一份（纯函数表）──────────────────── */
+    const giftMod = await import('../lib/gift-catalog.js');
+    check(
+      '2.2: 模型 id 归一（未知丢弃 / 去重 / 空或全无效回目录首条）',
+      j(giftMod.normalizeGiftModelIds(['GLM-5.2', 'GLM-5.2', 'UNKNOWN', 42], [{ id: 'GLM-5.2' }, { id: 'GLM-5.3' }])) === j(['GLM-5.2']) &&
+        j(giftMod.normalizeGiftModelIds([], [{ id: 'A' }, { id: 'B' }])) === j(['A']) &&
+        j(giftMod.normalizeGiftModelIds(['X'], [{ id: 'A' }])) === j(['A'])
+    );
+    check(
+      '2.2: 上下文口径（预算覆盖夹 1M / 官方值 / 兜底 200k）',
+      giftMod.giftContextWindow({ contextWindow: 200000 }, 1_500_000) === 1_000_000 &&
+        giftMod.giftContextWindow({ contextWindow: 200000 }, 300000) === 300000 &&
+        giftMod.giftContextWindow({ contextWindow: 262144 }, undefined) === 262144 &&
+        giftMod.giftContextWindow({ contextWindow: 0 }, null) === 200000 &&
+        giftMod.giftContextWindow(undefined, 'bad') === 200000
+    );
+    const indexSrcForGift = readFileSync(join(PLUGIN_ROOT, 'index.js'), 'utf8');
+    check(
+      '2.2: 三处（发现行/状态行/适配器）改用同一实现，旧的各自口径代码已清零',
+      /giftContextWindow/.test(indexSrcForGift) &&
+        /giftMaxTokens/.test(indexSrcForGift) &&
+        (indexSrcForGift.match(/Math\.min\(Math\.trunc\(override\)/g) ?? []).length === 0 &&
+        !/Math\.min\(Math\.trunc\(override\)/.test(appServerSrcForWs) &&
+        /normalizeGiftModelIds/.test(indexSrcForGift) &&
+        /normalizeGiftModelIds/.test(appServerSrcForWs)
+    );
+
+    /* ── 审查 1.4 / 5.7：队列超时**不再静默放行**（宁可报错也不两轮并行）────────── */
+    const queueAdapter = mkWsAdapter({ ...cfgLike, appServerInjectAccount: false, appServerTurnTimeoutMs: 300 }, async () => undefined);
+    queueAdapter.turnLocks.set('s-queue', new Promise(() => {})); // 模拟"上一轮永不结束"
+    let queueError = null;
+    try {
+      for await (const _ of queueAdapter.stream({
+        provider: 'zcode-appserver',
+        model: 'GLM-5.2',
+        sessionId: 's-queue',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      })) {
+        /* drain */
+      }
+    } catch (error) {
+      queueError = error;
+    }
+    check(
+      '1.4/5.7: 上一轮超时未释放 ⇒ 明确报错且**不发送**（不再静默并行发送）',
+      queueError !== null &&
+        /排队超时/.test(String(queueError?.message ?? '')) &&
+        !queueAdapter.client.calls.some((c) => c.method === 'session/send'),
+      String(queueError?.message ?? 'no-error').slice(0, 90)
+    );
+    queueAdapter.dispose();
   }
 
   /* ── 流式分块 + 思考档（2026-10-10 用户实测"面板内容一直覆盖"；赠送 5.3-Flash 补思考档）──

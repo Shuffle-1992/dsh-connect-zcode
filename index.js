@@ -31,6 +31,8 @@ import { DEFAULT_SWITCH_PATH, assertSwitchEnabled, readDispatchSwitch } from './
 import { DEFAULT_LEDGER_PATH, appendProviderRun } from './lib/ledger.js';
 import { resolveHostLlmModules, resolveSchemastery } from './lib/host-modules.js';
 import { readPlanQuota } from './lib/plan-quota.js';
+/* ZB-46（审查 2.2）：赠送通道"模型 id 归一 + 上下文预算覆盖 + 兜底"的唯一口径。 */
+import { giftContextWindow, giftMaxTokens, normalizeGiftModelIds } from './lib/gift-catalog.js';
 import {
   APPSERVER_PROVIDER_ID,
   APPSERVER_DISPLAY_NAME,
@@ -191,11 +193,7 @@ function normalizeConfig(config) {
     // 留空 = 按 oauth:active_provider 自动选 account:{bigmodel|zai}-start-plan
     appServerAccountProviderId: typeof v.appServerAccountProviderId === 'string' ? v.appServerAccountProviderId : '',
     // 只保留内置目录里真实存在的 id（未知 id 会被 setModel 拒绝，宁可丢弃也不透传）
-    appServerModels: (() => {
-      const raw = Array.isArray(v.appServerModels) ? v.appServerModels : [];
-      const ids = [...new Set(raw.filter((id) => typeof id === 'string' && START_PLAN_CATALOG.some((m) => m.id === id)))];
-      return ids.length > 0 ? ids : [START_PLAN_CATALOG[0].id];
-    })(),
+    appServerModels: normalizeGiftModelIds(v.appServerModels, START_PLAN_CATALOG),
     appServerReasoningLevel: START_PLAN_REASONING_LEVELS.includes(v.appServerReasoningLevel)
       ? v.appServerReasoningLevel
       : DEFAULT_REASONING_LEVEL,
@@ -578,12 +576,7 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
   // 面板配置活读（volatile 字段经 settings 写入后以活引用到达，必须现读；T21 §3.1 + T22 §1.2）。
   const readEnabled = () => enabledModelIdsOf(rawConfig);
   /** 赠送额度通道暴露的模型（**活读**；面板写入 appServerModels 后下一次会话生效）。 */
-  const readGiftModels = () => {
-    const raw = unwrapLive(rawConfig?.appServerModels);
-    const list = Array.isArray(raw) ? raw : [];
-    const ids = [...new Set(list.filter((id) => typeof id === 'string' && START_PLAN_CATALOG.some((m) => m.id === id)))];
-    return ids.length > 0 ? ids : [START_PLAN_CATALOG[0].id];
-  };
+  const readGiftModels = () => normalizeGiftModelIds(unwrapLive(rawConfig?.appServerModels), START_PLAN_CATALOG);
   const readBudgets = () => contextBudgetsOf(rawConfig);
   const readOverrides = () => modelOverridesOf(rawConfig);
   const readUserCfg = () => ({ enabledIds: readEnabled(), budgets: readBudgets(), overrides: readOverrides() });
@@ -611,13 +604,9 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
       return {
         id: entry.id,
         name: entry.name ?? entry.id,
-        contextWindow:
-          Number.isFinite(override) && override > 0
-            ? Math.min(Math.trunc(override), 1000000)
-            : Number.isInteger(entry.contextWindow) && entry.contextWindow > 0
-              ? entry.contextWindow
-              : BASE_CONTEXT_WINDOW,
-        maxTokens: Number.isInteger(entry.maxTokens) && entry.maxTokens > 0 ? entry.maxTokens : FALLBACK_MAX_TOKENS,
+        /* 上下文/maxTokens 统一走 `lib/gift-catalog.js`（与状态行、适配器同一口径）。 */
+        contextWindow: giftContextWindow(entry, override, { fallback: BASE_CONTEXT_WINDOW }),
+        maxTokens: giftMaxTokens(entry),
         inputModalities: imageInput,
       };
     });
@@ -1012,10 +1001,8 @@ function registerZcodeProvider(ctx, mods, cfg, settingsNs, rawConfig) {
                   return {
                     id: entry.id,
                     name: entry.name ?? entry.id,
-                    contextWindow:
-                      Number.isFinite(override) && override > 0
-                        ? Math.min(Math.trunc(override), 1000000)
-                        : entry.contextWindow,
+                    /* 与发现行、适配器同一口径（`lib/gift-catalog.js`）——此前这条少了非整数兜底。 */
+                    contextWindow: giftContextWindow(entry, override),
                     reasoningLevels: facts.levels,
                     defaultReasoningLevel: facts.defaultLevel,
                   };
