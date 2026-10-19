@@ -168,6 +168,47 @@ ctx.inject(['webServer'], (webCtx) => {
 
 ---
 
+### 3.1 真机硬坑：卡片的 `key` 必须等于 **profile 的 bundle 名**（不是"你包里的 name"）
+
+**现象**：卡片**静默消失** —— 那块区域一片空白，**控制台零 error / 零 warn**，而槽位探针却显示占用者
+`active: true`（注册成功了，就是没人渲染它）。自测全绿也照样发生。
+
+**机理**（DSH 源码 `@deepseek-ai/dsh-client-ui-plugin-manager/lib/client.js`）：
+
+```js
+configured ? renderSlot("plugins.bundle.config", { view: "page" }, { entryKey: pkg.name }) : null
+```
+
+`entryKey = pkg.name`，而 `pkg.name` 是 **profile 的 bundle 身份**（`dsh.profile.bundles` 里那个字符串，
+可由 `plugin_manager list_bundles` 直接看到），**不是**你 `package.json` 的 `name`。两者不一致 ⇒ 匹配不上 ⇒ 空白。
+
+**真实事故（2026-10-19，dsh-context-pilot）**：
+
+| 位置 | 名字 |
+|---|---|
+| profile bundle 名（= DSH 派发的 `entryKey`） | `@local/dsh-context-pilot`（旧别名，改名迁移遗留） |
+| 该插件 client 里注册卡片的 `key` | `dsh-context-pilot`（规范名） |
+
+⇒ 不相等 ⇒ 卡片空白且零线索。对照 `dsh-connect-zcode`：两处都是 `dsh-connect-zcode` ⇒ 正常显示。
+
+**两条修法**：
+
+1. **改 profile 身份（推荐）**：把 profile `dsh.profile.bundles` 与 `dependencies` 里的旧别名 `@local/<pkg>`
+   改成规范包名（确保 `node_modules/<pkg>` junction 在），重启 DSH。
+2. **client 里双 key 注册（最小改动，立即生效）**：keyed 槽位允许不同 key 各占一格：
+
+   ```js
+   for (const key of ["your-plugin", "@local/your-plugin"]) {
+     ctx.slots.inject("plugins.bundle.config", () => ctx.slots.register(
+       { name: "plugins.bundle.config", key, priority: 30, inject: () => ({}) }, Card));
+   }
+   ```
+
+**为什么自测挡不住**：渲染测试只验证"组件渲染出什么"，**覆盖不到"宿主用哪个 key 派发"**。
+要守住它，只能加**运行时契约断言**：把槽位探针里 `plugins.bundle.config` 的占用者 key 集合与 profile bundle 名比对。
+
+---
+
 ## 4. 「面板一直不显示」排查表（按可能性排序）
 
 | # | 现象 | 最可能原因 | 怎么定位 |
