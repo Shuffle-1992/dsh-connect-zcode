@@ -1137,6 +1137,56 @@ rollout: 请求中 image 块 = 1     ← CLI 把 localPath 附件嵌进了模型
 
 ---
 
+### 2.19 配置卡「静默空白」：卡片 key ≠ **profile 的 bundle 名**（2026-10-19 真机，第三方插件）
+
+**现象**：插件详情页本该出现配置卡的那块区域**一片空白**，而控制台**零 error / 零 warn**；
+槽位探针却显示该槽位有占用者、`active: true` ——"注册成功了，但就是没人渲染它"。自测全绿也照样发生。
+
+**机理**（DSH 源码 `@deepseek-ai/dsh-client-ui-plugin-manager/lib/client.js`）：
+
+```js
+configured ? renderSlot("plugins.bundle.config", { view: "page" }, { entryKey: pkg.name }) : null
+```
+
+`entryKey = pkg.name`，而 `pkg.name` 是 **profile 的 bundle 名**（`dsh.profile.bundles` 里那个字符串），
+**不是**插件 `package.json` 的 `name`。`plugins.bundle.config` 是 **keyed** 槽位：key 不相等就没有占用者，
+结果是**渲染空**——没有异常、没有告警、没有日志。
+
+**真机案例**（dsh-context-pilot）：
+
+| 位置 | 名字 |
+|---|---|
+| profile bundle 名（DSH 派发的 `entryKey`） | `@local/dsh-context-pilot`（2026-10-10 统一包名前的旧别名） |
+| 该插件 client 里注册卡片的 `key` | `dsh-context-pilot`（规范名） |
+
+⇒ 不相等 ⇒ 卡片空白。**对照**：`dsh-connect-zcode` 两处都是 `dsh-connect-zcode` ⇒ 一直正常显示。
+
+**三步定位**（都无需改代码）：
+
+1. `plugin_manager` 的 `list_bundles` → 看该插件条目的 `name`（= 宿主派发的 `entryKey`）；
+2. client `Slots` 探针 → `plugins.bundle.config` 的 occupants，看 `key`；
+3. 两者比对：不等就是本坑（opt 3 交叉验证：同槽位里能正常显示的插件，其两处名字必定相同）。
+
+**两条修法**：
+
+- **双 key 注册（本次采用，最小改动）**：`for (const key of [BUNDLE_KEY, "@local/" + BUNDLE_KEY])` 各注册一格；
+  keyed 槽位允许不同 key 并存，无论 profile 用哪个名字都能命中。迁移到规范名后别名那格自然空置、无害。
+- **把 profile 迁到规范名（长期）**：`dsh.profile.bundles` + `dependencies` 里的 `@local/<pkg>` 改成规范包名，
+  重启 DSH。此后别名那格可删，插件显示名也统一。
+
+**为什么测试挡不住**：渲染测试只验证"组件渲染出什么"，**覆盖不到"宿主用哪个 key 派发"**。
+本案里那条断言甚至把错误前提写死（`cfg.key === "包名"`），于是 864 条断言全绿、线上却一张卡都没有。
+修法：断言改成"**key 集合覆盖两个名字**"，并让桩**收集全部**注册（原先只留最后一次）。
+
+**验证**：`npm test` 864/864 全绿；**重载页面**后卡片出现，槽位探针里该插件出现**两格**
+（`dsh-context-pilot` 与 `@local/dsh-context-pilot`）。
+
+**一句话护栏**：凡是 profile 里以 `@local/<pkg>` 挂载的插件，客户端卡片 key **必须同时覆盖别名**；
+同类风险：`dsh-browser-kit`（bundle 名 `@local/dsh-browser-kit`，卡片 key `dsh-browser-kit`）。
+
+---
+
+
 ## 三、通用工程
 
 ### 3.1 用 `fetch` 后调 `process.exit()` 会崩（Windows）

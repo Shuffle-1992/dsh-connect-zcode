@@ -204,6 +204,11 @@ configured ? renderSlot("plugins.bundle.config", { view: "page" }, { entryKey: p
    }
    ```
 
+**已落地（2026-10-19 实例）**：dsh-context-pilot 采用**双 key 注册**修好（其仓库提交 `dc12b27`，v0.1.49）：
+① 卡片同时注册 `dsh-context-pilot` 与 `@local/dsh-context-pilot`；② 其渲染测试的断言由「key === 包名」
+改为「**key 集合覆盖两个名字**」，并让桩收集全部注册；③ `npm test` 864/864 全绿；④ **重载页面**后卡片出现，
+槽位探针里该插件出现两格。详见 `TROUBLESHOOTING.md` §2.19。
+
 **为什么自测挡不住**：渲染测试只验证"组件渲染出什么"，**覆盖不到"宿主用哪个 key 派发"**。
 要守住它，只能加**运行时契约断言**：把槽位探针里 `plugins.bundle.config` 的占用者 key 集合与 profile bundle 名比对。
 
