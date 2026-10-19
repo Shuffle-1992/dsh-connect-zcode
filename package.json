@@ -71,6 +71,7 @@
     "README.md",
     "test",
     "scripts",
-    "TROUBLESHOOTING.md"
+    "TROUBLESHOOTING.md",
+    "PANEL-HOWTO.md"
   ]
 }

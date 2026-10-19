@@ -207,6 +207,8 @@ node scripts/compat-check.mjs --self-test          # 只跑内置 semver 自测
 
 ## 设置面板（T21 显隐 + T22 能力行控件）
 
+> 想让**自己的插件**也有一块能正确显示、且保存真生效的面板？见 [`PANEL-HOWTO.md`](./PANEL-HOWTO.md)（清单 / 信封 / 槽位 / settingsNs 四处必配，外加「面板一直不显示」10 条排查表）。
+
 DSH 插件设置页的本 bundle 卡片（slot `plugins.bundle.config`，key = 包名）提供**最小可用面板**：
 
 - **模型行布局（T22，一行一模型）**：显隐勾选 + 名称（网关 `display_name`）+ `·官方` 徽标
